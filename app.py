@@ -8,9 +8,7 @@ import json
 import os
 from datetime import datetime, date
 from pathlib import Path
-import calendar
 
-import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import (
     PatternFill, Font, Alignment, Border, Side
