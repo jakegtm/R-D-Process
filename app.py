@@ -293,6 +293,7 @@ def save_submission(username: str, month: str, data: dict):
 def new_initiative() -> dict:
     return {
         "id": f"{int(datetime.now().timestamp()*1000)}",
+        # Core fields (Excel columns)
         "business_component": "",
         "initiative_name": "",
         "initiative_description": "",
@@ -303,6 +304,14 @@ def new_initiative() -> dict:
         "team_members": [],
         "expected_hours": 0,
         "notes": "",
+        # Doni's supplemental fields
+        "rd_activity_type": "",
+        "rd_time_percentage": 0,
+        "prior_month_progress": "",
+        "obstacles": "",
+        "next_month_plan": "",
+        "uncertainty_status": "",
+        # Meta
         "carry_over": False,
     }
 
@@ -328,10 +337,16 @@ def build_excel(all_data: dict, only_user: str | None = None) -> bytes:
     ws.title = "R&D Tracking"
 
     headers = [
+        # Core columns (match original Excel template)
         "User", "Month", "Business Component", "Initiative Name",
         "Description", "Technical Uncertainty", "Start Date",
         "Expected End Date", "Activities This Month", "Team Members",
-        "Expected Hours", "Notes", "Status", "Submitted At",
+        "Expected Hours", "Notes",
+        # Doni's supplemental columns (edit labels here to match question changes)
+        "R&D Activity Type", "% Time on R&D", "Progress vs Last Month",
+        "Obstacles", "Next Month Plan", "Uncertainty Status",
+        # Meta
+        "Status", "Submitted At",
     ]
 
     # Header row styling
@@ -351,8 +366,12 @@ def build_excel(all_data: dict, only_user: str | None = None) -> bytes:
         cell.alignment = hdr_align
         cell.border = thin_border
 
-    # Column widths
-    col_widths = [16, 14, 22, 26, 42, 42, 12, 14, 42, 32, 14, 32, 22, 20]
+    # Column widths (one entry per header column)
+    col_widths = [
+        16, 14, 22, 26, 42, 42, 12, 14, 42, 32, 14, 32,  # core columns
+        36, 14, 36, 36, 36, 36,                            # Doni's columns
+        22, 20,                                            # meta
+    ]
     for i, w in enumerate(col_widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
@@ -371,6 +390,7 @@ def build_excel(all_data: dict, only_user: str | None = None) -> bytes:
             for init in sub["initiatives"]:
                 fill = fill_even if row_num % 2 == 0 else None
                 vals = [
+                    # Core columns
                     username,
                     fmt_month(month),
                     init.get("business_component", ""),
@@ -383,6 +403,14 @@ def build_excel(all_data: dict, only_user: str | None = None) -> bytes:
                     ", ".join(init.get("team_members") or []),
                     init.get("expected_hours", 0),
                     init.get("notes", ""),
+                    # Doni's supplemental columns
+                    init.get("rd_activity_type", ""),
+                    init.get("rd_time_percentage", ""),
+                    init.get("prior_month_progress", ""),
+                    init.get("obstacles", ""),
+                    init.get("next_month_plan", ""),
+                    init.get("uncertainty_status", ""),
+                    # Meta
                     STATUS_LABELS.get(sub.get("status", ""), sub.get("status", "")),
                     (
                         datetime.fromtimestamp(sub["submitted_at"] / 1000).strftime("%Y-%m-%d %H:%M")
@@ -769,7 +797,15 @@ def screen_wizard():
         </div>
         """, unsafe_allow_html=True)
 
-    st.markdown(f'<p class="step-label">Question {step+1}</p>', unsafe_allow_html=True)
+    # Label — show "Supplemental Question" badge for Doni's questions
+    if s.get("doni"):
+        st.markdown(
+            f'<p class="step-label" style="color:#7c3aed;">'
+            f'✦ Supplemental Question {step+1} &nbsp;·&nbsp; <span style="font-weight:400;font-style:italic;">Edit in WIZARD_STEPS</span></p>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(f'<p class="step-label">Question {step+1}</p>', unsafe_allow_html=True)
     st.markdown(f'<p class="wizard-question">{s["question"]}</p>', unsafe_allow_html=True)
     st.markdown(f'<p class="wizard-hint">{s["hint"]}</p>', unsafe_allow_html=True)
 
@@ -800,7 +836,11 @@ def screen_wizard():
         new_val = picked.strftime("%Y-%m-%d") if picked else None
 
     elif s["type"] == "number":
-        new_val = st.number_input(s["label"], min_value=0, value=int(val or 0), step=4)
+        max_v = 100 if "percentage" in s["field"] else 10000
+        step_v = 1 if "percentage" in s["field"] else 4
+        new_val = st.number_input(s["label"], min_value=0, max_value=max_v, value=int(val or 0), step=step_v)
+        if "percentage" in s["field"]:
+            st.caption(f"{new_val}% of team time")
 
     elif s["type"] == "multiselect":
         new_val = st.multiselect(s["label"], EMPLOYEES, default=val or [])
