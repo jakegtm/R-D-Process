@@ -31,6 +31,8 @@ EMPLOYEES = [
     "Jonathan", "Steven", "Michael", "Joe", "Nicole Browne",
 ]
 
+ENTITIES = ["107", "108", "109", "110"]
+
 STATUS_LABELS = {
     "in-progress": "🟡 In Progress",
     "submitted":   "🔵 Submitted for Review",
@@ -39,14 +41,8 @@ STATUS_LABELS = {
     "not-started": "⚪ Not Started",
 }
 
-# ── Wizard Steps — exactly the columns in the Excel template ─────────────────
-#
-#  Column order: Month/Yr | Business Component | Initiative Name |
-#  Initiative Description | Tech Uncertainty | Start Date | Expected End Date |
-#  Activities to Eliminate Technical Uncertainty | Team Members | Notes
-#
-#  Month/Yr is auto-filled from the current month — not asked as a question.
-#
+# Wizard steps — exactly the 9 columns in the Excel template
+# (Month/Yr is derived from reporting_month, not asked separately)
 WIZARD_STEPS = [
     {
         "field": "business_component",
@@ -128,25 +124,22 @@ WIZARD_STEPS = [
     },
 ]
 
-# Fields that pre-fill when carrying over from the previous month
 CARRYOVER_FIELDS = {
     "business_component", "initiative_name", "initiative_description",
     "tech_uncertainty", "start_date", "expected_end_date", "team_members",
 }
-# Fields that reset each month (must be filled in fresh)
-RESET_FIELDS = {"activities", "notes"}
 
 
-# ── Data Helpers ──────────────────────────────────────────────────────────────
+# ── Date helpers ──────────────────────────────────────────────────────────────
 
 def cur_month() -> str:
     return datetime.now().strftime("%Y-%m")
 
-def prev_month() -> str:
-    n = datetime.now()
-    if n.month == 1:
-        return f"{n.year - 1}-12"
-    return f"{n.year}-{str(n.month - 1).zfill(2)}"
+def prev_month_of(m: str) -> str:
+    y, mo = map(int, m.split("-"))
+    if mo == 1:
+        return f"{y-1}-12"
+    return f"{y}-{str(mo-1).zfill(2)}"
 
 def fmt_month(m: str) -> str:
     if not m:
@@ -154,31 +147,36 @@ def fmt_month(m: str) -> str:
     y, mo = m.split("-")
     return datetime(int(y), int(mo), 1).strftime("%B %Y")
 
+def fmt_month_tab(m: str) -> str:
+    """Short form for Excel sheet tab names, e.g. 'May 26'"""
+    if not m:
+        return ""
+    y, mo = m.split("-")
+    return datetime(int(y), int(mo), 1).strftime("%b %Y")
+
 def available_months() -> list[str]:
-    """Last 6 months + next 1 month as YYYY-MM strings, newest first."""
-    from datetime import date
-    now = date.today()
+    """6 months back + 1 forward, newest first."""
+    today = date.today()
     result = []
     for delta in range(-6, 2):
-        total = now.month - 1 + delta   # 0-based month offset
-        yr    = now.year + total // 12
+        total = today.month - 1 + delta
+        yr    = today.year + total // 12
         mo    = total % 12 + 1
         result.append(f"{yr}-{str(mo).zfill(2)}")
     result.sort(reverse=True)
     return result
 
-ENTITIES = ["107", "108", "109", "110"]
+
+# ── Filename helper ───────────────────────────────────────────────────────────
 
 def export_filename(entity: str, reporting_month: str, tag: str = "") -> str:
     """
-    Build filename matching the original convention:
-      {entity}_Group_{month}_{year}_Monthly_R_D_Tracking_Template.xlsx
-    e.g. 107_Group_10_2025_Monthly_R_D_Tracking_Template.xlsx
-    tag is inserted before the final segment, e.g. "Consolidated_Submitted"
+    107_Group_10_2025_Monthly_R_D_Tracking_Template.xlsx
+    107_Group_10_2025_Consolidated_Submitted_Monthly_R_D_Tracking_Template.xlsx
     """
     try:
         dt = datetime.strptime(reporting_month, "%Y-%m")
-        mo = str(dt.month)    # no leading zero — matches original (10 not 010)
+        mo = str(dt.month)
         yr = str(dt.year)
     except Exception:
         mo, yr = "00", "0000"
@@ -189,9 +187,10 @@ def export_filename(entity: str, reporting_month: str, tag: str = "") -> str:
     return "_".join(parts) + ".xlsx"
 
 
-def data_path(username: str, month: str) -> Path:
-    safe = username.replace(" ", "_").replace("/", "_")
-    return DATA_DIR / f"{safe}_{month}.json"
+# ── Storage ───────────────────────────────────────────────────────────────────
+
+def _safe_name(s: str) -> str:
+    return s.replace(" ", "_").replace("/", "_")
 
 def registry_path() -> Path:
     return DATA_DIR / "registry.json"
@@ -203,21 +202,76 @@ def load_registry() -> list:
 def save_registry(users: list):
     registry_path().write_text(json.dumps(users, indent=2))
 
+def months_index_path(username: str) -> Path:
+    return DATA_DIR / f"{_safe_name(username)}_months.json"
+
+def load_user_months(username: str) -> list:
+    p = months_index_path(username)
+    return json.loads(p.read_text()) if p.exists() else []
+
+def save_user_months(username: str, months: list):
+    months_index_path(username).write_text(json.dumps(months, indent=2))
+
+def submission_path(username: str, month: str) -> Path:
+    return DATA_DIR / f"{_safe_name(username)}_{month}.json"
+
 def load_submission(username: str, month: str) -> dict | None:
-    p = data_path(username, month)
+    p = submission_path(username, month)
     return json.loads(p.read_text()) if p.exists() else None
 
-def save_submission(username: str, month: str, data: dict):
-    data_path(username, month).write_text(json.dumps(data, indent=2))
+def save_draft(username: str, draft: dict):
+    """
+    Always keys by draft['reporting_month'] — this is the fix that ensures
+    May submissions don't appear under June.
+    """
+    month = draft.get("reporting_month") or cur_month()
+    submission_path(username, month).write_text(json.dumps(draft, indent=2))
+    # Registry
     reg = load_registry()
     if username not in reg:
         reg.append(username)
         save_registry(reg)
+    # Per-user month index
+    months = load_user_months(username)
+    if month not in months:
+        months.append(month)
+        save_user_months(username, months)
+
+def load_all_submissions() -> dict:
+    """
+    Returns { username: { reporting_month: submission_dict } }
+    Uses each user's month index so we find ALL months, not just current.
+    """
+    reg = load_registry()
+    all_data: dict[str, dict] = {}
+    for user in reg:
+        all_data[user] = {}
+        for month in load_user_months(user):
+            sub = load_submission(user, month)
+            if sub:
+                all_data[user][month] = sub
+    return all_data
+
+def get_combos(all_data: dict) -> list[tuple[str, str]]:
+    """
+    Returns sorted list of unique (entity, reporting_month) tuples
+    found across all submissions.
+    """
+    combos: set[tuple[str, str]] = set()
+    for user, months in all_data.items():
+        for month, sub in months.items():
+            e  = sub.get("entity", "")
+            rm = sub.get("reporting_month", month)
+            if e and rm:
+                combos.add((e, rm))
+    return sorted(combos, key=lambda x: (x[1], x[0]))
+
+
+# ── Initiative helpers ────────────────────────────────────────────────────────
 
 def new_initiative() -> dict:
     return {
         "id": f"{int(datetime.now().timestamp()*1000)}",
-        # Matches Excel columns exactly
         "business_component":    "",
         "initiative_name":       "",
         "initiative_description":"",
@@ -227,197 +281,193 @@ def new_initiative() -> dict:
         "activities":            "",
         "team_members":          [],
         "notes":                 "",
-        # Meta
-        "carry_over": False,
+        "carry_over":            False,
     }
 
 def carryover_initiative(src: dict) -> dict:
     init = new_initiative()
-    init["id"] = f"{int(datetime.now().timestamp()*1000)}"
     for f in CARRYOVER_FIELDS:
         init[f] = src.get(f, init[f])
     init["carry_over"] = True
     return init
 
+def empty_draft() -> dict:
+    return {
+        "initiatives":     [],
+        "status":          "in-progress",
+        "entity":          "",
+        "reporting_month": "",
+    }
 
-# ── Excel Export ──────────────────────────────────────────────────────────────
-#
-# Colors extracted directly from the original template file:
-#   Header fill  : #9BBB59  (theme accent3 — the green header row)
-#   Header font  : white #FFFFFF, bold, Arial Narrow 12pt
-#   Data fill    : #EEECE1  (theme lt2 — beige, used on most input cells)
-#   Team Members : #DED900  (yellow — "Selection" cells in the original)
-#   Title font   : bold, Arial Narrow 14pt
-#   Borders      : thin, all sides
 
-def build_excel(
-    all_data: dict,
-    only_user: str | None = None,
-    submitted_only: bool = False,
-    label: str = "",
-) -> bytes:
+# ── Excel export ──────────────────────────────────────────────────────────────
+# Colors from the original template (extracted via openpyxl):
+#   GREEN  = 9BBB59  (theme accent3 — header row)
+#   BEIGE  = EEECE1  (theme lt2   — input cells)
+#   YELLOW = DED900  (rgb         — Team Members / Selection cells)
+#   Font   = Arial Narrow, bold white 12pt on headers
+
+GREEN  = "9BBB59"
+BEIGE  = "EEECE1"
+YELLOW = "DED900"
+WHITE  = "FFFFFF"
+DARK   = "1F1F1F"
+GRAY   = "666666"
+
+def _thin_border():
+    s = Side(style="thin", color="A0A0A0")
+    return Border(left=s, right=s, top=s, bottom=s)
+
+def _hdr_font(sz=12):
+    return Font(name="Arial Narrow", bold=True, color=WHITE, size=sz)
+
+def _data_font():
+    return Font(name="Arial Narrow", color=DARK, size=11)
+
+# Column definition for a single-combo sheet (User prepended for consolidated)
+_COL_DEF = [
+    # (header_label,                                            field_key,      width, is_team)
+    ("Month/Yr",                                               "_month",        14,   False),
+    ("Business Component",                                     "business_component", 35, False),
+    ("Initiative Name",                                        "initiative_name",    19, False),
+    ("Initiative Description",                                 "initiative_description", 38, False),
+    ("Tech Uncertainty",                                       "tech_uncertainty",   64, False),
+    ("Start Date",                                             "start_date",    16,   False),
+    ("Expected End Date",                                      "expected_end_date", 16, False),
+    ("Activities to Eliminate Technical Uncertainty",          "activities",    60,   False),
+    ("Team Members",                                           "team_members",  49,   True),
+    ("Notes",                                                  "notes",         53,   False),
+    ("Status",                                                 "_status",       22,   False),
+]
+
+def _write_sheet(ws, rows_data: list[dict], subtitle: str):
     """
-    Build an Excel workbook styled to match the original R&D tracking template.
-
-    Parameters
-    ----------
-    all_data       : { username: { month_str: submission_dict } }
-    only_user      : if set, only include rows for that user
-    submitted_only : if True, skip initiatives from non-submitted reports
-    label          : extra text shown in the subtitle row (e.g. "Consolidated — Submitted Only")
+    Write title row, subtitle, spacer, header row, then data rows
+    into worksheet ws.  rows_data is a list of dicts with keys from _COL_DEF
+    plus 'user' for consolidated sheets.
     """
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "R&D Tracking"
-
-    # ── Style constants ──────────────────────────────────────────────────────
-    GREEN     = "9BBB59"   # header row fill  (template's accent3)
-    BEIGE     = "EEECE1"   # data row fill    (template's lt2 / Input cells)
-    YELLOW    = "DED900"   # Team Members col (template's Selection cells)
-    WHITE     = "FFFFFF"
-    DARK      = "1F1F1F"
-
+    border     = _thin_border()
     fill_green  = PatternFill("solid", fgColor=GREEN)
     fill_beige  = PatternFill("solid", fgColor=BEIGE)
     fill_yellow = PatternFill("solid", fgColor=YELLOW)
 
-    thin = Side(style="thin", color="A0A0A0")
-    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    has_user_col = any("user" in r for r in rows_data) if rows_data else False
+    cols = ([("User", "user", 18, False)] if has_user_col else []) + list(_COL_DEF)
 
-    def hdr_font(sz=12):
-        return Font(name="Arial Narrow", bold=True, color=WHITE, size=sz)
-
-    def data_font(bold=False):
-        return Font(name="Arial Narrow", bold=bold, color=DARK, size=11)
-
-    # ── Column layout ────────────────────────────────────────────────────────
-    # Individual export: mirrors original template columns (A–J) + Status col
-    # Consolidated:      prepends "User" column, then same layout
-    is_consolidated = only_user is None
-
-    if is_consolidated:
-        headers = [
-            "User",                                           # A  (extra for consolidated)
-            "Month/Yr",                                       # B
-            "Business Component",                             # C
-            "Initiative Name",                                # D
-            "Initiative Description",                         # E
-            "Tech Uncertainty",                               # F
-            "Start Date",                                     # G
-            "Expected End Date",                              # H
-            "Activities to Eliminate Technical Uncertainty",  # I
-            "Team Members",                                   # J
-            "Notes",                                          # K
-            "Status",                                         # L
-        ]
-        col_widths  = [18, 14, 35, 19, 38, 64, 16, 16, 60, 49, 53, 22]
-        team_col    = 10   # J — yellow
-        status_col  = 12   # L
-    else:
-        headers = [
-            "Month/Yr",                                       # A
-            "Business Component",                             # B
-            "Initiative Name",                                # C
-            "Initiative Description",                         # D
-            "Tech Uncertainty",                               # E
-            "Start Date",                                     # F
-            "Expected End Date",                              # G
-            "Activities to Eliminate Technical Uncertainty",  # H
-            "Team Members",                                   # I
-            "Notes",                                          # J
-            "Status",                                         # K
-        ]
-        col_widths  = [14, 35, 19, 38, 64, 16, 16, 60, 49, 53, 22]
-        team_col    = 9    # I — yellow
-        status_col  = 11   # K
-
-    ncols = len(headers)
-
-    # ── Row 1 — Title ────────────────────────────────────────────────────────
+    # Row 1 — title
     ws.row_dimensions[1].height = 18.3
-    ws.cell(row=1, column=1, value="Monthly R&D Tracking Template").font = Font(
-        name="Arial Narrow", bold=True, size=14, color=DARK
-    )
+    c = ws.cell(1, 1, "Monthly R&D Tracking Template")
+    c.font = Font(name="Arial Narrow", bold=True, size=14, color=DARK)
 
-    # ── Row 2 — Subtitle / export info ──────────────────────────────────────
+    # Row 2 — subtitle
     ws.row_dimensions[2].height = 15
-    subtitle = label or (f"Exported: {datetime.now().strftime('%B %Y')}")
-    ws.cell(row=2, column=1, value=subtitle).font = Font(
-        name="Arial Narrow", size=10, color="666666", italic=True
-    )
+    c = ws.cell(2, 1, subtitle)
+    c.font = Font(name="Arial Narrow", size=10, color=GRAY, italic=True)
 
-    # ── Row 3 — Spacer ───────────────────────────────────────────────────────
+    # Row 3 — spacer
     ws.row_dimensions[3].height = 8
 
-    # ── Row 4 — Column headers ───────────────────────────────────────────────
+    # Row 4 — column headers
     ws.row_dimensions[4].height = 30
-    for ci, h in enumerate(headers, 1):
-        cell = ws.cell(row=4, column=ci, value=h)
+    for ci, (hdr, _, width, _is_team) in enumerate(cols, 1):
+        cell = ws.cell(4, ci, hdr)
         cell.fill      = fill_green
-        cell.font      = hdr_font(12)
+        cell.font      = _hdr_font(12)
         cell.border    = border
         cell.alignment = Alignment(horizontal="center", vertical="top", wrap_text=True)
+        ws.column_dimensions[get_column_letter(ci)].width = width
 
-    # ── Column widths ────────────────────────────────────────────────────────
-    for ci, w in enumerate(col_widths, 1):
-        ws.column_dimensions[get_column_letter(ci)].width = w
+    # Data rows
+    for rn, row in enumerate(rows_data, 5):
+        ws.row_dimensions[rn].height = 45
+        for ci, (_, key, _, is_team) in enumerate(cols, 1):
+            val = row.get(key, "")
+            cell = ws.cell(rn, ci, val)
+            cell.font      = _data_font()
+            cell.border    = border
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+            cell.fill      = fill_yellow if is_team else fill_beige
 
-    # ── Data rows ─────────────────────────────────────────────────────────────
-    row_num = 5
-    for username, months in all_data.items():
-        if only_user and username != only_user:
-            continue
-        for month, sub in months.items():
-            if not sub or not sub.get("initiatives"):
+    ws.freeze_panes = "A5"
+
+
+def _sub_to_rows(username: str, sub: dict, include_user: bool) -> list[dict]:
+    """Convert a submission dict into a list of row dicts for _write_sheet."""
+    rm     = sub.get("reporting_month", "")
+    status = STATUS_LABELS.get(sub.get("status", ""), sub.get("status", ""))
+    rows   = []
+    for init in sub.get("initiatives") or []:
+        row = {
+            "_month":  fmt_month(rm),
+            "_status": status,
+            "business_component":    init.get("business_component",    ""),
+            "initiative_name":       init.get("initiative_name",        ""),
+            "initiative_description":init.get("initiative_description", ""),
+            "tech_uncertainty":      init.get("tech_uncertainty",       ""),
+            "start_date":            str(init.get("start_date")        or ""),
+            "expected_end_date":     str(init.get("expected_end_date") or ""),
+            "activities":            init.get("activities",             ""),
+            "team_members":          ", ".join(init.get("team_members") or []),
+            "notes":                 init.get("notes",                  ""),
+        }
+        if include_user:
+            row["user"] = username
+        rows.append(row)
+    return rows
+
+
+def build_excel_individual(username: str, sub: dict) -> bytes:
+    """Single-user, single-month export — matches original template layout."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = fmt_month_tab(sub.get("reporting_month", ""))
+    entity = sub.get("entity", "")
+    rm     = sub.get("reporting_month", "")
+    subtitle = f"Submitted by: {username}  |  Entity: {entity}  |  Period: {fmt_month(rm)}"
+    rows = _sub_to_rows(username, sub, include_user=False)
+    _write_sheet(ws, rows, subtitle)
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def build_excel_consolidated(
+    all_data: dict,
+    selected_combos: list[tuple[str, str]],
+    submitted_only: bool = False,
+) -> bytes:
+    """
+    Multi-sheet consolidated export.
+    One sheet per (entity, reporting_month) combo.
+    Sheet name: "107 - May 2026"
+    """
+    wb = Workbook()
+    wb.remove(wb.active)   # remove blank default sheet
+
+    for (entity, rm) in selected_combos:
+        sheet_name = f"{entity} - {fmt_month_tab(rm)}"[:31]
+        ws = wb.create_sheet(title=sheet_name)
+        subtitle = (
+            f"Entity: {entity}  |  Period: {fmt_month(rm)}"
+            + ("  |  Submitted & Approved only" if submitted_only else "")
+        )
+        rows = []
+        for username, months in all_data.items():
+            sub = months.get(rm)
+            if not sub:
+                continue
+            if sub.get("entity") != entity:
                 continue
             if submitted_only and sub.get("status") not in ("submitted", "approved"):
                 continue
-            for init in sub["initiatives"]:
-                if is_consolidated:
-                    vals = [
-                        username,
-                        fmt_month(month),
-                        init.get("business_component",    ""),
-                        init.get("initiative_name",        ""),
-                        init.get("initiative_description", ""),
-                        init.get("tech_uncertainty",       ""),
-                        str(init.get("start_date")        or ""),
-                        str(init.get("expected_end_date") or ""),
-                        init.get("activities",             ""),
-                        ", ".join(init.get("team_members") or []),
-                        init.get("notes",                  ""),
-                        STATUS_LABELS.get(sub.get("status",""), sub.get("status","")),
-                    ]
-                else:
-                    vals = [
-                        fmt_month(month),
-                        init.get("business_component",    ""),
-                        init.get("initiative_name",        ""),
-                        init.get("initiative_description", ""),
-                        init.get("tech_uncertainty",       ""),
-                        str(init.get("start_date")        or ""),
-                        str(init.get("expected_end_date") or ""),
-                        init.get("activities",             ""),
-                        ", ".join(init.get("team_members") or []),
-                        init.get("notes",                  ""),
-                        STATUS_LABELS.get(sub.get("status",""), sub.get("status","")),
-                    ]
+            rows.extend(_sub_to_rows(username, sub, include_user=True))
 
-                ws.row_dimensions[row_num].height = 45
-                for ci, val in enumerate(vals, 1):
-                    cell = ws.cell(row=row_num, column=ci, value=val)
-                    cell.font      = data_font()
-                    cell.border    = border
-                    cell.alignment = Alignment(vertical="top", wrap_text=True)
-                    # Column-specific fill colors matching the template
-                    if ci == team_col:
-                        cell.fill = fill_yellow   # Team Members → yellow
-                    else:
-                        cell.fill = fill_beige    # Everything else → beige
-                row_num += 1
+        _write_sheet(ws, rows, subtitle)
 
-    # ── Freeze header row ────────────────────────────────────────────────────
-    ws.freeze_panes = f"A5"
+    # If nothing matched, add a placeholder sheet
+    if not wb.sheetnames:
+        ws = wb.create_sheet("No Data")
+        ws.cell(1, 1, "No matching submissions found.")
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -431,38 +481,22 @@ def inject_css():
     <style>
     #MainMenu, footer, header { visibility: hidden; }
     .stApp { background: #f1f5f9; }
-
     .badge-approved    { background:#f0fdf4; color:#166534; border:1.5px solid #86efac; }
     .badge-submitted   { background:#eff6ff; color:#1e40af; border:1.5px solid #93c5fd; }
     .badge-in-progress { background:#fef9ec; color:#92600a; border:1.5px solid #fcd34d; }
     .badge-rejected    { background:#fff1f2; color:#9f1239; border:1.5px solid #fda4af; }
     .badge-not-started { background:#f8fafc; color:#64748b; border:1.5px solid #cbd5e1; }
     .rd-badge { display:inline-block; padding:3px 12px; border-radius:20px; font-size:12px; font-weight:700; }
-
     .progress-bar-outer { background:#e2e8f0; border-radius:4px; height:8px; overflow:hidden; margin-bottom:6px; }
     .progress-bar-inner { background:#c86a2a; height:100%; border-radius:4px; transition:width 0.3s; }
-
     .wizard-question { font-size:22px; font-weight:700; color:#1a3c5e; margin-bottom:6px; }
     .wizard-hint     { font-size:14px; color:#64748b; margin-bottom:20px; }
     .step-label      { font-size:11px; font-weight:700; color:#c86a2a; text-transform:uppercase; letter-spacing:.8px; }
-
-    .carryover-banner {
-        background:#fffbeb; border:1.5px solid #fcd34d;
-        border-radius:10px; padding:10px 16px; margin-bottom:14px; font-size:13px; color:#92600a;
-    }
-    .prefilled-banner {
-        background:#f0f9ff; border:1.5px solid #93c5fd;
-        border-radius:10px; padding:10px 16px; margin-bottom:14px; font-size:13px; color:#1e40af;
-    }
-    .delete-confirm {
-        background:#fff1f2; border:1.5px solid #fda4af;
-        border-radius:10px; padding:12px 16px; margin-top:8px;
-    }
+    .carryover-banner { background:#fffbeb; border:1.5px solid #fcd34d; border-radius:10px; padding:10px 16px; margin-bottom:14px; font-size:13px; color:#92600a; }
+    .prefilled-banner { background:#f0f9ff; border:1.5px solid #93c5fd; border-radius:10px; padding:10px 16px; margin-bottom:14px; font-size:13px; color:#1e40af; }
+    .delete-confirm   { background:#fff1f2; border:1.5px solid #fda4af; border-radius:10px; padding:12px 16px; margin-top:8px; }
     </style>
     """, unsafe_allow_html=True)
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def badge_html(status: str) -> str:
     cls_map = {
@@ -477,22 +511,14 @@ def badge_html(status: str) -> str:
 
 def init_session():
     defaults = {
-        "screen":       "login",
-        "user":         None,
-        "is_admin":     False,
-        "draft":        {
-            "initiatives":     [],
-            "status":          "in-progress",
-            "entity":          "",
-            "reporting_month": "",
-        },
-        # Admin-level export settings (separate from any user draft)
-        "admin_entity":          "",
-        "admin_reporting_month": "",
-        "wiz_init":     None,
-        "wiz_step":     0,
-        "wiz_mode":     "new",
-        "confirm_del":  None,   # id of initiative pending delete confirmation
+        "screen":      "login",
+        "user":        None,
+        "is_admin":    False,
+        "draft":       empty_draft(),
+        "wiz_init":    None,
+        "wiz_step":    0,
+        "wiz_mode":    "new",
+        "confirm_del": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -512,10 +538,8 @@ def screen_login():
             <p style="color:#64748b; margin:0;">Monthly Reporting Portal</p>
         </div>
         """, unsafe_allow_html=True)
-
         options = ["— Select your name —", "⚙ Admin (Oversight Lead)"] + EMPLOYEES
         sel = st.selectbox("Sign in as", options, label_visibility="collapsed")
-
         if st.button("Sign In →", use_container_width=True, type="primary"):
             if sel.startswith("— "):
                 st.warning("Please select your name.")
@@ -524,14 +548,9 @@ def screen_login():
                 is_admin = "Admin" in sel
                 st.session_state.user     = name
                 st.session_state.is_admin = is_admin
-                if is_admin:
-                    st.session_state.screen = "admin"
-                else:
-                    existing = load_submission(name, cur_month())
-                    st.session_state.draft  = existing or {"initiatives": [], "status": "in-progress"}
-                    st.session_state.screen = "dashboard"
+                st.session_state.draft    = empty_draft()
+                st.session_state.screen   = "admin" if is_admin else "dashboard"
                 st.rerun()
-
         st.markdown(
             '<p style="text-align:center;font-size:12px;color:#94a3b8;margin-top:16px;">'
             'Your entries are saved automatically as you go.</p>',
@@ -545,105 +564,93 @@ def screen_dashboard():
     user      = st.session_state.user
     draft     = st.session_state.draft
     submitted = draft["status"] != "in-progress"
-    cm        = cur_month()
-    pm        = prev_month()
-
-    prev_sub   = load_submission(user, pm)
-    today      = date.today()
-    prev_inits = [
-        i for i in (prev_sub or {}).get("initiatives", [])
-        if not i.get("expected_end_date")
-        or datetime.strptime(str(i["expected_end_date"]), "%Y-%m-%d").date() >= today
-    ] if prev_sub else []
 
     # Header
     c1, c2 = st.columns([5, 1])
     with c1:
-        st.markdown(f"## 🔬 R&D Tracker — {fmt_month(cm)}")
+        period = fmt_month(draft.get("reporting_month")) or "— Set reporting month below"
+        st.markdown(f"## 🔬 R&D Tracker — {period}")
         st.caption(f"Signed in as **{user}**")
     with c2:
         st.write("")
         if st.button("Sign Out"):
-            for k in ["screen","user","is_admin","draft","wiz_init","wiz_step","wiz_mode","confirm_del"]:
-                st.session_state.pop(k, None)
+            for k in list(st.session_state.keys()):
+                del st.session_state[k]
             st.rerun()
 
     st.divider()
 
-    # Status strip
-    c1, c2, c3 = st.columns([4, 1, 1])
-    with c1:
-        st.markdown(f"**Report Status:** {badge_html(draft['status'])}", unsafe_allow_html=True)
-        if draft.get("submitted_at"):
-            ts = datetime.fromtimestamp(draft["submitted_at"] / 1000).strftime("%b %d, %Y %H:%M")
-            st.caption(f"Submitted {ts}")
-        if draft["status"] == "rejected":
-            st.error("Your report was returned. Please revise and resubmit.")
-    with c2:
-        st.metric("Initiatives", len(draft["initiatives"]))
-    with c3:
-        if st.session_state.is_admin:
-            if st.button("Admin View →"):
-                st.session_state.screen = "admin"
-                st.rerun()
-
-    # ── Report Setup ────────────────────────────────────────────────────────
-    # Entity and reporting month are report-level (not per initiative).
-    # Stored in the draft so they're remembered and used in the filename.
+    # ── Report Setup ─────────────────────────────────────────────────────────
+    setup_complete = bool(draft.get("entity") and draft.get("reporting_month"))
     with st.expander(
         "⚙ Report Setup"
         + (f"  —  Entity {draft['entity']}  ·  {fmt_month(draft['reporting_month'])}"
-           if draft.get("entity") and draft.get("reporting_month") else
-           "  ⚠ Please select entity and reporting month"),
-        expanded=not (draft.get("entity") and draft.get("reporting_month")),
+           if setup_complete else "  ⚠ Please select entity and reporting month first"),
+        expanded=not setup_complete,
     ):
         st.caption(
-            "These are used to name your exported file: "
+            "Export filename: "
             "`{entity}_Group_{month}_{year}_Monthly_R_D_Tracking_Template.xlsx`"
         )
         su1, su2 = st.columns(2)
         with su1:
-            entity_idx = ENTITIES.index(draft["entity"]) if draft.get("entity") in ENTITIES else 0
-            chosen_entity = st.selectbox(
-                "Entity",
-                ENTITIES,
-                index=entity_idx,
-                key="setup_entity",
-            )
+            eidx         = ENTITIES.index(draft["entity"]) if draft.get("entity") in ENTITIES else 0
+            chosen_entity = st.selectbox("Entity", ENTITIES, index=eidx, key="su_entity")
         with su2:
-            months_list = available_months()
-            # Default to previous month if not set
-            default_rm   = months_list[1] if len(months_list) > 1 else months_list[0]
-            current_rm   = draft.get("reporting_month") or default_rm
-            rm_idx       = months_list.index(current_rm) if current_rm in months_list else 0
-            chosen_rm    = st.selectbox(
-                "Reporting Month",
-                months_list,
-                index=rm_idx,
-                format_func=fmt_month,
-                key="setup_rm",
+            mlist    = available_months()
+            def_rm   = mlist[1] if len(mlist) > 1 else mlist[0]
+            cur_rm   = draft.get("reporting_month") or def_rm
+            rm_idx   = mlist.index(cur_rm) if cur_rm in mlist else 0
+            chosen_rm = st.selectbox(
+                "Reporting Month", mlist, index=rm_idx,
+                format_func=fmt_month, key="su_rm",
             )
-        # Auto-save whenever either value changes
-        if chosen_entity != draft.get("entity") or chosen_rm != draft.get("reporting_month"):
+
+        entity_changed = chosen_entity != draft.get("entity")
+        month_changed  = chosen_rm     != draft.get("reporting_month")
+
+        if entity_changed or month_changed:
+            if month_changed:
+                # Load existing submission for that month if it exists
+                existing = load_submission(user, chosen_rm)
+                if existing:
+                    draft = existing
+                else:
+                    draft = empty_draft()
             draft["entity"]          = chosen_entity
             draft["reporting_month"] = chosen_rm
-            save_submission(user, cm, draft)
+            save_draft(user, draft)
             st.session_state.draft = draft
             st.rerun()
 
-        if draft.get("entity") and draft.get("reporting_month"):
+        if setup_complete:
             fname = export_filename(draft["entity"], draft["reporting_month"])
             st.success(f"Export will be named: **{fname}**")
 
+    if not setup_complete:
+        st.info("Complete the Report Setup above before adding initiatives.")
+        return
+
     st.divider()
 
-    # ── Carry-over prompt
+    # ── Carry-over from previous period ──────────────────────────────────────
+    pm         = prev_month_of(draft["reporting_month"])
+    prev_sub   = load_submission(user, pm)
+    today      = date.today()
+    prev_inits = []
+    if prev_sub:
+        prev_inits = [
+            i for i in (prev_sub.get("initiatives") or [])
+            if not i.get("expected_end_date")
+            or datetime.strptime(str(i["expected_end_date"]), "%Y-%m-%d").date() >= today
+        ]
+
     if not submitted and prev_inits and not draft["initiatives"]:
         st.markdown(f"""
         <div class="carryover-banner">
             <strong>📋 Ongoing initiatives from {fmt_month(pm)}</strong><br>
-            You had <strong>{len(prev_inits)}</strong> active initiative{"s" if len(prev_inits)!=1 else ""} last month.
-            Carry any forward — key details will be pre-filled; you only update activities and notes.
+            You had <strong>{len(prev_inits)}</strong> active initiative{"s" if len(prev_inits)!=1 else ""} last period.
+            Carry any forward — key details pre-fill; you only update activities and notes.
         </div>
         """, unsafe_allow_html=True)
         cols = st.columns(min(len(prev_inits), 4))
@@ -658,18 +665,33 @@ def screen_dashboard():
 
     st.divider()
 
-    # Initiatives list header
+    # ── Status strip ─────────────────────────────────────────────────────────
+    c1, c2, c3 = st.columns([4, 1, 1])
+    with c1:
+        st.markdown(f"**Report Status:** {badge_html(draft['status'])}", unsafe_allow_html=True)
+        if draft.get("submitted_at"):
+            ts = datetime.fromtimestamp(draft["submitted_at"]/1000).strftime("%b %d, %Y %H:%M")
+            st.caption(f"Submitted {ts}")
+        if draft["status"] == "rejected":
+            st.error("Your report was returned. Please revise and resubmit.")
+    with c2:
+        st.metric("Initiatives", len(draft["initiatives"]))
+    with c3:
+        if st.session_state.is_admin and st.button("Admin View →"):
+            st.session_state.screen = "admin"
+            st.rerun()
+
+    # ── Initiatives list ──────────────────────────────────────────────────────
     c1, c2 = st.columns([5, 1])
     with c1:
-        st.subheader(f"{fmt_month(cm)} Initiatives")
+        st.subheader(f"{fmt_month(draft['reporting_month'])} Initiatives")
     with c2:
-        if not submitted:
-            if st.button("＋ Add Initiative", type="primary"):
-                st.session_state.wiz_init = new_initiative()
-                st.session_state.wiz_step = 0
-                st.session_state.wiz_mode = "new"
-                st.session_state.screen   = "wizard"
-                st.rerun()
+        if not submitted and st.button("＋ Add Initiative", type="primary"):
+            st.session_state.wiz_init = new_initiative()
+            st.session_state.wiz_step = 0
+            st.session_state.wiz_mode = "new"
+            st.session_state.screen   = "wizard"
+            st.rerun()
 
     if not draft["initiatives"]:
         st.info("No initiatives added yet. Click **＋ Add Initiative** to begin this month's report.")
@@ -681,7 +703,6 @@ def screen_dashboard():
                 f"{init.get('initiative_name','Unnamed')} — {init.get('business_component','')}",
                 expanded=True,
             ):
-                # Info
                 st.markdown(f"**{init.get('initiative_description','—')}**")
                 st.caption(
                     f"📅 {init.get('start_date','—')} → {init.get('expected_end_date','—')}  "
@@ -701,24 +722,19 @@ def screen_dashboard():
                     st.markdown(f"*Notes: {init['notes']}*")
 
                 st.write("")
-
-                # Action buttons — Edit and Delete always visible
                 c1, c2, c3 = st.columns([3, 0.8, 0.8])
                 with c2:
-                    if not submitted:
-                        if st.button("✏ Edit", key=f"edit_{iid}"):
-                            st.session_state.wiz_init = dict(init)
-                            st.session_state.wiz_step = 0
-                            st.session_state.wiz_mode = "edit"
-                            st.session_state.screen   = "wizard"
-                            st.rerun()
+                    if not submitted and st.button("✏ Edit", key=f"edit_{iid}"):
+                        st.session_state.wiz_init = dict(init)
+                        st.session_state.wiz_step = 0
+                        st.session_state.wiz_mode = "edit"
+                        st.session_state.screen   = "wizard"
+                        st.rerun()
                 with c3:
-                    # Delete works regardless of submitted status
                     if st.button("🗑 Delete", key=f"del_{iid}"):
                         st.session_state.confirm_del = iid
                         st.rerun()
 
-                # Inline confirmation — only shown for this card
                 if st.session_state.get("confirm_del") == iid:
                     st.markdown('<div class="delete-confirm">', unsafe_allow_html=True)
                     st.warning(
@@ -728,15 +744,12 @@ def screen_dashboard():
                     ca, cb = st.columns(2)
                     with ca:
                         if st.button("Yes, delete it", key=f"conf_yes_{iid}", type="primary"):
-                            draft["initiatives"] = [
-                                i for i in draft["initiatives"] if i["id"] != iid
-                            ]
-                            # If they delete after submitting, reopen the report for editing
+                            draft["initiatives"] = [i for i in draft["initiatives"] if i["id"] != iid]
                             if submitted:
                                 draft["status"] = "in-progress"
                                 draft.pop("submitted_at", None)
-                            save_submission(user, cm, draft)
-                            st.session_state.draft      = draft
+                            save_draft(user, draft)
+                            st.session_state.draft       = draft
                             st.session_state.confirm_del = None
                             st.success("Initiative deleted.")
                             st.rerun()
@@ -746,38 +759,30 @@ def screen_dashboard():
                             st.rerun()
                     st.markdown('</div>', unsafe_allow_html=True)
 
-    # Submit + Export
+    # ── Submit + Export ───────────────────────────────────────────────────────
     st.divider()
     c1, c2 = st.columns([3, 1])
     with c1:
         if not submitted and draft["initiatives"]:
             st.markdown("#### Ready to submit?")
             st.caption(
-                f"This will send your {len(draft['initiatives'])} initiative"
+                f"Sends your {len(draft['initiatives'])} initiative"
                 f"{'s' if len(draft['initiatives'])!=1 else ''} to the Oversight Lead for review."
             )
             if st.button("Submit for Review ✓", type="primary"):
                 draft["status"]       = "submitted"
-                draft["submitted_at"] = int(datetime.now().timestamp() * 1000)
-                save_submission(user, cm, draft)
+                draft["submitted_at"] = int(datetime.now().timestamp()*1000)
+                save_draft(user, draft)
                 st.session_state.draft = draft
                 st.success("Report submitted!")
                 st.rerun()
     with c2:
-        all_data   = {user: {cm: draft}}
-        xlsx_bytes = build_excel(
-            all_data,
-            only_user=user,
-            label=f"Submitted by: {user}  |  Period: {fmt_month(draft.get('reporting_month', cm))}",
-        )
-        ind_fname = export_filename(
-            draft.get("entity", ""),
-            draft.get("reporting_month", cm),
-        )
+        xlsx = build_excel_individual(user, draft)
+        fname = export_filename(draft.get("entity",""), draft.get("reporting_month",""))
         st.download_button(
             "↓ Download My Report",
-            data=xlsx_bytes,
-            file_name=ind_fname,
+            data=xlsx,
+            file_name=fname,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
@@ -791,12 +796,11 @@ def screen_wizard():
     mode  = st.session_state.wiz_mode
     s     = WIZARD_STEPS[step]
     total = len(WIZARD_STEPS)
-    pct   = int((step + 1) / total * 100)
+    pct   = int((step+1)/total*100)
 
     is_carryover = mode == "carryover"
     is_prefilled = is_carryover and s["field"] in CARRYOVER_FIELDS
 
-    # Header
     c1, c2 = st.columns([5, 1])
     with c1:
         title = {"new":"New Initiative","edit":"Edit Initiative","carryover":"Carry Over Initiative"}[mode]
@@ -815,39 +819,28 @@ def screen_wizard():
     </p>
     """, unsafe_allow_html=True)
 
-    # Context banners
     if is_carryover and not is_prefilled:
-        st.markdown(f"""
-        <div class="carryover-banner">
-            <strong>Updating for {fmt_month(cur_month())}:</strong>
+        st.markdown(f"""<div class="carryover-banner">
+            <strong>Updating for {fmt_month(st.session_state.draft.get('reporting_month',''))}:</strong>
             {init.get("initiative_name","this initiative")}
-        </div>
-        """, unsafe_allow_html=True)
+        </div>""", unsafe_allow_html=True)
     elif is_prefilled:
-        st.markdown("""
-        <div class="prefilled-banner">
+        st.markdown("""<div class="prefilled-banner">
             Pre-filled from last month — confirm or update before continuing.
-        </div>
-        """, unsafe_allow_html=True)
+        </div>""", unsafe_allow_html=True)
 
     st.markdown(f'<p class="step-label">Question {step+1} of {total}</p>', unsafe_allow_html=True)
     st.markdown(f'<p class="wizard-question">{s["question"]}</p>', unsafe_allow_html=True)
     st.markdown(f'<p class="wizard-hint">{s["hint"]}</p>', unsafe_allow_html=True)
 
-    # Input
     field   = s["field"]
     val     = init.get(field)
     new_val = val
 
     if s["type"] == "text":
         new_val = st.text_input(s["label"], value=val or "", placeholder=s.get("placeholder",""))
-
     elif s["type"] == "textarea":
-        new_val = st.text_area(
-            s["label"], value=val or "",
-            placeholder=s.get("placeholder",""), height=140,
-        )
-
+        new_val = st.text_area(s["label"], value=val or "", placeholder=s.get("placeholder",""), height=140)
     elif s["type"] == "date":
         parsed = None
         if val:
@@ -857,22 +850,16 @@ def screen_wizard():
                 pass
         picked  = st.date_input(s["label"], value=parsed)
         new_val = picked.strftime("%Y-%m-%d") if picked else None
-
     elif s["type"] == "multiselect":
         new_val = st.multiselect(s["label"], EMPLOYEES, default=val or [])
 
     init[field] = new_val
 
-    # Validation
     if s["required"]:
-        if s["type"] == "multiselect":
-            is_valid = bool(new_val)
-        else:
-            is_valid = bool(str(new_val or "").strip())
+        is_valid = bool(new_val) if s["type"] == "multiselect" else bool(str(new_val or "").strip())
     else:
         is_valid = True
 
-    # Navigation
     c1, c2, c3 = st.columns([1, 4, 1])
     with c1:
         if st.button("← Back", disabled=(step == 0)):
@@ -880,18 +867,14 @@ def screen_wizard():
             st.rerun()
     with c3:
         is_last = step == total - 1
-        label   = "Save Initiative ✓" if is_last else "Next →"
-        if st.button(label, disabled=not is_valid, type="primary"):
+        if st.button("Save Initiative ✓" if is_last else "Next →", disabled=not is_valid, type="primary"):
             if is_last:
                 draft = st.session_state.draft
                 if mode == "edit":
-                    draft["initiatives"] = [
-                        i if i["id"] != init["id"] else init
-                        for i in draft["initiatives"]
-                    ]
+                    draft["initiatives"] = [i if i["id"] != init["id"] else init for i in draft["initiatives"]]
                 else:
                     draft["initiatives"].append(init)
-                save_submission(user, cur_month(), draft)
+                save_draft(user, draft)
                 st.session_state.draft  = draft
                 st.session_state.screen = "dashboard"
             else:
@@ -899,7 +882,6 @@ def screen_wizard():
                 st.session_state.wiz_step += 1
             st.rerun()
 
-    # Step dots
     dots = "".join(
         f'<span style="display:inline-block;width:{"24px" if i==step else "8px"};height:8px;'
         f'border-radius:4px;margin:0 3px;'
@@ -912,160 +894,154 @@ def screen_wizard():
 # ── Admin ─────────────────────────────────────────────────────────────────────
 
 def screen_admin():
-    cm = cur_month()
-    st.markdown(f"## ⚙ Admin Dashboard — {fmt_month(cm)}")
+    st.markdown("## ⚙ Admin Dashboard")
 
     c1, c2 = st.columns([5, 1])
     with c2:
         if st.button("← Back"):
-            st.session_state.screen = (
-                "login" if st.session_state.user == "Admin" else "dashboard"
-            )
+            st.session_state.screen = "login" if st.session_state.user == "Admin" else "dashboard"
             st.rerun()
 
-    reg      = load_registry()
-    all_data = {}
-    for u in reg:
-        all_data[u] = {}
-        for m in [cm, prev_month()]:
-            sub = load_submission(u, m)
-            if sub:
-                all_data[u][m] = sub
+    # Load everything, grouped by (entity, reporting_month)
+    all_data = load_all_submissions()
+    combos   = get_combos(all_data)   # [(entity, rm), ...]
 
-    rows            = [(u, all_data.get(u, {}).get(cm)) for u in reg]
-    submitted_count = sum(1 for _, s in rows if s and s.get("status") in ("submitted","approved"))
-    approved_count  = sum(1 for _, s in rows if s and s.get("status") == "approved")
-    total_inits     = sum(len((s or {}).get("initiatives",[]) or []) for _, s in rows)
+    # ── Summary stats ────────────────────────────────────────────────────────
+    all_subs  = [sub for ud in all_data.values() for sub in ud.values()]
+    n_users   = len(all_data)
+    n_sub     = sum(1 for s in all_subs if s.get("status") in ("submitted","approved"))
+    n_appr    = sum(1 for s in all_subs if s.get("status") == "approved")
+    n_inits   = sum(len(s.get("initiatives") or []) for s in all_subs)
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Team Members",     len(reg))
-    c2.metric("Submitted",        f"{submitted_count}/{len(reg)}")
-    c3.metric("Approved",         approved_count)
-    c4.metric("Total Initiatives",total_inits)
-
-    # Admin export setup — entity and reporting month for filename
-    with st.expander(
-        "⚙ Export Settings"
-        + (f"  —  Entity {st.session_state.admin_entity}"
-           f"  ·  {fmt_month(st.session_state.admin_reporting_month)}"
-           if st.session_state.get("admin_entity") and st.session_state.get("admin_reporting_month")
-           else "  ⚠ Set entity & month for correct filenames"),
-        expanded=not (st.session_state.get("admin_entity") and st.session_state.get("admin_reporting_month")),
-    ):
-        st.caption(
-            "Sets the filename: `{entity}_Group_{month}_{year}_Monthly_R_D_Tracking_Template.xlsx`"
-        )
-        ae1, ae2 = st.columns(2)
-        with ae1:
-            aidx = ENTITIES.index(st.session_state.admin_entity)                 if st.session_state.get("admin_entity") in ENTITIES else 0
-            st.session_state.admin_entity = st.selectbox(
-                "Entity", ENTITIES, index=aidx, key="adm_entity_sel"
-            )
-        with ae2:
-            mlist   = available_months()
-            def_rm  = mlist[1] if len(mlist) > 1 else mlist[0]
-            cur_arm = st.session_state.get("admin_reporting_month") or def_rm
-            arm_idx = mlist.index(cur_arm) if cur_arm in mlist else 0
-            st.session_state.admin_reporting_month = st.selectbox(
-                "Reporting Month", mlist, index=arm_idx,
-                format_func=fmt_month, key="adm_rm_sel"
-            )
-        adm_e  = st.session_state.admin_entity
-        adm_rm = st.session_state.admin_reporting_month
-        if adm_e and adm_rm:
-            st.success(
-                f"Consolidated export will be named: "
-                f"**{export_filename(adm_e, adm_rm, 'Consolidated')}**"
-            )
-
-    adm_e  = st.session_state.get("admin_entity",          "")
-    adm_rm = st.session_state.get("admin_reporting_month", cm)
-
-    # Exports — side by side
-    ex1, ex2 = st.columns(2)
-    with ex1:
-        all_bytes = build_excel(
-            all_data,
-            label=f"Consolidated — All Users  |  Period: {fmt_month(adm_rm)}",
-        )
-        st.download_button(
-            "↓ Consolidated — All Users",
-            data=all_bytes,
-            file_name=export_filename(adm_e, adm_rm, "Consolidated_All"),
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-    with ex2:
-        sub_bytes = build_excel(
-            all_data,
-            submitted_only=True,
-            label=f"Consolidated — Submitted & Approved Only  |  Period: {fmt_month(adm_rm)}",
-        )
-        st.download_button(
-            "↓ Consolidated — Submitted Only",
-            data=sub_bytes,
-            file_name=export_filename(adm_e, adm_rm, "Consolidated_Submitted"),
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Team Members",     n_users)
+    c2.metric("Unique Combos",    len(combos))
+    c3.metric("Submitted",        n_sub)
+    c4.metric("Approved",         n_appr)
+    c5.metric("Total Initiatives",n_inits)
 
     st.divider()
-    st.subheader(f"Team Submissions — {fmt_month(cm)}")
 
-    if not reg:
-        st.info("No submissions recorded yet.")
+    # ── Combo selector + consolidated export ─────────────────────────────────
+    st.subheader("Consolidated Export")
+
+    if not combos:
+        st.info("No submissions found yet.")
+    else:
+        combo_labels  = {f"{e} — {fmt_month(rm)}": (e, rm) for e, rm in combos}
+        all_labels    = list(combo_labels.keys())
+
+        sel_all = st.checkbox("Select all combos", value=True, key="sel_all_combos")
+        if sel_all:
+            chosen_labels = all_labels
+        else:
+            chosen_labels = st.multiselect(
+                "Choose which entity/month combinations to include:",
+                all_labels,
+                default=all_labels,
+            )
+
+        chosen_combos = [combo_labels[l] for l in chosen_labels]
+
+        submitted_only = st.checkbox("Submitted & Approved only (exclude In Progress / Returned)", value=True)
+
+        if chosen_combos:
+            tab_preview = ", ".join(f'"{e} - {fmt_month_tab(rm)}"' for e,rm in chosen_combos[:4])
+            if len(chosen_combos) > 4:
+                tab_preview += f" +{len(chosen_combos)-4} more"
+            st.caption(f"Excel tabs: {tab_preview}")
+
+        ex1, ex2 = st.columns(2)
+        with ex1:
+            if chosen_combos:
+                xlsx = build_excel_consolidated(all_data, chosen_combos, submitted_only=False)
+                # Use first combo for filename, or "Consolidated"
+                fe, frm = chosen_combos[0]
+                tag = "Consolidated_All" if len(chosen_combos) > 1 else "All"
+                st.download_button(
+                    f"↓ Download — All Statuses ({len(chosen_combos)} combo{'s' if len(chosen_combos)!=1 else ''})",
+                    data=xlsx,
+                    file_name=export_filename(fe, frm, tag),
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+        with ex2:
+            if chosen_combos:
+                xlsx_sub = build_excel_consolidated(all_data, chosen_combos, submitted_only=True)
+                tag2 = "Consolidated_Submitted" if len(chosen_combos) > 1 else "Submitted"
+                st.download_button(
+                    f"↓ Download — Submitted Only ({len(chosen_combos)} combo{'s' if len(chosen_combos)!=1 else ''})",
+                    data=xlsx_sub,
+                    file_name=export_filename(fe, frm, tag2),
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+
+    st.divider()
+
+    # ── Submissions by combo ──────────────────────────────────────────────────
+    if not combos:
         return
 
-    for u, sub in rows:
-        status = (sub or {}).get("status", "not-started")
-        inits  = (sub or {}).get("initiatives") or []
-        icon   = {"approved":"✅","submitted":"🔵","in-progress":"🟡",
-                  "rejected":"🔴","not-started":"⚪"}.get(status,"⚪")
+    st.subheader("Team Submissions by Period")
 
-        with st.expander(
-            f"{icon}  {u}   —  {STATUS_LABELS.get(status,'—')}   "
-            f"({len(inits)} initiative{'s' if len(inits)!=1 else ''})",
-            expanded=False,
-        ):
-            if not sub:
-                st.caption("No submission for this month.")
-            else:
-                c1, c2, c3 = st.columns([3, 1, 1])
-                with c1:
+    for (entity, rm) in combos:
+        st.markdown(f"#### Entity {entity} — {fmt_month(rm)}")
+
+        # Find all users who have a submission for this combo
+        combo_rows = []
+        for username, months in all_data.items():
+            sub = months.get(rm)
+            if not sub or sub.get("entity") != entity:
+                continue
+            combo_rows.append((username, sub))
+
+        if not combo_rows:
+            st.caption("No submissions.")
+            continue
+
+        for username, sub in combo_rows:
+            status = sub.get("status", "not-started")
+            inits  = sub.get("initiatives") or []
+            icon   = {"approved":"✅","submitted":"🔵","in-progress":"🟡",
+                      "rejected":"🔴","not-started":"⚪"}.get(status,"⚪")
+
+            with st.expander(
+                f"{icon}  {username}   —  {STATUS_LABELS.get(status,'—')}  "
+                f"({len(inits)} initiative{'s' if len(inits)!=1 else ''})",
+                expanded=False,
+            ):
+                ac1, ac2, ac3 = st.columns([3, 1, 1])
+                with ac1:
                     if sub.get("submitted_at"):
                         ts = datetime.fromtimestamp(sub["submitted_at"]/1000).strftime("%b %d %H:%M")
                         st.caption(f"Submitted: {ts}")
-                with c2:
+                with ac2:
                     if status == "submitted":
-                        if st.button("✓ Approve", key=f"appr_{u}", type="primary"):
+                        if st.button("✓ Approve", key=f"appr_{entity}_{rm}_{username}", type="primary"):
                             sub["status"]      = "approved"
                             sub["approved_at"] = int(datetime.now().timestamp()*1000)
-                            save_submission(u, cm, sub)
-                            st.success(f"{u}'s report approved!")
+                            save_draft(username, sub)
+                            st.success(f"{username} approved!")
                             st.rerun()
-                with c3:
+                with ac3:
                     if status == "submitted":
-                        if st.button("↩ Return", key=f"rej_{u}"):
+                        if st.button("↩ Return", key=f"rej_{entity}_{rm}_{username}"):
                             sub["status"]      = "rejected"
                             sub["rejected_at"] = int(datetime.now().timestamp()*1000)
-                            save_submission(u, cm, sub)
-                            st.warning(f"{u}'s report returned.")
+                            save_draft(username, sub)
+                            st.warning(f"{username}'s report returned.")
                             st.rerun()
 
-                u_bytes = build_excel(
-                    {u: {cm: sub}},
-                    only_user=u,
-                    label=(
-                        f"Submitted by: {u}  |  "
-                        f"Period: {fmt_month(sub.get('reporting_month', cm))}"
-                    ),
-                )
-                u_entity = sub.get("entity") or st.session_state.get("admin_entity", "")
-                u_rm     = sub.get("reporting_month") or cm
+                # Per-user individual export
+                u_xlsx  = build_excel_individual(username, sub)
+                u_fname = export_filename(entity, rm)
+                # Disambiguate filename with username suffix
+                u_fname = u_fname.replace(".xlsx", f"_{_safe_name(username)}.xlsx")
                 st.download_button(
-                    f"↓ Export {u}'s Report",
-                    data=u_bytes,
-                    file_name=export_filename(u_entity, u_rm),
+                    f"↓ Export {username}'s Report",
+                    data=u_xlsx,
+                    file_name=u_fname,
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key=f"dl_{u}",
+                    key=f"dl_{entity}_{rm}_{username}",
                 )
 
                 if inits:
@@ -1077,6 +1053,8 @@ def screen_admin():
                             f"{i.get('business_component','')} · "
                             f"👥 {', '.join(i.get('team_members') or ['—'])}"
                         )
+
+        st.write("")  # spacing between combos
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
