@@ -330,14 +330,10 @@ def rollover_entity(
     create a new in-progress draft under (source_entity, target_month)
     — unless they already have one there.
 
-    Only carries over initiatives whose expected_end_date >= target_month start.
+    Carries ALL initiatives regardless of end date — the admin is explicitly
+    choosing what to roll over, so the app doesn't second-guess them.
     Returns list of usernames that were rolled over.
     """
-    try:
-        target_start = datetime.strptime(target_month, "%Y-%m").date()
-    except Exception:
-        return []
-
     rolled: list[str] = []
 
     for username, months in all_data.items():
@@ -345,32 +341,23 @@ def rollover_entity(
         if not src_sub or src_sub.get("entity") != source_entity:
             continue
 
-        # Don't overwrite an existing submission
+        # Don't overwrite an existing submission for that period
         existing = load_submission(username, target_month)
         if existing and existing.get("entity") == source_entity:
             continue
 
+        initiatives = src_sub.get("initiatives") or []
+        if not initiatives:
+            continue
+
         new_sub: dict = {
-            "initiatives":     [],
+            "initiatives":     [carryover_initiative(i) for i in initiatives],
             "status":          "in-progress",
             "entity":          source_entity,
             "reporting_month": target_month,
         }
-
-        for init in (src_sub.get("initiatives") or []):
-            end = init.get("expected_end_date")
-            if end:
-                try:
-                    if datetime.strptime(str(end), "%Y-%m-%d").date() < target_start:
-                        continue   # initiative ended before target period
-                except Exception:
-                    pass
-            new_sub["initiatives"].append(carryover_initiative(init))
-
-        # Only create the new sub if there's at least one initiative to carry
-        if new_sub["initiatives"]:
-            save_draft(username, new_sub)
-            rolled.append(username)
+        save_draft(username, new_sub)
+        rolled.append(username)
 
     return rolled
 
@@ -1174,23 +1161,9 @@ def screen_admin():
             existing = load_submission(username, chosen_target)
             if existing and existing.get("entity") == src_entity:
                 continue
-            inits_to_carry = []
-            try:
-                target_start = datetime.strptime(chosen_target, "%Y-%m").date()
-            except Exception:
-                target_start = date.today()
-            for init in (sub.get("initiatives") or []):
-                end = init.get("expected_end_date")
-                skip = False
-                if end:
-                    try:
-                        if datetime.strptime(str(end), "%Y-%m-%d").date() < target_start:
-                            skip = True
-                    except Exception:
-                        pass
-                if not skip:
-                    inits_to_carry.append(init.get("initiative_name","Unnamed"))
-            if inits_to_carry:
+            inits = sub.get("initiatives") or []
+            if inits:
+                inits_to_carry = [i.get("initiative_name", "Unnamed") for i in inits]
                 preview_users.append((username, inits_to_carry))
 
         if src_month == chosen_target:
