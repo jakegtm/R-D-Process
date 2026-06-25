@@ -267,6 +267,114 @@ def get_combos(all_data: dict) -> list[tuple[str, str]]:
     return sorted(combos, key=lambda x: (x[1], x[0]))
 
 
+# ── Memory / history helpers ─────────────────────────────────────────────────
+
+def get_past_ongoing_initiatives(username: str, current_reporting_month: str) -> list[dict]:
+    """
+    Returns all initiatives from ALL past submissions for this user where
+    expected_end_date is still in the future (or not set).
+    Deduplicates by initiative_name so the same initiative doesn't appear
+    multiple times if it was carried over in earlier months.
+    """
+    months    = load_user_months(username)
+    today     = date.today()
+    seen      = set()
+    result    = []
+
+    # Walk months newest-first so we get the most recent version of each initiative
+    for month in sorted(months, reverse=True):
+        if month >= current_reporting_month:
+            continue   # skip current or future periods
+        sub = load_submission(username, month)
+        if not sub:
+            continue
+        for init in (sub.get("initiatives") or []):
+            name = init.get("initiative_name", "").strip().lower()
+            if name in seen:
+                continue   # already have a newer version
+            seen.add(name)
+            end = init.get("expected_end_date")
+            if end:
+                try:
+                    if datetime.strptime(str(end), "%Y-%m-%d").date() < today:
+                        continue   # already ended
+                except Exception:
+                    pass
+            result.append(init)
+    return result
+
+
+def get_user_history(username: str) -> list[tuple[str, dict]]:
+    """
+    Returns [(month_str, submission_dict), ...] sorted newest-first.
+    """
+    months = load_user_months(username)
+    history = []
+    for month in sorted(months, reverse=True):
+        sub = load_submission(username, month)
+        if sub:
+            history.append((month, sub))
+    return history
+
+
+# ── Entity rollover ───────────────────────────────────────────────────────────
+
+def rollover_entity(
+    all_data: dict,
+    source_entity: str,
+    source_month: str,
+    target_month: str,
+) -> list[str]:
+    """
+    For every user who has a submission under (source_entity, source_month),
+    create a new in-progress draft under (source_entity, target_month)
+    — unless they already have one there.
+
+    Only carries over initiatives whose expected_end_date >= target_month start.
+    Returns list of usernames that were rolled over.
+    """
+    try:
+        target_start = datetime.strptime(target_month, "%Y-%m").date()
+    except Exception:
+        return []
+
+    rolled: list[str] = []
+
+    for username, months in all_data.items():
+        src_sub = months.get(source_month)
+        if not src_sub or src_sub.get("entity") != source_entity:
+            continue
+
+        # Don't overwrite an existing submission
+        existing = load_submission(username, target_month)
+        if existing and existing.get("entity") == source_entity:
+            continue
+
+        new_sub: dict = {
+            "initiatives":     [],
+            "status":          "in-progress",
+            "entity":          source_entity,
+            "reporting_month": target_month,
+        }
+
+        for init in (src_sub.get("initiatives") or []):
+            end = init.get("expected_end_date")
+            if end:
+                try:
+                    if datetime.strptime(str(end), "%Y-%m-%d").date() < target_start:
+                        continue   # initiative ended before target period
+                except Exception:
+                    pass
+            new_sub["initiatives"].append(carryover_initiative(init))
+
+        # Only create the new sub if there's at least one initiative to carry
+        if new_sub["initiatives"]:
+            save_draft(username, new_sub)
+            rolled.append(username)
+
+    return rolled
+
+
 # ── Initiative helpers ────────────────────────────────────────────────────────
 
 def new_initiative() -> dict:
@@ -633,29 +741,26 @@ def screen_dashboard():
 
     st.divider()
 
-    # ── Carry-over from previous period ──────────────────────────────────────
-    pm         = prev_month_of(draft["reporting_month"])
-    prev_sub   = load_submission(user, pm)
-    today      = date.today()
-    prev_inits = []
-    if prev_sub:
-        prev_inits = [
-            i for i in (prev_sub.get("initiatives") or [])
-            if not i.get("expected_end_date")
-            or datetime.strptime(str(i["expected_end_date"]), "%Y-%m-%d").date() >= today
-        ]
+    # ── Carry-over from any past period ─────────────────────────────────────
+    # Searches ALL past months for this user (not just previous month)
+    # so nothing falls through the cracks.
+    past_inits = get_past_ongoing_initiatives(user, draft["reporting_month"])
 
-    if not submitted and prev_inits and not draft["initiatives"]:
+    # Filter out initiatives already in the current draft (by name)
+    current_names = {i.get("initiative_name","").strip().lower() for i in draft["initiatives"]}
+    past_inits    = [i for i in past_inits if i.get("initiative_name","").strip().lower() not in current_names]
+
+    if not submitted and past_inits:
         st.markdown(f"""
         <div class="carryover-banner">
-            <strong>📋 Ongoing initiatives from {fmt_month(pm)}</strong><br>
-            You had <strong>{len(prev_inits)}</strong> active initiative{"s" if len(prev_inits)!=1 else ""} last period.
+            <strong>📋 Ongoing initiatives from past periods</strong><br>
+            {len(past_inits)} active initiative{"s" if len(past_inits)!=1 else ""} found across your history.
             Carry any forward — key details pre-fill; you only update activities and notes.
         </div>
         """, unsafe_allow_html=True)
-        cols = st.columns(min(len(prev_inits), 4))
-        for idx, pi in enumerate(prev_inits):
-            with cols[idx % 4]:
+        cols = st.columns(min(len(past_inits), 3))
+        for idx, pi in enumerate(past_inits):
+            with cols[idx % 3]:
                 if st.button(f"↩ {pi.get('initiative_name','Unnamed')}", key=f"co_{pi['id']}"):
                     st.session_state.wiz_init = carryover_initiative(pi)
                     st.session_state.wiz_step = 0
@@ -785,6 +890,56 @@ def screen_dashboard():
             file_name=fname,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
+
+    # ── History ──────────────────────────────────────────────────────────────
+    st.write("")
+    render_history_section(user, draft.get("reporting_month",""))
+
+
+# ── History (shown below submit on the dashboard) ───────────────────────────
+
+def render_history_section(user: str, current_reporting_month: str):
+    """Renders a collapsible history of all past submissions for this user."""
+    history = get_user_history(user)
+    # Exclude current period from history display
+    history = [(m, s) for m, s in history if m != current_reporting_month]
+
+    if not history:
+        return
+
+    with st.expander(f"📁 My Submission History ({len(history)} past period{'s' if len(history)!=1 else ''})", expanded=False):
+        for month, sub in history:
+            entity  = sub.get("entity", "—")
+            status  = sub.get("status", "not-started")
+            inits   = sub.get("initiatives") or []
+            st.markdown(
+                f"**{entity} — {fmt_month(month)}** &nbsp; {badge_html(status)} &nbsp; "
+                f"*{len(inits)} initiative{'s' if len(inits)!=1 else ''}*",
+                unsafe_allow_html=True,
+            )
+            if inits:
+                for i in inits:
+                    st.markdown(
+                        f"&nbsp;&nbsp;&nbsp;• **{i.get('initiative_name','Unnamed')}** — "
+                        f"{i.get('business_component','')}  "
+                        f"📅 {i.get('start_date','—')} → {i.get('expected_end_date','—')}  "
+                        f"👥 {', '.join(i.get('team_members') or ['—'])}",
+                        unsafe_allow_html=True,
+                    )
+                    if i.get("tech_uncertainty"):
+                        st.caption(f"   Uncertainty: {i['tech_uncertainty'][:120]}{'…' if len(i.get('tech_uncertainty',''))>120 else ''}")
+            # Export button for this past period
+            if sub.get("entity") and sub.get("reporting_month"):
+                h_xlsx  = build_excel_individual(user, sub)
+                h_fname = export_filename(sub["entity"], sub["reporting_month"])
+                st.download_button(
+                    f"↓ {entity} — {fmt_month(month)}",
+                    data=h_xlsx,
+                    file_name=h_fname,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key=f"hist_dl_{month}",
+                )
+            st.write("")
 
 
 # ── Wizard ────────────────────────────────────────────────────────────────────
@@ -974,6 +1129,103 @@ def screen_admin():
                     file_name=export_filename(fe, frm, tag2),
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
+
+    st.divider()
+
+    # ── Entity Rollover ───────────────────────────────────────────────────────
+    st.subheader("🔄 Entity Rollover")
+    st.caption(
+        "Copy all active initiatives from one entity/month combo into a new period. "
+        "Only initiatives whose expected end date hasn't passed will be carried. "
+        "Users who already have a submission for the target period won't be overwritten."
+    )
+
+    if not combos:
+        st.info("No submissions to roll over yet.")
+    else:
+        combo_labels_ro = {f"{e} — {fmt_month(rm)}": (e, rm) for e, rm in combos}
+        ro1, ro2 = st.columns(2)
+
+        with ro1:
+            src_label = st.selectbox(
+                "Source (roll FROM)",
+                list(combo_labels_ro.keys()),
+                key="ro_src",
+            )
+        src_entity, src_month = combo_labels_ro[src_label]
+
+        with ro2:
+            mlist_ro   = available_months()
+            def_ro_idx = 0  # newest month as default target
+            chosen_target = st.selectbox(
+                "Target (roll TO)",
+                mlist_ro,
+                index=def_ro_idx,
+                format_func=fmt_month,
+                key="ro_target",
+            )
+
+        # Preview what would happen
+        preview_users = []
+        for username, months in all_data.items():
+            sub = months.get(src_month)
+            if not sub or sub.get("entity") != src_entity:
+                continue
+            existing = load_submission(username, chosen_target)
+            if existing and existing.get("entity") == src_entity:
+                continue
+            inits_to_carry = []
+            try:
+                target_start = datetime.strptime(chosen_target, "%Y-%m").date()
+            except Exception:
+                target_start = date.today()
+            for init in (sub.get("initiatives") or []):
+                end = init.get("expected_end_date")
+                skip = False
+                if end:
+                    try:
+                        if datetime.strptime(str(end), "%Y-%m-%d").date() < target_start:
+                            skip = True
+                    except Exception:
+                        pass
+                if not skip:
+                    inits_to_carry.append(init.get("initiative_name","Unnamed"))
+            if inits_to_carry:
+                preview_users.append((username, inits_to_carry))
+
+        if src_month == chosen_target:
+            st.warning("Source and target are the same period — choose a different target month.")
+        elif not preview_users:
+            st.info("No users have active initiatives to roll over into this target period.")
+        else:
+            st.markdown(
+                f"**Preview:** Rolling **{src_entity} — {fmt_month(src_month)}** → "
+                f"**{fmt_month(chosen_target)}** will create in-progress drafts for:"
+            )
+            for uname, init_names in preview_users:
+                st.markdown(
+                    f"&nbsp;&nbsp;• **{uname}** — "
+                    + ", ".join(f"*{n}*" for n in init_names),
+                    unsafe_allow_html=True,
+                )
+
+            if st.button(
+                f"🔄 Roll Over {src_entity} — {fmt_month(src_month)} → {fmt_month(chosen_target)}",
+                type="primary",
+                key="do_rollover",
+            ):
+                rolled = rollover_entity(all_data, src_entity, src_month, chosen_target)
+                if rolled:
+                    st.success(
+                        f"✓ Rolled over for: {', '.join(rolled)}. "
+                        f"They'll see a pre-filled draft when they sign in and select {fmt_month(chosen_target)}."
+                    )
+                    # Reload data so the new combos appear
+                    all_data = load_all_submissions()
+                    combos   = get_combos(all_data)
+                    st.rerun()
+                else:
+                    st.info("Nothing to roll over (all users may already have a submission for that period).")
 
     st.divider()
 
