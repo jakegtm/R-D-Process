@@ -5,14 +5,10 @@ Run with: streamlit run app.py
 
 import streamlit as st
 import json
-import os
 from datetime import datetime, date
 from pathlib import Path
-
 from openpyxl import Workbook
-from openpyxl.styles import (
-    PatternFill, Font, Alignment, Border, Side
-)
+from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 import io
 
@@ -35,27 +31,30 @@ EMPLOYEES = [
     "Jonathan", "Steven", "Michael", "Joe", "Nicole Browne",
 ]
 
-BIZ_COMPONENTS = [
-    "Software Development", "Hardware Engineering", "Process Innovation",
-    "Product Development", "Data & Analytics", "Infrastructure", "Other",
-]
-
 STATUS_LABELS = {
-    "in-progress":  "🟡 In Progress",
-    "submitted":    "🔵 Submitted for Review",
-    "approved":     "🟢 Approved",
-    "rejected":     "🔴 Returned — Needs Revision",
-    "not-started":  "⚪ Not Started",
+    "in-progress": "🟡 In Progress",
+    "submitted":   "🔵 Submitted for Review",
+    "approved":    "🟢 Approved",
+    "rejected":    "🔴 Returned — Needs Revision",
+    "not-started": "⚪ Not Started",
 }
 
+# ── Wizard Steps — exactly the columns in the Excel template ─────────────────
+#
+#  Column order: Month/Yr | Business Component | Initiative Name |
+#  Initiative Description | Tech Uncertainty | Start Date | Expected End Date |
+#  Activities to Eliminate Technical Uncertainty | Team Members | Notes
+#
+#  Month/Yr is auto-filled from the current month — not asked as a question.
+#
 WIZARD_STEPS = [
     {
         "field": "business_component",
         "label": "Business Component",
-        "type": "select",
-        "opts": BIZ_COMPONENTS,
+        "type": "text",
+        "placeholder": "e.g. Software Development, Hardware Engineering...",
         "question": "What business component does this initiative belong to?",
-        "hint": "Select the primary business area that this R&D work supports.",
+        "hint": "Enter the area of the business this R&D work supports.",
         "required": True,
     },
     {
@@ -78,11 +77,11 @@ WIZARD_STEPS = [
     },
     {
         "field": "tech_uncertainty",
-        "label": "Technical Uncertainty",
+        "label": "Tech Uncertainty",
         "type": "textarea",
         "placeholder": "It is currently unknown whether... We are testing if...",
         "question": "What technical uncertainty are you working to resolve?",
-        "hint": "Core R&D eligibility question: what scientific or technical question are you trying to answer? What don't you know yet?",
+        "hint": "What scientific or technical question are you trying to answer? What don't you know yet? This is key for R&D eligibility.",
         "required": True,
     },
     {
@@ -103,27 +102,19 @@ WIZARD_STEPS = [
     },
     {
         "field": "activities",
-        "label": "R&D Activities This Month",
+        "label": "Activities to Eliminate Technical Uncertainty",
         "type": "textarea",
         "placeholder": "Prototyping new approach, running performance tests, analyzing results...",
-        "question": "What R&D activities are being conducted this month?",
-        "hint": "Describe specific tasks, experiments, or development work happening this period.",
+        "question": "What activities are being conducted to eliminate the technical uncertainty?",
+        "hint": "Describe the specific tasks, experiments, or development work happening this month.",
         "required": True,
     },
     {
         "field": "team_members",
         "label": "Team Members",
         "type": "multiselect",
-        "question": "Which team members are contributing this month?",
-        "hint": "Select everyone logging R&D hours to this initiative this period.",
-        "required": True,
-    },
-    {
-        "field": "expected_hours",
-        "label": "Expected Hours",
-        "type": "number",
-        "question": "How many total R&D hours are expected this month?",
-        "hint": "Combined estimate across all team members for this initiative.",
+        "question": "Which team members are working on this initiative?",
+        "hint": "Select everyone contributing to this initiative this month.",
         "required": True,
     },
     {
@@ -132,112 +123,24 @@ WIZARD_STEPS = [
         "type": "textarea",
         "placeholder": "Optional — blockers, scope changes, anything useful for review...",
         "question": "Any additional notes or comments?",
-        "hint": "Include anything helpful for the Oversight Lead's review.",
+        "hint": "Include anything helpful for the Oversight Lead's review. This field is optional.",
         "required": False,
-    },
-
-    # ── DONI'S QUESTIONS ──────────────────────────────────────────────────────
-    # These are sample questions — edit the text, type, and opts as needed.
-    # To remove a question: delete its block.
-    # To add a question: copy a block and give it a unique "field" name.
-    # Supported types: text, textarea, select, multiselect, number, date, yesno
-    # ─────────────────────────────────────────────────────────────────────────
-
-    {
-        "field": "rd_activity_type",
-        "label": "Type of R&D Activity",
-        "type": "select",
-        "opts": [
-            "Basic Research — expanding general knowledge, no specific application yet",
-            "Applied Research — directed toward a specific practical goal",
-            "Experimental Development — using research to create new products or processes",
-        ],
-        "question": "What type of R&D activity best describes this initiative?",
-        "hint": "This helps classify the work for reporting purposes. Choose the closest match.",
-        "required": True,
-        "doni": True,   # mark as Doni's question so it's easy to find
-    },
-    {
-        "field": "rd_time_percentage",
-        "label": "% of Time on R&D",
-        "type": "number",
-        "question": "What percentage of the team's time this month is R&D work on this initiative?",
-        "hint": "Estimate the portion of hours that qualify as genuine R&D vs. routine work. Enter a number between 0 and 100.",
-        "required": True,
-        "doni": True,
-    },
-    {
-        "field": "prior_month_progress",
-        "label": "Progress vs. Last Month",
-        "type": "select",
-        "opts": [
-            "Significant progress — major new findings or breakthroughs",
-            "Moderate progress — advancing but no major breakthroughs yet",
-            "Minimal progress — work ongoing, results inconclusive",
-            "Blocked — work paused due to obstacles (explain in notes)",
-            "N/A — this is a new initiative",
-        ],
-        "question": "How did work this month advance your understanding of the technical uncertainty compared to last month?",
-        "hint": "Give an honest assessment of momentum. Use the Notes field to add detail.",
-        "required": True,
-        "doni": True,
-    },
-    {
-        "field": "obstacles",
-        "label": "Obstacles & Challenges",
-        "type": "textarea",
-        "placeholder": "e.g. Waiting on equipment, dependency on another team, unexpected test failures...",
-        "question": "What obstacles or challenges did you encounter this month?",
-        "hint": "Note anything that slowed progress or may affect future months. Leave blank if none.",
-        "required": False,
-        "doni": True,
-    },
-    {
-        "field": "next_month_plan",
-        "label": "Next Month Plan",
-        "type": "textarea",
-        "placeholder": "e.g. Complete prototype v2, run user testing, analyze data set...",
-        "question": "What do you plan to work on for this initiative next month?",
-        "hint": "A brief outline helps the Oversight Lead understand the trajectory of the work.",
-        "required": True,
-        "doni": True,
-    },
-    {
-        "field": "uncertainty_status",
-        "label": "Uncertainty Resolution Status",
-        "type": "select",
-        "opts": [
-            "Still unresolved — uncertainty remains, work continues",
-            "Partially resolved — some answers found, more work needed",
-            "Fully resolved — technical uncertainty has been eliminated",
-            "Abandoned — initiative discontinued (explain in notes)",
-        ],
-        "question": "What is the current status of the technical uncertainty for this initiative?",
-        "hint": "Has your R&D work answered the core technical question yet?",
-        "required": True,
-        "doni": True,
     },
 ]
 
-# Fields that carry over vs. fields that reset each month
+# Fields that pre-fill when carrying over from the previous month
 CARRYOVER_FIELDS = {
     "business_component", "initiative_name", "initiative_description",
     "tech_uncertainty", "start_date", "expected_end_date", "team_members",
-    "rd_activity_type",   # type of R&D doesn't usually change month to month
 }
-RESET_FIELDS = {
-    "activities", "expected_hours", "notes",
-    "rd_time_percentage", "prior_month_progress", "obstacles",
-    "next_month_plan", "uncertainty_status",
-}
+# Fields that reset each month (must be filled in fresh)
+RESET_FIELDS = {"activities", "notes"}
 
 
 # ── Data Helpers ──────────────────────────────────────────────────────────────
 
 def cur_month() -> str:
-    """Returns 'YYYY-MM'"""
     return datetime.now().strftime("%Y-%m")
-
 
 def prev_month() -> str:
     n = datetime.now()
@@ -245,40 +148,29 @@ def prev_month() -> str:
         return f"{n.year - 1}-12"
     return f"{n.year}-{str(n.month - 1).zfill(2)}"
 
-
 def fmt_month(m: str) -> str:
     if not m:
         return ""
     y, mo = m.split("-")
     return datetime(int(y), int(mo), 1).strftime("%B %Y")
 
-
 def data_path(username: str, month: str) -> Path:
     safe = username.replace(" ", "_").replace("/", "_")
     return DATA_DIR / f"{safe}_{month}.json"
 
-
 def registry_path() -> Path:
     return DATA_DIR / "registry.json"
 
-
 def load_registry() -> list:
     p = registry_path()
-    if p.exists():
-        return json.loads(p.read_text())
-    return []
-
+    return json.loads(p.read_text()) if p.exists() else []
 
 def save_registry(users: list):
     registry_path().write_text(json.dumps(users, indent=2))
 
-
 def load_submission(username: str, month: str) -> dict | None:
     p = data_path(username, month)
-    if p.exists():
-        return json.loads(p.read_text())
-    return None
-
+    return json.loads(p.read_text()) if p.exists() else None
 
 def save_submission(username: str, month: str, data: dict):
     data_path(username, month).write_text(json.dumps(data, indent=2))
@@ -287,32 +179,22 @@ def save_submission(username: str, month: str, data: dict):
         reg.append(username)
         save_registry(reg)
 
-
 def new_initiative() -> dict:
     return {
         "id": f"{int(datetime.now().timestamp()*1000)}",
-        # Core fields (Excel columns)
-        "business_component": "",
-        "initiative_name": "",
-        "initiative_description": "",
-        "tech_uncertainty": "",
-        "start_date": None,
-        "expected_end_date": None,
-        "activities": "",
-        "team_members": [],
-        "expected_hours": 0,
-        "notes": "",
-        # Doni's supplemental fields
-        "rd_activity_type": "",
-        "rd_time_percentage": 0,
-        "prior_month_progress": "",
-        "obstacles": "",
-        "next_month_plan": "",
-        "uncertainty_status": "",
+        # Matches Excel columns exactly
+        "business_component":    "",
+        "initiative_name":       "",
+        "initiative_description":"",
+        "tech_uncertainty":      "",
+        "start_date":            None,
+        "expected_end_date":     None,
+        "activities":            "",
+        "team_members":          [],
+        "notes":                 "",
         # Meta
         "carry_over": False,
     }
-
 
 def carryover_initiative(src: dict) -> dict:
     init = new_initiative()
@@ -326,55 +208,39 @@ def carryover_initiative(src: dict) -> dict:
 # ── Excel Export ──────────────────────────────────────────────────────────────
 
 def build_excel(all_data: dict, only_user: str | None = None) -> bytes:
-    """
-    Builds and returns an Excel workbook as bytes.
-    all_data = { username: { month: submission_dict } }
-    """
-    wb = Workbook()
-    ws = wb.active
+    wb  = Workbook()
+    ws  = wb.active
     ws.title = "R&D Tracking"
 
+    # Headers match the Excel template column order
     headers = [
-        # Core columns (match original Excel template)
-        "User", "Month", "Business Component", "Initiative Name",
-        "Description", "Technical Uncertainty", "Start Date",
-        "Expected End Date", "Activities This Month", "Team Members",
-        "Expected Hours", "Notes",
-        # Doni's supplemental columns (edit labels here to match question changes)
-        "R&D Activity Type", "% Time on R&D", "Progress vs Last Month",
-        "Obstacles", "Next Month Plan", "Uncertainty Status",
-        # Meta
-        "Status", "Submitted At",
+        "User", "Month/Yr", "Business Component", "Initiative Name",
+        "Initiative Description", "Tech Uncertainty", "Start Date",
+        "Expected End Date", "Activities to Eliminate Technical Uncertainty",
+        "Team Members", "Notes", "Status", "Submitted At",
     ]
+    col_widths = [16, 14, 24, 28, 44, 44, 13, 15, 44, 34, 34, 22, 20]
 
-    # Header row styling
-    hdr_fill   = PatternFill("solid", fgColor="1a3c5e")
-    hdr_font   = Font(color="FFFFFF", bold=True, size=11)
-    hdr_align  = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    hdr_fill    = PatternFill("solid", fgColor="1a3c5e")
+    hdr_font    = Font(color="FFFFFF", bold=True, size=11)
+    hdr_align   = Alignment(horizontal="center", vertical="center", wrap_text=True)
     thin_border = Border(
         left=Side(style="thin"), right=Side(style="thin"),
-        top=Side(style="thin"), bottom=Side(style="thin"),
+        top=Side(style="thin"),  bottom=Side(style="thin"),
     )
 
     ws.row_dimensions[1].height = 32
-    for col_idx, h in enumerate(headers, 1):
-        cell = ws.cell(row=1, column=col_idx, value=h)
-        cell.fill   = hdr_fill
-        cell.font   = hdr_font
+    for ci, h in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=ci, value=h)
+        cell.fill      = hdr_fill
+        cell.font      = hdr_font
         cell.alignment = hdr_align
-        cell.border = thin_border
+        cell.border    = thin_border
 
-    # Column widths (one entry per header column)
-    col_widths = [
-        16, 14, 22, 26, 42, 42, 12, 14, 42, 32, 14, 32,  # core columns
-        36, 14, 36, 36, 36, 36,                            # Doni's columns
-        22, 20,                                            # meta
-    ]
     for i, w in enumerate(col_widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
-    # Alternating row fill
-    fill_even = PatternFill("solid", fgColor="EFF6FF")
+    fill_even  = PatternFill("solid", fgColor="EFF6FF")
     cell_font  = Font(size=10)
     cell_align = Alignment(vertical="top", wrap_text=True)
 
@@ -388,46 +254,34 @@ def build_excel(all_data: dict, only_user: str | None = None) -> bytes:
             for init in sub["initiatives"]:
                 fill = fill_even if row_num % 2 == 0 else None
                 vals = [
-                    # Core columns
                     username,
                     fmt_month(month),
-                    init.get("business_component", ""),
-                    init.get("initiative_name", ""),
+                    init.get("business_component",    ""),
+                    init.get("initiative_name",        ""),
                     init.get("initiative_description", ""),
-                    init.get("tech_uncertainty", ""),
-                    str(init.get("start_date") or ""),
+                    init.get("tech_uncertainty",       ""),
+                    str(init.get("start_date")        or ""),
                     str(init.get("expected_end_date") or ""),
-                    init.get("activities", ""),
+                    init.get("activities",             ""),
                     ", ".join(init.get("team_members") or []),
-                    init.get("expected_hours", 0),
-                    init.get("notes", ""),
-                    # Doni's supplemental columns
-                    init.get("rd_activity_type", ""),
-                    init.get("rd_time_percentage", ""),
-                    init.get("prior_month_progress", ""),
-                    init.get("obstacles", ""),
-                    init.get("next_month_plan", ""),
-                    init.get("uncertainty_status", ""),
-                    # Meta
-                    STATUS_LABELS.get(sub.get("status", ""), sub.get("status", "")),
+                    init.get("notes",                  ""),
+                    STATUS_LABELS.get(sub.get("status",""), sub.get("status","")),
                     (
                         datetime.fromtimestamp(sub["submitted_at"] / 1000).strftime("%Y-%m-%d %H:%M")
                         if sub.get("submitted_at") else ""
                     ),
                 ]
                 ws.row_dimensions[row_num].height = 60
-                for col_idx, val in enumerate(vals, 1):
-                    cell = ws.cell(row=row_num, column=col_idx, value=val)
-                    cell.font = cell_font
+                for ci, val in enumerate(vals, 1):
+                    cell = ws.cell(row=row_num, column=ci, value=val)
+                    cell.font      = cell_font
                     cell.alignment = cell_align
-                    cell.border = thin_border
+                    cell.border    = thin_border
                     if fill:
                         cell.fill = fill
                 row_num += 1
 
-    # Freeze top row
     ws.freeze_panes = "A2"
-
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
@@ -438,81 +292,40 @@ def build_excel(all_data: dict, only_user: str | None = None) -> bytes:
 def inject_css():
     st.markdown("""
     <style>
-    /* Hide Streamlit branding */
     #MainMenu, footer, header { visibility: hidden; }
-
-    /* App background */
     .stApp { background: #f1f5f9; }
 
-    /* Card style */
-    .rd-card {
-        background: white;
-        border-radius: 14px;
-        padding: 24px;
-        box-shadow: 0 1px 6px rgba(0,0,0,0.07);
-        margin-bottom: 16px;
-    }
-
-    /* Badges */
     .badge-approved    { background:#f0fdf4; color:#166534; border:1.5px solid #86efac; }
     .badge-submitted   { background:#eff6ff; color:#1e40af; border:1.5px solid #93c5fd; }
     .badge-in-progress { background:#fef9ec; color:#92600a; border:1.5px solid #fcd34d; }
     .badge-rejected    { background:#fff1f2; color:#9f1239; border:1.5px solid #fda4af; }
     .badge-not-started { background:#f8fafc; color:#64748b; border:1.5px solid #cbd5e1; }
-    .rd-badge {
-        display:inline-block; padding:3px 12px; border-radius:20px;
-        font-size:12px; font-weight:700;
-    }
+    .rd-badge { display:inline-block; padding:3px 12px; border-radius:20px; font-size:12px; font-weight:700; }
 
-    /* Step wizard progress */
-    .progress-bar-outer {
-        background:#e2e8f0; border-radius:4px; height:8px;
-        overflow:hidden; margin-bottom:6px;
-    }
-    .progress-bar-inner {
-        background:#c86a2a; height:100%;
-        border-radius:4px; transition:width 0.3s;
-    }
+    .progress-bar-outer { background:#e2e8f0; border-radius:4px; height:8px; overflow:hidden; margin-bottom:6px; }
+    .progress-bar-inner { background:#c86a2a; height:100%; border-radius:4px; transition:width 0.3s; }
 
-    /* Wizard question */
     .wizard-question { font-size:22px; font-weight:700; color:#1a3c5e; margin-bottom:6px; }
     .wizard-hint     { font-size:14px; color:#64748b; margin-bottom:20px; }
-    .step-label      { font-size:11px; font-weight:700; color:#c86a2a;
-                       text-transform:uppercase; letter-spacing:.8px; }
+    .step-label      { font-size:11px; font-weight:700; color:#c86a2a; text-transform:uppercase; letter-spacing:.8px; }
 
-    /* Carryover banner */
     .carryover-banner {
         background:#fffbeb; border:1.5px solid #fcd34d;
-        border-radius:10px; padding:10px 16px; margin-bottom:14px;
-        font-size:13px; color:#92600a;
+        border-radius:10px; padding:10px 16px; margin-bottom:14px; font-size:13px; color:#92600a;
     }
     .prefilled-banner {
         background:#f0f9ff; border:1.5px solid #93c5fd;
-        border-radius:10px; padding:10px 16px; margin-bottom:14px;
-        font-size:13px; color:#1e40af;
+        border-radius:10px; padding:10px 16px; margin-bottom:14px; font-size:13px; color:#1e40af;
     }
-
-    /* Page header */
-    .rd-header {
-        background:#1a3c5e; color:white;
-        padding:14px 32px; border-radius:12px;
-        margin-bottom:24px; display:flex;
-        align-items:center; justify-content:space-between;
+    .delete-confirm {
+        background:#fff1f2; border:1.5px solid #fda4af;
+        border-radius:10px; padding:12px 16px; margin-top:8px;
     }
-    .rd-header h1 { margin:0; font-size:22px; color:white; }
-
-    /* Stat box */
-    .stat-box {
-        background:white; border-radius:12px; text-align:center;
-        padding:18px 12px; box-shadow:0 1px 4px rgba(0,0,0,0.07);
-    }
-    .stat-val  { font-size:32px; font-weight:800; color:#1a3c5e; margin:0; }
-    .stat-lbl  { font-size:12px; color:#64748b; margin:0; }
     </style>
     """, unsafe_allow_html=True)
 
 
-# ── Badge helper ──────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def badge_html(status: str) -> str:
     cls_map = {
@@ -521,29 +334,27 @@ def badge_html(status: str) -> str:
         "in-progress": "badge-in-progress",
         "rejected":    "badge-rejected",
     }
-    cls = cls_map.get(status, "badge-not-started")
+    cls   = cls_map.get(status, "badge-not-started")
     label = STATUS_LABELS.get(status, status)
     return f'<span class="rd-badge {cls}">{label}</span>'
 
-
-# ── Session state init ────────────────────────────────────────────────────────
-
 def init_session():
     defaults = {
-        "screen":     "login",       # login | dashboard | wizard | admin
-        "user":       None,
-        "is_admin":   False,
-        "draft":      {"initiatives": [], "status": "in-progress"},
-        "wiz_init":   None,          # initiative dict being edited
-        "wiz_step":   0,
-        "wiz_mode":   "new",         # new | edit | carryover
+        "screen":       "login",
+        "user":         None,
+        "is_admin":     False,
+        "draft":        {"initiatives": [], "status": "in-progress"},
+        "wiz_init":     None,
+        "wiz_step":     0,
+        "wiz_mode":     "new",
+        "confirm_del":  None,   # id of initiative pending delete confirmation
     }
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
 
 
-# ── Screens ───────────────────────────────────────────────────────────────────
+# ── Login ─────────────────────────────────────────────────────────────────────
 
 def screen_login():
     col1, col2, col3 = st.columns([1, 1.2, 1])
@@ -557,56 +368,50 @@ def screen_login():
         </div>
         """, unsafe_allow_html=True)
 
-        with st.container():
-            options = ["— Select your name —", "⚙ Admin (Oversight Lead)"] + EMPLOYEES
-            sel = st.selectbox("Sign in as", options, label_visibility="collapsed")
+        options = ["— Select your name —", "⚙ Admin (Oversight Lead)"] + EMPLOYEES
+        sel = st.selectbox("Sign in as", options, label_visibility="collapsed")
 
-            if st.button("Sign In →", use_container_width=True, type="primary"):
-                if sel.startswith("— "):
-                    st.warning("Please select your name.")
+        if st.button("Sign In →", use_container_width=True, type="primary"):
+            if sel.startswith("— "):
+                st.warning("Please select your name.")
+            else:
+                name     = sel.replace("⚙ ", "").replace(" (Oversight Lead)", "").strip()
+                is_admin = "Admin" in sel
+                st.session_state.user     = name
+                st.session_state.is_admin = is_admin
+                if is_admin:
+                    st.session_state.screen = "admin"
                 else:
-                    name = sel.replace("⚙ ", "").replace(" (Oversight Lead)", "").strip()
-                    is_admin = "Admin" in sel
+                    existing = load_submission(name, cur_month())
+                    st.session_state.draft  = existing or {"initiatives": [], "status": "in-progress"}
+                    st.session_state.screen = "dashboard"
+                st.rerun()
 
-                    st.session_state.user     = name
-                    st.session_state.is_admin = is_admin
+        st.markdown(
+            '<p style="text-align:center;font-size:12px;color:#94a3b8;margin-top:16px;">'
+            'Your entries are saved automatically as you go.</p>',
+            unsafe_allow_html=True,
+        )
 
-                    if is_admin:
-                        st.session_state.screen = "admin"
-                    else:
-                        existing = load_submission(name, cur_month())
-                        st.session_state.draft = existing or {
-                            "initiatives": [], "status": "in-progress"
-                        }
-                        st.session_state.screen = "dashboard"
-                    st.rerun()
 
-        st.markdown("""
-        <p style="text-align:center; font-size:12px; color:#94a3b8; margin-top:16px;">
-            Your entries are saved automatically as you go.
-        </p>
-        """, unsafe_allow_html=True)
-
+# ── Dashboard ─────────────────────────────────────────────────────────────────
 
 def screen_dashboard():
-    user  = st.session_state.user
-    draft = st.session_state.draft
+    user      = st.session_state.user
+    draft     = st.session_state.draft
     submitted = draft["status"] != "in-progress"
-    cm = cur_month()
-    pm = prev_month()
+    cm        = cur_month()
+    pm        = prev_month()
 
-    # Load previous month for carry-over
-    prev_sub  = load_submission(user, pm)
-    prev_inits = []
-    if prev_sub:
-        today = date.today()
-        prev_inits = [
-            i for i in (prev_sub.get("initiatives") or [])
-            if not i.get("expected_end_date")
-            or datetime.strptime(str(i["expected_end_date"]), "%Y-%m-%d").date() >= today
-        ]
+    prev_sub   = load_submission(user, pm)
+    today      = date.today()
+    prev_inits = [
+        i for i in (prev_sub or {}).get("initiatives", [])
+        if not i.get("expected_end_date")
+        or datetime.strptime(str(i["expected_end_date"]), "%Y-%m-%d").date() >= today
+    ] if prev_sub else []
 
-    # ── Header ──────────────────────────────────────────────────────────────
+    # Header
     c1, c2 = st.columns([5, 1])
     with c1:
         st.markdown(f"## 🔬 R&D Tracker — {fmt_month(cm)}")
@@ -614,15 +419,14 @@ def screen_dashboard():
     with c2:
         st.write("")
         if st.button("Sign Out"):
-            for k in ["screen","user","is_admin","draft","wiz_init","wiz_step","wiz_mode"]:
-                del st.session_state[k]
+            for k in ["screen","user","is_admin","draft","wiz_init","wiz_step","wiz_mode","confirm_del"]:
+                st.session_state.pop(k, None)
             st.rerun()
 
     st.divider()
 
-    # ── Status strip ────────────────────────────────────────────────────────
-    total_hours = sum(i.get("expected_hours", 0) or 0 for i in draft["initiatives"])
-    c1, c2, c3, c4 = st.columns([3, 1, 1, 1])
+    # Status strip
+    c1, c2, c3 = st.columns([4, 1, 1])
     with c1:
         st.markdown(f"**Report Status:** {badge_html(draft['status'])}", unsafe_allow_html=True)
         if draft.get("submitted_at"):
@@ -633,20 +437,18 @@ def screen_dashboard():
     with c2:
         st.metric("Initiatives", len(draft["initiatives"]))
     with c3:
-        st.metric("Total Hours", total_hours)
-    with c4:
         if st.session_state.is_admin:
             if st.button("Admin View →"):
                 st.session_state.screen = "admin"
                 st.rerun()
 
-    # ── Carry-over prompt ────────────────────────────────────────────────────
+    # Carry-over prompt
     if not submitted and prev_inits and not draft["initiatives"]:
         st.markdown(f"""
         <div class="carryover-banner">
             <strong>📋 Ongoing initiatives from {fmt_month(pm)}</strong><br>
             You had <strong>{len(prev_inits)}</strong> active initiative{"s" if len(prev_inits)!=1 else ""} last month.
-            Carry any forward — key details will be pre-filled; you only update activities and hours.
+            Carry any forward — key details will be pre-filled; you only update activities and notes.
         </div>
         """, unsafe_allow_html=True)
         cols = st.columns(min(len(prev_inits), 4))
@@ -661,7 +463,7 @@ def screen_dashboard():
 
     st.divider()
 
-    # ── Initiatives list ─────────────────────────────────────────────────────
+    # Initiatives list header
     c1, c2 = st.columns([5, 1])
     with c1:
         st.subheader(f"{fmt_month(cm)} Initiatives")
@@ -678,49 +480,78 @@ def screen_dashboard():
         st.info("No initiatives added yet. Click **＋ Add Initiative** to begin this month's report.")
     else:
         for init in draft["initiatives"]:
+            iid = init["id"]
             with st.expander(
                 f"{'↩ ' if init.get('carry_over') else ''}"
                 f"{init.get('initiative_name','Unnamed')} — {init.get('business_component','')}",
                 expanded=True,
             ):
-                c1, c2, c3 = st.columns([3, 1, 1])
-                with c1:
-                    st.markdown(f"**{init.get('initiative_description','—')}**")
-                    st.caption(
-                        f"📅 {init.get('start_date','—')} → {init.get('expected_end_date','—')}  "
-                        f"  👥 {', '.join(init.get('team_members') or ['—'])}  "
-                        f"  ⏱ {init.get('expected_hours',0)} hrs"
+                # Info
+                st.markdown(f"**{init.get('initiative_description','—')}**")
+                st.caption(
+                    f"📅 {init.get('start_date','—')} → {init.get('expected_end_date','—')}  "
+                    f"  👥 {', '.join(init.get('team_members') or ['—'])}"
+                )
+                if init.get("tech_uncertainty"):
+                    st.markdown("**Technical Uncertainty:**")
+                    st.markdown(
+                        f'<div style="background:#f8fafc;padding:10px 14px;border-radius:6px;'
+                        f'font-size:13px;color:#334155;">{init["tech_uncertainty"]}</div>',
+                        unsafe_allow_html=True,
                     )
-                    if init.get("tech_uncertainty"):
-                        st.markdown("**Technical Uncertainty:**")
-                        st.markdown(
-                            f'<div style="background:#f8fafc; padding:10px 14px; border-radius:6px; '
-                            f'font-size:13px; color:#334155;">{init["tech_uncertainty"]}</div>',
-                            unsafe_allow_html=True,
-                        )
-                    if init.get("activities"):
-                        st.markdown("**Activities this month:**")
-                        st.caption(init["activities"])
-                    if init.get("notes"):
-                        st.markdown(f"*Notes: {init['notes']}*")
+                if init.get("activities"):
+                    st.markdown("**Activities to eliminate uncertainty:**")
+                    st.caption(init["activities"])
+                if init.get("notes"):
+                    st.markdown(f"*Notes: {init['notes']}*")
+
+                st.write("")
+
+                # Action buttons — Edit and Delete always visible
+                c1, c2, c3 = st.columns([3, 0.8, 0.8])
                 with c2:
-                    if not submitted and st.button("✏ Edit", key=f"edit_{init['id']}"):
-                        st.session_state.wiz_init = dict(init)
-                        st.session_state.wiz_step = 0
-                        st.session_state.wiz_mode = "edit"
-                        st.session_state.screen   = "wizard"
-                        st.rerun()
+                    if not submitted:
+                        if st.button("✏ Edit", key=f"edit_{iid}"):
+                            st.session_state.wiz_init = dict(init)
+                            st.session_state.wiz_step = 0
+                            st.session_state.wiz_mode = "edit"
+                            st.session_state.screen   = "wizard"
+                            st.rerun()
                 with c3:
-                    if not submitted and st.button("🗑 Remove", key=f"del_{init['id']}"):
-                        draft["initiatives"] = [
-                            i for i in draft["initiatives"] if i["id"] != init["id"]
-                        ]
-                        save_submission(user, cm, draft)
-                        st.session_state.draft = draft
-                        st.success("Initiative removed.")
+                    # Delete works regardless of submitted status
+                    if st.button("🗑 Delete", key=f"del_{iid}"):
+                        st.session_state.confirm_del = iid
                         st.rerun()
 
-    # ── Submit + Export ──────────────────────────────────────────────────────
+                # Inline confirmation — only shown for this card
+                if st.session_state.get("confirm_del") == iid:
+                    st.markdown('<div class="delete-confirm">', unsafe_allow_html=True)
+                    st.warning(
+                        f"Delete **{init.get('initiative_name','this initiative')}**? "
+                        "This cannot be undone."
+                    )
+                    ca, cb = st.columns(2)
+                    with ca:
+                        if st.button("Yes, delete it", key=f"conf_yes_{iid}", type="primary"):
+                            draft["initiatives"] = [
+                                i for i in draft["initiatives"] if i["id"] != iid
+                            ]
+                            # If they delete after submitting, reopen the report for editing
+                            if submitted:
+                                draft["status"] = "in-progress"
+                                draft.pop("submitted_at", None)
+                            save_submission(user, cm, draft)
+                            st.session_state.draft      = draft
+                            st.session_state.confirm_del = None
+                            st.success("Initiative deleted.")
+                            st.rerun()
+                    with cb:
+                        if st.button("Cancel", key=f"conf_no_{iid}"):
+                            st.session_state.confirm_del = None
+                            st.rerun()
+                    st.markdown('</div>', unsafe_allow_html=True)
+
+    # Submit + Export
     st.divider()
     c1, c2 = st.columns([3, 1])
     with c1:
@@ -738,8 +569,7 @@ def screen_dashboard():
                 st.success("Report submitted!")
                 st.rerun()
     with c2:
-        # Individual export
-        all_data = {user: {cm: draft}}
+        all_data  = {user: {cm: draft}}
         xlsx_bytes = build_excel(all_data, only_user=user)
         st.download_button(
             "↓ Download My Report",
@@ -748,6 +578,8 @@ def screen_dashboard():
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
+
+# ── Wizard ────────────────────────────────────────────────────────────────────
 
 def screen_wizard():
     user  = st.session_state.user
@@ -761,7 +593,7 @@ def screen_wizard():
     is_carryover = mode == "carryover"
     is_prefilled = is_carryover and s["field"] in CARRYOVER_FIELDS
 
-    # ── Header ──────────────────────────────────────────────────────────────
+    # Header
     c1, c2 = st.columns([5, 1])
     with c1:
         title = {"new":"New Initiative","edit":"Edit Initiative","carryover":"Carry Over Initiative"}[mode]
@@ -771,12 +603,11 @@ def screen_wizard():
             st.session_state.screen = "dashboard"
             st.rerun()
 
-    # Progress bar
     st.markdown(f"""
     <div class="progress-bar-outer">
         <div class="progress-bar-inner" style="width:{pct}%"></div>
     </div>
-    <p style="font-size:12px; color:#64748b; margin-top:2px;">
+    <p style="font-size:12px;color:#64748b;margin-top:2px;">
         Step {step+1} of {total} &nbsp;·&nbsp; {pct}% complete
     </p>
     """, unsafe_allow_html=True)
@@ -785,7 +616,8 @@ def screen_wizard():
     if is_carryover and not is_prefilled:
         st.markdown(f"""
         <div class="carryover-banner">
-            <strong>Updating for {fmt_month(cur_month())}:</strong> {init.get("initiative_name","this initiative")}
+            <strong>Updating for {fmt_month(cur_month())}:</strong>
+            {init.get("initiative_name","this initiative")}
         </div>
         """, unsafe_allow_html=True)
     elif is_prefilled:
@@ -795,33 +627,23 @@ def screen_wizard():
         </div>
         """, unsafe_allow_html=True)
 
-    # Label — show "Supplemental Question" badge for Doni's questions
-    if s.get("doni"):
-        st.markdown(
-            f'<p class="step-label" style="color:#7c3aed;">'
-            f'✦ Supplemental Question {step+1} &nbsp;·&nbsp; <span style="font-weight:400;font-style:italic;">Edit in WIZARD_STEPS</span></p>',
-            unsafe_allow_html=True,
-        )
-    else:
-        st.markdown(f'<p class="step-label">Question {step+1}</p>', unsafe_allow_html=True)
+    st.markdown(f'<p class="step-label">Question {step+1} of {total}</p>', unsafe_allow_html=True)
     st.markdown(f'<p class="wizard-question">{s["question"]}</p>', unsafe_allow_html=True)
     st.markdown(f'<p class="wizard-hint">{s["hint"]}</p>', unsafe_allow_html=True)
 
-    # ── Input ────────────────────────────────────────────────────────────────
-    field = s["field"]
-    val   = init.get(field)
-    new_val = val  # will be overwritten
+    # Input
+    field   = s["field"]
+    val     = init.get(field)
+    new_val = val
 
-    if s["type"] == "select":
-        opts = s["opts"]
-        idx  = opts.index(val) if val in opts else 0
-        new_val = st.radio(s["label"], opts, index=idx, horizontal=True)
-
-    elif s["type"] == "text":
+    if s["type"] == "text":
         new_val = st.text_input(s["label"], value=val or "", placeholder=s.get("placeholder",""))
 
     elif s["type"] == "textarea":
-        new_val = st.text_area(s["label"], value=val or "", placeholder=s.get("placeholder",""), height=130)
+        new_val = st.text_area(
+            s["label"], value=val or "",
+            placeholder=s.get("placeholder",""), height=140,
+        )
 
     elif s["type"] == "date":
         parsed = None
@@ -830,66 +652,61 @@ def screen_wizard():
                 parsed = datetime.strptime(str(val), "%Y-%m-%d").date()
             except Exception:
                 pass
-        picked = st.date_input(s["label"], value=parsed)
+        picked  = st.date_input(s["label"], value=parsed)
         new_val = picked.strftime("%Y-%m-%d") if picked else None
-
-    elif s["type"] == "number":
-        max_v = 100 if "percentage" in s["field"] else 10000
-        step_v = 1 if "percentage" in s["field"] else 4
-        new_val = st.number_input(s["label"], min_value=0, max_value=max_v, value=int(val or 0), step=step_v)
-        if "percentage" in s["field"]:
-            st.caption(f"{new_val}% of team time")
 
     elif s["type"] == "multiselect":
         new_val = st.multiselect(s["label"], EMPLOYEES, default=val or [])
 
-    # Update in-place
     init[field] = new_val
 
-    # ── Validation ───────────────────────────────────────────────────────────
-    is_valid = True
+    # Validation
     if s["required"]:
         if s["type"] == "multiselect":
             is_valid = bool(new_val)
-        elif s["type"] == "number":
-            is_valid = new_val is not None
         else:
             is_valid = bool(str(new_val or "").strip())
+    else:
+        is_valid = True
 
-    # ── Navigation ───────────────────────────────────────────────────────────
+    # Navigation
     c1, c2, c3 = st.columns([1, 4, 1])
     with c1:
         if st.button("← Back", disabled=(step == 0)):
             st.session_state.wiz_step -= 1
             st.rerun()
     with c3:
-        if step < total - 1:
-            if st.button("Next →", disabled=not is_valid, type="primary"):
-                st.session_state.wiz_init = init
-                st.session_state.wiz_step += 1
-                st.rerun()
-        else:
-            if st.button("Save Initiative ✓", disabled=not is_valid, type="primary"):
-                # Merge back into draft
+        is_last = step == total - 1
+        label   = "Save Initiative ✓" if is_last else "Next →"
+        if st.button(label, disabled=not is_valid, type="primary"):
+            if is_last:
                 draft = st.session_state.draft
-                inits = draft["initiatives"]
                 if mode == "edit":
-                    draft["initiatives"] = [i if i["id"] != init["id"] else init for i in inits]
+                    draft["initiatives"] = [
+                        i if i["id"] != init["id"] else init
+                        for i in draft["initiatives"]
+                    ]
                 else:
                     draft["initiatives"].append(init)
                 save_submission(user, cur_month(), draft)
                 st.session_state.draft  = draft
                 st.session_state.screen = "dashboard"
-                st.rerun()
+            else:
+                st.session_state.wiz_init = init
+                st.session_state.wiz_step += 1
+            st.rerun()
 
     # Step dots
     dots = "".join(
-        f'<span style="display:inline-block; width:{"24px" if i==step else "8px"}; height:8px; '
-        f'border-radius:4px; margin:0 3px; background:{"#c86a2a" if i<step else "#1a3c5e" if i==step else "#cbd5e1"}"></span>'
+        f'<span style="display:inline-block;width:{"24px" if i==step else "8px"};height:8px;'
+        f'border-radius:4px;margin:0 3px;'
+        f'background:{"#c86a2a" if i<step else "#1a3c5e" if i==step else "#cbd5e1"}"></span>'
         for i in range(total)
     )
-    st.markdown(f'<div style="text-align:center; margin-top:20px;">{dots}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div style="text-align:center;margin-top:20px;">{dots}</div>', unsafe_allow_html=True)
 
+
+# ── Admin ─────────────────────────────────────────────────────────────────────
 
 def screen_admin():
     cm = cur_month()
@@ -899,14 +716,11 @@ def screen_admin():
     with c2:
         if st.button("← Back"):
             st.session_state.screen = (
-                "dashboard" if not st.session_state.is_admin
-                or st.session_state.user != "Admin"
-                else "login"
+                "login" if st.session_state.user == "Admin" else "dashboard"
             )
             st.rerun()
 
-    # Load all data
-    reg = load_registry()
+    reg      = load_registry()
     all_data = {}
     for u in reg:
         all_data[u] = {}
@@ -915,17 +729,16 @@ def screen_admin():
             if sub:
                 all_data[u][m] = sub
 
-    # Stats
-    rows = [(u, all_data.get(u, {}).get(cm)) for u in reg]
+    rows            = [(u, all_data.get(u, {}).get(cm)) for u in reg]
     submitted_count = sum(1 for _, s in rows if s and s.get("status") in ("submitted","approved"))
     approved_count  = sum(1 for _, s in rows if s and s.get("status") == "approved")
     total_inits     = sum(len((s or {}).get("initiatives",[]) or []) for _, s in rows)
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Team Members",    len(reg))
-    c2.metric("Submitted",       f"{submitted_count}/{len(reg)}")
-    c3.metric("Approved",        approved_count)
-    c4.metric("Total Initiatives", total_inits)
+    c1.metric("Team Members",     len(reg))
+    c2.metric("Submitted",        f"{submitted_count}/{len(reg)}")
+    c3.metric("Approved",         approved_count)
+    c4.metric("Total Initiatives",total_inits)
 
     # Consolidated export
     xlsx_bytes = build_excel(all_data)
@@ -944,12 +757,16 @@ def screen_admin():
         return
 
     for u, sub in rows:
-        status  = (sub or {}).get("status", "not-started")
-        inits   = (sub or {}).get("initiatives") or []
-        icon    = {"approved":"✅","submitted":"🔵","in-progress":"🟡",
-                   "rejected":"🔴","not-started":"⚪"}.get(status,"⚪")
+        status = (sub or {}).get("status", "not-started")
+        inits  = (sub or {}).get("initiatives") or []
+        icon   = {"approved":"✅","submitted":"🔵","in-progress":"🟡",
+                  "rejected":"🔴","not-started":"⚪"}.get(status,"⚪")
 
-        with st.expander(f"{icon}  {u}   —  {STATUS_LABELS.get(status,'—')}   ({len(inits)} initiative{'s' if len(inits)!=1 else ''})", expanded=False):
+        with st.expander(
+            f"{icon}  {u}   —  {STATUS_LABELS.get(status,'—')}   "
+            f"({len(inits)} initiative{'s' if len(inits)!=1 else ''})",
+            expanded=False,
+        ):
             if not sub:
                 st.caption("No submission for this month.")
             else:
@@ -975,7 +792,6 @@ def screen_admin():
                             st.warning(f"{u}'s report returned.")
                             st.rerun()
 
-                # Individual export
                 u_bytes = build_excel({u: {cm: sub}}, only_user=u)
                 st.download_button(
                     f"↓ Export {u}'s Report",
@@ -992,8 +808,7 @@ def screen_admin():
                         st.markdown(
                             f"- **{co}{i.get('initiative_name','Unnamed')}** — "
                             f"{i.get('business_component','')} · "
-                            f"👥 {', '.join(i.get('team_members') or ['—'])} · "
-                            f"⏱ {i.get('expected_hours',0)} hrs"
+                            f"👥 {', '.join(i.get('team_members') or ['—'])}"
                         )
 
 
@@ -1002,7 +817,6 @@ def screen_admin():
 def main():
     inject_css()
     init_session()
-
     screen = st.session_state.screen
     if screen == "login":
         screen_login()
@@ -1012,7 +826,6 @@ def main():
         screen_wizard()
     elif screen == "admin":
         screen_admin()
-
 
 if __name__ == "__main__":
     main()
