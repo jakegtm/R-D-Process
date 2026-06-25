@@ -206,82 +206,184 @@ def carryover_initiative(src: dict) -> dict:
 
 
 # ── Excel Export ──────────────────────────────────────────────────────────────
+#
+# Colors extracted directly from the original template file:
+#   Header fill  : #9BBB59  (theme accent3 — the green header row)
+#   Header font  : white #FFFFFF, bold, Arial Narrow 12pt
+#   Data fill    : #EEECE1  (theme lt2 — beige, used on most input cells)
+#   Team Members : #DED900  (yellow — "Selection" cells in the original)
+#   Title font   : bold, Arial Narrow 14pt
+#   Borders      : thin, all sides
 
-def build_excel(all_data: dict, only_user: str | None = None) -> bytes:
-    wb  = Workbook()
-    ws  = wb.active
+def build_excel(
+    all_data: dict,
+    only_user: str | None = None,
+    submitted_only: bool = False,
+    label: str = "",
+) -> bytes:
+    """
+    Build an Excel workbook styled to match the original R&D tracking template.
+
+    Parameters
+    ----------
+    all_data       : { username: { month_str: submission_dict } }
+    only_user      : if set, only include rows for that user
+    submitted_only : if True, skip initiatives from non-submitted reports
+    label          : extra text shown in the subtitle row (e.g. "Consolidated — Submitted Only")
+    """
+    wb = Workbook()
+    ws = wb.active
     ws.title = "R&D Tracking"
 
-    # Headers match the Excel template column order
-    headers = [
-        "User", "Month/Yr", "Business Component", "Initiative Name",
-        "Initiative Description", "Tech Uncertainty", "Start Date",
-        "Expected End Date", "Activities to Eliminate Technical Uncertainty",
-        "Team Members", "Notes", "Status", "Submitted At",
-    ]
-    col_widths = [16, 14, 24, 28, 44, 44, 13, 15, 44, 34, 34, 22, 20]
+    # ── Style constants ──────────────────────────────────────────────────────
+    GREEN     = "9BBB59"   # header row fill  (template's accent3)
+    BEIGE     = "EEECE1"   # data row fill    (template's lt2 / Input cells)
+    YELLOW    = "DED900"   # Team Members col (template's Selection cells)
+    WHITE     = "FFFFFF"
+    DARK      = "1F1F1F"
 
-    hdr_fill    = PatternFill("solid", fgColor="1a3c5e")
-    hdr_font    = Font(color="FFFFFF", bold=True, size=11)
-    hdr_align   = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    thin_border = Border(
-        left=Side(style="thin"), right=Side(style="thin"),
-        top=Side(style="thin"),  bottom=Side(style="thin"),
+    fill_green  = PatternFill("solid", fgColor=GREEN)
+    fill_beige  = PatternFill("solid", fgColor=BEIGE)
+    fill_yellow = PatternFill("solid", fgColor=YELLOW)
+
+    thin = Side(style="thin", color="A0A0A0")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    def hdr_font(sz=12):
+        return Font(name="Arial Narrow", bold=True, color=WHITE, size=sz)
+
+    def data_font(bold=False):
+        return Font(name="Arial Narrow", bold=bold, color=DARK, size=11)
+
+    # ── Column layout ────────────────────────────────────────────────────────
+    # Individual export: mirrors original template columns (A–J) + Status col
+    # Consolidated:      prepends "User" column, then same layout
+    is_consolidated = only_user is None
+
+    if is_consolidated:
+        headers = [
+            "User",                                           # A  (extra for consolidated)
+            "Month/Yr",                                       # B
+            "Business Component",                             # C
+            "Initiative Name",                                # D
+            "Initiative Description",                         # E
+            "Tech Uncertainty",                               # F
+            "Start Date",                                     # G
+            "Expected End Date",                              # H
+            "Activities to Eliminate Technical Uncertainty",  # I
+            "Team Members",                                   # J
+            "Notes",                                          # K
+            "Status",                                         # L
+        ]
+        col_widths  = [18, 14, 35, 19, 38, 64, 16, 16, 60, 49, 53, 22]
+        team_col    = 10   # J — yellow
+        status_col  = 12   # L
+    else:
+        headers = [
+            "Month/Yr",                                       # A
+            "Business Component",                             # B
+            "Initiative Name",                                # C
+            "Initiative Description",                         # D
+            "Tech Uncertainty",                               # E
+            "Start Date",                                     # F
+            "Expected End Date",                              # G
+            "Activities to Eliminate Technical Uncertainty",  # H
+            "Team Members",                                   # I
+            "Notes",                                          # J
+            "Status",                                         # K
+        ]
+        col_widths  = [14, 35, 19, 38, 64, 16, 16, 60, 49, 53, 22]
+        team_col    = 9    # I — yellow
+        status_col  = 11   # K
+
+    ncols = len(headers)
+
+    # ── Row 1 — Title ────────────────────────────────────────────────────────
+    ws.row_dimensions[1].height = 18.3
+    ws.cell(row=1, column=1, value="Monthly R&D Tracking Template").font = Font(
+        name="Arial Narrow", bold=True, size=14, color=DARK
     )
 
-    ws.row_dimensions[1].height = 32
+    # ── Row 2 — Subtitle / export info ──────────────────────────────────────
+    ws.row_dimensions[2].height = 15
+    subtitle = label or (f"Exported: {datetime.now().strftime('%B %Y')}")
+    ws.cell(row=2, column=1, value=subtitle).font = Font(
+        name="Arial Narrow", size=10, color="666666", italic=True
+    )
+
+    # ── Row 3 — Spacer ───────────────────────────────────────────────────────
+    ws.row_dimensions[3].height = 8
+
+    # ── Row 4 — Column headers ───────────────────────────────────────────────
+    ws.row_dimensions[4].height = 30
     for ci, h in enumerate(headers, 1):
-        cell = ws.cell(row=1, column=ci, value=h)
-        cell.fill      = hdr_fill
-        cell.font      = hdr_font
-        cell.alignment = hdr_align
-        cell.border    = thin_border
+        cell = ws.cell(row=4, column=ci, value=h)
+        cell.fill      = fill_green
+        cell.font      = hdr_font(12)
+        cell.border    = border
+        cell.alignment = Alignment(horizontal="center", vertical="top", wrap_text=True)
 
-    for i, w in enumerate(col_widths, 1):
-        ws.column_dimensions[get_column_letter(i)].width = w
+    # ── Column widths ────────────────────────────────────────────────────────
+    for ci, w in enumerate(col_widths, 1):
+        ws.column_dimensions[get_column_letter(ci)].width = w
 
-    fill_even  = PatternFill("solid", fgColor="EFF6FF")
-    cell_font  = Font(size=10)
-    cell_align = Alignment(vertical="top", wrap_text=True)
-
-    row_num = 2
+    # ── Data rows ─────────────────────────────────────────────────────────────
+    row_num = 5
     for username, months in all_data.items():
         if only_user and username != only_user:
             continue
         for month, sub in months.items():
             if not sub or not sub.get("initiatives"):
                 continue
+            if submitted_only and sub.get("status") not in ("submitted", "approved"):
+                continue
             for init in sub["initiatives"]:
-                fill = fill_even if row_num % 2 == 0 else None
-                vals = [
-                    username,
-                    fmt_month(month),
-                    init.get("business_component",    ""),
-                    init.get("initiative_name",        ""),
-                    init.get("initiative_description", ""),
-                    init.get("tech_uncertainty",       ""),
-                    str(init.get("start_date")        or ""),
-                    str(init.get("expected_end_date") or ""),
-                    init.get("activities",             ""),
-                    ", ".join(init.get("team_members") or []),
-                    init.get("notes",                  ""),
-                    STATUS_LABELS.get(sub.get("status",""), sub.get("status","")),
-                    (
-                        datetime.fromtimestamp(sub["submitted_at"] / 1000).strftime("%Y-%m-%d %H:%M")
-                        if sub.get("submitted_at") else ""
-                    ),
-                ]
-                ws.row_dimensions[row_num].height = 60
+                if is_consolidated:
+                    vals = [
+                        username,
+                        fmt_month(month),
+                        init.get("business_component",    ""),
+                        init.get("initiative_name",        ""),
+                        init.get("initiative_description", ""),
+                        init.get("tech_uncertainty",       ""),
+                        str(init.get("start_date")        or ""),
+                        str(init.get("expected_end_date") or ""),
+                        init.get("activities",             ""),
+                        ", ".join(init.get("team_members") or []),
+                        init.get("notes",                  ""),
+                        STATUS_LABELS.get(sub.get("status",""), sub.get("status","")),
+                    ]
+                else:
+                    vals = [
+                        fmt_month(month),
+                        init.get("business_component",    ""),
+                        init.get("initiative_name",        ""),
+                        init.get("initiative_description", ""),
+                        init.get("tech_uncertainty",       ""),
+                        str(init.get("start_date")        or ""),
+                        str(init.get("expected_end_date") or ""),
+                        init.get("activities",             ""),
+                        ", ".join(init.get("team_members") or []),
+                        init.get("notes",                  ""),
+                        STATUS_LABELS.get(sub.get("status",""), sub.get("status","")),
+                    ]
+
+                ws.row_dimensions[row_num].height = 45
                 for ci, val in enumerate(vals, 1):
                     cell = ws.cell(row=row_num, column=ci, value=val)
-                    cell.font      = cell_font
-                    cell.alignment = cell_align
-                    cell.border    = thin_border
-                    if fill:
-                        cell.fill = fill
+                    cell.font      = data_font()
+                    cell.border    = border
+                    cell.alignment = Alignment(vertical="top", wrap_text=True)
+                    # Column-specific fill colors matching the template
+                    if ci == team_col:
+                        cell.fill = fill_yellow   # Team Members → yellow
+                    else:
+                        cell.fill = fill_beige    # Everything else → beige
                 row_num += 1
 
-    ws.freeze_panes = "A2"
+    # ── Freeze header row ────────────────────────────────────────────────────
+    ws.freeze_panes = f"A5"
+
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
@@ -569,8 +671,12 @@ def screen_dashboard():
                 st.success("Report submitted!")
                 st.rerun()
     with c2:
-        all_data  = {user: {cm: draft}}
-        xlsx_bytes = build_excel(all_data, only_user=user)
+        all_data   = {user: {cm: draft}}
+        xlsx_bytes = build_excel(
+            all_data,
+            only_user=user,
+            label=f"Submitted by: {user}  |  Period: {fmt_month(cm)}",
+        )
         st.download_button(
             "↓ Download My Report",
             data=xlsx_bytes,
@@ -740,14 +846,31 @@ def screen_admin():
     c3.metric("Approved",         approved_count)
     c4.metric("Total Initiatives",total_inits)
 
-    # Consolidated export
-    xlsx_bytes = build_excel(all_data)
-    st.download_button(
-        "↓ Download Consolidated Report (All Users)",
-        data=xlsx_bytes,
-        file_name=f"RD_Consolidated_{cm}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+    # Exports — side by side
+    ex1, ex2 = st.columns(2)
+    with ex1:
+        all_bytes = build_excel(
+            all_data,
+            label=f"Consolidated — All Users  |  Period: {fmt_month(cm)}",
+        )
+        st.download_button(
+            "↓ Consolidated — All Users",
+            data=all_bytes,
+            file_name=f"RD_Consolidated_All_{cm}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    with ex2:
+        sub_bytes = build_excel(
+            all_data,
+            submitted_only=True,
+            label=f"Consolidated — Submitted & Approved Only  |  Period: {fmt_month(cm)}",
+        )
+        st.download_button(
+            "↓ Consolidated — Submitted Only",
+            data=sub_bytes,
+            file_name=f"RD_Consolidated_Submitted_{cm}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
 
     st.divider()
     st.subheader(f"Team Submissions — {fmt_month(cm)}")
@@ -792,7 +915,11 @@ def screen_admin():
                             st.warning(f"{u}'s report returned.")
                             st.rerun()
 
-                u_bytes = build_excel({u: {cm: sub}}, only_user=u)
+                u_bytes = build_excel(
+                    {u: {cm: sub}},
+                    only_user=u,
+                    label=f"Submitted by: {u}  |  Period: {fmt_month(cm)}",
+                )
                 st.download_button(
                     f"↓ Export {u}'s Report",
                     data=u_bytes,
