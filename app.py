@@ -154,6 +154,41 @@ def fmt_month(m: str) -> str:
     y, mo = m.split("-")
     return datetime(int(y), int(mo), 1).strftime("%B %Y")
 
+def available_months() -> list[str]:
+    """Last 6 months + next 1 month as YYYY-MM strings, newest first."""
+    from datetime import date
+    now = date.today()
+    result = []
+    for delta in range(-6, 2):
+        total = now.month - 1 + delta   # 0-based month offset
+        yr    = now.year + total // 12
+        mo    = total % 12 + 1
+        result.append(f"{yr}-{str(mo).zfill(2)}")
+    result.sort(reverse=True)
+    return result
+
+ENTITIES = ["107", "108", "109", "110"]
+
+def export_filename(entity: str, reporting_month: str, tag: str = "") -> str:
+    """
+    Build filename matching the original convention:
+      {entity}_Group_{month}_{year}_Monthly_R_D_Tracking_Template.xlsx
+    e.g. 107_Group_10_2025_Monthly_R_D_Tracking_Template.xlsx
+    tag is inserted before the final segment, e.g. "Consolidated_Submitted"
+    """
+    try:
+        dt = datetime.strptime(reporting_month, "%Y-%m")
+        mo = str(dt.month)    # no leading zero — matches original (10 not 010)
+        yr = str(dt.year)
+    except Exception:
+        mo, yr = "00", "0000"
+    parts = [entity or "000", "Group", mo, yr]
+    if tag:
+        parts.append(tag)
+    parts.append("Monthly_R_D_Tracking_Template")
+    return "_".join(parts) + ".xlsx"
+
+
 def data_path(username: str, month: str) -> Path:
     safe = username.replace(" ", "_").replace("/", "_")
     return DATA_DIR / f"{safe}_{month}.json"
@@ -445,7 +480,15 @@ def init_session():
         "screen":       "login",
         "user":         None,
         "is_admin":     False,
-        "draft":        {"initiatives": [], "status": "in-progress"},
+        "draft":        {
+            "initiatives":     [],
+            "status":          "in-progress",
+            "entity":          "",
+            "reporting_month": "",
+        },
+        # Admin-level export settings (separate from any user draft)
+        "admin_entity":          "",
+        "admin_reporting_month": "",
         "wiz_init":     None,
         "wiz_step":     0,
         "wiz_mode":     "new",
@@ -544,7 +587,57 @@ def screen_dashboard():
                 st.session_state.screen = "admin"
                 st.rerun()
 
-    # Carry-over prompt
+    # ── Report Setup ────────────────────────────────────────────────────────
+    # Entity and reporting month are report-level (not per initiative).
+    # Stored in the draft so they're remembered and used in the filename.
+    with st.expander(
+        "⚙ Report Setup"
+        + (f"  —  Entity {draft['entity']}  ·  {fmt_month(draft['reporting_month'])}"
+           if draft.get("entity") and draft.get("reporting_month") else
+           "  ⚠ Please select entity and reporting month"),
+        expanded=not (draft.get("entity") and draft.get("reporting_month")),
+    ):
+        st.caption(
+            "These are used to name your exported file: "
+            "`{entity}_Group_{month}_{year}_Monthly_R_D_Tracking_Template.xlsx`"
+        )
+        su1, su2 = st.columns(2)
+        with su1:
+            entity_idx = ENTITIES.index(draft["entity"]) if draft.get("entity") in ENTITIES else 0
+            chosen_entity = st.selectbox(
+                "Entity",
+                ENTITIES,
+                index=entity_idx,
+                key="setup_entity",
+            )
+        with su2:
+            months_list = available_months()
+            # Default to previous month if not set
+            default_rm   = months_list[1] if len(months_list) > 1 else months_list[0]
+            current_rm   = draft.get("reporting_month") or default_rm
+            rm_idx       = months_list.index(current_rm) if current_rm in months_list else 0
+            chosen_rm    = st.selectbox(
+                "Reporting Month",
+                months_list,
+                index=rm_idx,
+                format_func=fmt_month,
+                key="setup_rm",
+            )
+        # Auto-save whenever either value changes
+        if chosen_entity != draft.get("entity") or chosen_rm != draft.get("reporting_month"):
+            draft["entity"]          = chosen_entity
+            draft["reporting_month"] = chosen_rm
+            save_submission(user, cm, draft)
+            st.session_state.draft = draft
+            st.rerun()
+
+        if draft.get("entity") and draft.get("reporting_month"):
+            fname = export_filename(draft["entity"], draft["reporting_month"])
+            st.success(f"Export will be named: **{fname}**")
+
+    st.divider()
+
+    # ── Carry-over prompt
     if not submitted and prev_inits and not draft["initiatives"]:
         st.markdown(f"""
         <div class="carryover-banner">
@@ -675,12 +768,16 @@ def screen_dashboard():
         xlsx_bytes = build_excel(
             all_data,
             only_user=user,
-            label=f"Submitted by: {user}  |  Period: {fmt_month(cm)}",
+            label=f"Submitted by: {user}  |  Period: {fmt_month(draft.get('reporting_month', cm))}",
+        )
+        ind_fname = export_filename(
+            draft.get("entity", ""),
+            draft.get("reporting_month", cm),
         )
         st.download_button(
             "↓ Download My Report",
             data=xlsx_bytes,
-            file_name=f"RD_{user.replace(' ','_')}_{cm}.xlsx",
+            file_name=ind_fname,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
@@ -846,29 +943,67 @@ def screen_admin():
     c3.metric("Approved",         approved_count)
     c4.metric("Total Initiatives",total_inits)
 
+    # Admin export setup — entity and reporting month for filename
+    with st.expander(
+        "⚙ Export Settings"
+        + (f"  —  Entity {st.session_state.admin_entity}"
+           f"  ·  {fmt_month(st.session_state.admin_reporting_month)}"
+           if st.session_state.get("admin_entity") and st.session_state.get("admin_reporting_month")
+           else "  ⚠ Set entity & month for correct filenames"),
+        expanded=not (st.session_state.get("admin_entity") and st.session_state.get("admin_reporting_month")),
+    ):
+        st.caption(
+            "Sets the filename: `{entity}_Group_{month}_{year}_Monthly_R_D_Tracking_Template.xlsx`"
+        )
+        ae1, ae2 = st.columns(2)
+        with ae1:
+            aidx = ENTITIES.index(st.session_state.admin_entity)                 if st.session_state.get("admin_entity") in ENTITIES else 0
+            st.session_state.admin_entity = st.selectbox(
+                "Entity", ENTITIES, index=aidx, key="adm_entity_sel"
+            )
+        with ae2:
+            mlist   = available_months()
+            def_rm  = mlist[1] if len(mlist) > 1 else mlist[0]
+            cur_arm = st.session_state.get("admin_reporting_month") or def_rm
+            arm_idx = mlist.index(cur_arm) if cur_arm in mlist else 0
+            st.session_state.admin_reporting_month = st.selectbox(
+                "Reporting Month", mlist, index=arm_idx,
+                format_func=fmt_month, key="adm_rm_sel"
+            )
+        adm_e  = st.session_state.admin_entity
+        adm_rm = st.session_state.admin_reporting_month
+        if adm_e and adm_rm:
+            st.success(
+                f"Consolidated export will be named: "
+                f"**{export_filename(adm_e, adm_rm, 'Consolidated')}**"
+            )
+
+    adm_e  = st.session_state.get("admin_entity",          "")
+    adm_rm = st.session_state.get("admin_reporting_month", cm)
+
     # Exports — side by side
     ex1, ex2 = st.columns(2)
     with ex1:
         all_bytes = build_excel(
             all_data,
-            label=f"Consolidated — All Users  |  Period: {fmt_month(cm)}",
+            label=f"Consolidated — All Users  |  Period: {fmt_month(adm_rm)}",
         )
         st.download_button(
             "↓ Consolidated — All Users",
             data=all_bytes,
-            file_name=f"RD_Consolidated_All_{cm}.xlsx",
+            file_name=export_filename(adm_e, adm_rm, "Consolidated_All"),
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
     with ex2:
         sub_bytes = build_excel(
             all_data,
             submitted_only=True,
-            label=f"Consolidated — Submitted & Approved Only  |  Period: {fmt_month(cm)}",
+            label=f"Consolidated — Submitted & Approved Only  |  Period: {fmt_month(adm_rm)}",
         )
         st.download_button(
             "↓ Consolidated — Submitted Only",
             data=sub_bytes,
-            file_name=f"RD_Consolidated_Submitted_{cm}.xlsx",
+            file_name=export_filename(adm_e, adm_rm, "Consolidated_Submitted"),
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
@@ -918,12 +1053,17 @@ def screen_admin():
                 u_bytes = build_excel(
                     {u: {cm: sub}},
                     only_user=u,
-                    label=f"Submitted by: {u}  |  Period: {fmt_month(cm)}",
+                    label=(
+                        f"Submitted by: {u}  |  "
+                        f"Period: {fmt_month(sub.get('reporting_month', cm))}"
+                    ),
                 )
+                u_entity = sub.get("entity") or st.session_state.get("admin_entity", "")
+                u_rm     = sub.get("reporting_month") or cm
                 st.download_button(
                     f"↓ Export {u}'s Report",
                     data=u_bytes,
-                    file_name=f"RD_{u.replace(' ','_')}_{cm}.xlsx",
+                    file_name=export_filename(u_entity, u_rm),
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     key=f"dl_{u}",
                 )
