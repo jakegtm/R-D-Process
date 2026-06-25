@@ -1070,7 +1070,7 @@ def screen_admin():
 
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Team Members",     n_users)
-    c2.metric("Unique Combos",    len(combos))
+    c2.metric("Periods/Entities", len(combos))
     c3.metric("Submitted",        n_sub)
     c4.metric("Approved",         n_appr)
     c5.metric("Total Initiatives",n_inits)
@@ -1086,12 +1086,12 @@ def screen_admin():
         combo_labels  = {f"{e} — {fmt_month(rm)}": (e, rm) for e, rm in combos}
         all_labels    = list(combo_labels.keys())
 
-        sel_all = st.checkbox("Select all combos", value=True, key="sel_all_combos")
+        sel_all = st.checkbox("Select all periods/entities", value=True, key="sel_all_periods")
         if sel_all:
             chosen_labels = all_labels
         else:
             chosen_labels = st.multiselect(
-                "Choose which entity/month combinations to include:",
+                "Choose which periods/entities to include:",
                 all_labels,
                 default=all_labels,
             )
