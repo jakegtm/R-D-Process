@@ -11,6 +11,7 @@ from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 import io
+import re
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -258,6 +259,80 @@ def load_all_submissions() -> dict:
                 all_data[user][month] = sub
     return all_data
 
+def repair_months_index() -> int:
+    """
+    Scans the data/ folder for all submission JSON files and ensures every
+    file with real initiatives is correctly registered in:
+      - registry.json  (user list)
+      - {username}_months.json  (per-user month index)
+
+    Runs automatically on every admin page load.
+    Returns the number of entries that were repaired/added.
+    """
+    repaired = 0
+    pattern  = re.compile(r'^(.+)_(\d{4}-\d{2})\.json$')
+
+    for filepath in DATA_DIR.glob("*.json"):
+        # Skip index/registry files
+        if filepath.stem in ("registry", ) or filepath.stem.endswith("_months"):
+            continue
+
+        m = pattern.match(filepath.name)
+        if not m:
+            continue
+
+        raw_user = m.group(1).replace("_", " ")   # reverse _safe_name (best effort)
+        month    = m.group(2)
+
+        try:
+            data = json.loads(filepath.read_text())
+        except Exception:
+            continue
+
+        # Only index if it has real initiatives
+        if not data.get("initiatives"):
+            continue
+
+        # Determine the actual username from registry (handles multi-word names)
+        reg = load_registry()
+        # Try to find matching user in registry
+        username = None
+        for u in reg:
+            if _safe_name(u) == m.group(1):
+                username = u
+                break
+        if username is None:
+            # Not in registry — use the raw_user and add to registry
+            # Check if the safe name of raw_user matches
+            username = raw_user
+            if username not in reg:
+                reg.append(username)
+                save_registry(reg)
+                repaired += 1
+
+        # Ensure month is in user's months index
+        months = load_user_months(username)
+        if month not in months:
+            months.append(month)
+            save_user_months(username, months)
+            repaired += 1
+
+    return repaired
+
+
+def create_backup_zip() -> bytes:
+    """
+    Packages the entire data/ directory into a ZIP file and returns the bytes.
+    Used for the admin backup download button.
+    """
+    import zipfile
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for filepath in sorted(DATA_DIR.glob("*.json")):
+            zf.write(filepath, arcname=f"data/{filepath.name}")
+    return buf.getvalue()
+
+
 def get_combos(all_data: dict) -> list[tuple[str, str]]:
     """
     Returns sorted list of unique (entity, reporting_month) tuples
@@ -405,6 +480,10 @@ def new_initiative() -> dict:
         "initiative_status":     "active",   # active | approved | returned
         "approved_at":           None,       # ms timestamp when admin approved
         "returned_at":           None,       # ms timestamp when admin returned
+        # month_yr: the reporting period this initiative row belongs to.
+        # Set when first saved; preserved through admin rollovers so each row
+        # always shows the correct original period in the export.
+        "month_yr":              "",
     }
 
 def carryover_initiative(src: dict) -> dict:
@@ -551,7 +630,9 @@ def _sub_to_rows(username: str, sub: dict, include_user: bool) -> list[dict]:
     rows   = []
     for init in sub.get("initiatives") or []:
         row = {
-            "_month":  fmt_month(rm),
+            # Use initiative's own month_yr so each row shows the period
+            # it was originally filed for (preserved through rollovers)
+            "_month":  fmt_month(init.get("month_yr") or rm),
             "_status": status,
             "_completion": (
                 datetime.fromtimestamp(init["approved_at"] / 1000).strftime("%Y-%m-%d %H:%M")
@@ -1148,6 +1229,11 @@ def screen_wizard():
         if st.button("Save Initiative ✓" if is_last else "Next →", disabled=not is_valid, type="primary"):
             if is_last:
                 draft = st.session_state.draft
+                # Stamp month_yr on new/carryover initiatives so the export
+                # always shows the correct period regardless of later rollovers.
+                # Edit mode preserves whatever month_yr was already on the initiative.
+                if mode in ("new", "carryover") and not init.get("month_yr"):
+                    init["month_yr"] = draft.get("reporting_month", "")
                 if mode == "edit":
                     draft["initiatives"] = [i if i["id"] != init["id"] else init for i in draft["initiatives"]]
                 else:
@@ -1180,6 +1266,12 @@ def screen_admin():
             st.session_state.screen = "login" if st.session_state.user == "Admin" else "dashboard"
             st.rerun()
 
+    # Silently repair any missing index entries before loading data —
+    # ensures files that exist on disk are always included in the view.
+    repaired = repair_months_index()
+    if repaired:
+        st.info(f"🔧 Index repaired: {repaired} missing entr{'ies' if repaired!=1 else 'y'} restored from disk.")
+
     # Load everything, grouped by (entity, reporting_month)
     all_data = load_all_submissions()
     combos   = get_combos(all_data)   # [(entity, rm), ...]
@@ -1201,6 +1293,26 @@ def screen_admin():
     c3.metric("Submitted",        n_sub)
     c4.metric("Approved",         n_appr)
     c5.metric("Total Initiatives",n_inits)
+
+    # Backup — download entire data folder as ZIP
+    with st.expander("🗄 Data Backup", expanded=False):
+        st.caption(
+            "Download a ZIP of all submission data files. Keep a copy somewhere safe "
+            "(Google Drive, OneDrive, email) in case the server is ever reset or lost. "
+            "Recommended: download after each monthly approval cycle."
+        )
+        backup_bytes = create_backup_zip()
+        backup_date  = datetime.now().strftime("%m%d%y")
+        st.download_button(
+            "↓ Download Full Data Backup",
+            data=backup_bytes,
+            file_name=f"RD_Data_Backup_{backup_date}.zip",
+            mime="application/zip",
+        )
+        st.caption(
+            f"Backup contains **{len(list(DATA_DIR.glob('*.json')))} files** · "
+            f"{backup_bytes.__len__() // 1024} KB"
+        )
 
     st.divider()
 
