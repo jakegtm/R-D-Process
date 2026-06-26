@@ -258,11 +258,13 @@ def load_all_submissions() -> dict:
 def get_combos(all_data: dict) -> list[tuple[str, str]]:
     """
     Returns sorted list of unique (entity, reporting_month) tuples
-    found across all submissions.
+    found across submissions that have at least one initiative.
     """
     combos: set[tuple[str, str]] = set()
     for user, months in all_data.items():
         for month, sub in months.items():
+            if not sub.get("initiatives"):
+                continue   # skip empty setup drafts
             e  = sub.get("entity", "")
             rm = sub.get("reporting_month", month)
             if e and rm:
@@ -1083,8 +1085,12 @@ def screen_admin():
     combos   = get_combos(all_data)   # [(entity, rm), ...]
 
     # ── Summary stats ────────────────────────────────────────────────────────
-    all_subs  = [sub for ud in all_data.values() for sub in ud.values()]
-    n_users   = len(all_data)
+    # Only count submissions that have actual initiatives (ignore empty setup drafts)
+    all_subs  = [
+        sub for ud in all_data.values() for sub in ud.values()
+        if sub.get("initiatives")
+    ]
+    n_users   = sum(1 for ud in all_data.values() if any(s.get("initiatives") for s in ud.values()))
     n_sub     = sum(1 for s in all_subs if s.get("status") in ("submitted","approved"))
     n_appr    = sum(1 for s in all_subs if s.get("status") == "approved")
     n_inits   = sum(len(s.get("initiatives") or []) for s in all_subs)
