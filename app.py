@@ -515,10 +515,11 @@ def carryover_initiative(src: dict) -> dict:
 
 def empty_draft() -> dict:
     return {
-        "initiatives":     [],
-        "status":          "in-progress",
-        "entity":          "",
-        "reporting_month": "",
+        "initiatives":      [],
+        "status":           "in-progress",
+        "entity":           "",
+        "reporting_month":  "",   # filing month  — storage key & Group# in filename
+        "activities_month": "",   # activities month — Month/Yr column in export
     }
 
 
@@ -650,9 +651,8 @@ def _sub_to_rows(username: str, sub: dict, include_user: bool) -> list[dict]:
     rows   = []
     for init in sub.get("initiatives") or []:
         row = {
-            # Use initiative's own month_yr so each row shows the period
-            # it was originally filed for (preserved through rollovers)
-            "_month":  fmt_month(init.get("month_yr") or rm),
+            # Use initiative's own month_yr, then activities_month, then filing month
+            "_month":  fmt_month(init.get("month_yr") or sub.get("activities_month") or rm),
             "_status": status,
             "_completion": (
                 datetime.fromtimestamp(init["approved_at"] / 1000).strftime("%Y-%m-%d %H:%M")
@@ -680,10 +680,14 @@ def build_excel_individual(username: str, sub: dict) -> bytes:
     """Single-user, single-month export — matches original template layout."""
     wb = Workbook()
     ws = wb.active
-    ws.title = fmt_month_tab(sub.get("reporting_month", ""))
+    am     = sub.get("activities_month") or sub.get("reporting_month", "")
+    fm     = sub.get("reporting_month", "")
     entity = sub.get("entity", "")
-    rm     = sub.get("reporting_month", "")
-    subtitle = f"Submitted by: {username}  |  Entity: {entity}  |  Period: {fmt_month(rm)}"
+    ws.title = fmt_month_tab(am) or fmt_month_tab(fm) or "Report"
+    subtitle = (
+        f"Submitted by: {username}  |  Entity: {entity}  |  "
+        f"Filing: {fmt_month(fm)}  |  Reporting Period: {fmt_month(am)}"
+    )
     rows = _sub_to_rows(username, sub, include_user=False)
     _write_sheet(ws, rows, subtitle)
     buf = io.BytesIO()
@@ -837,21 +841,20 @@ def screen_dashboard():
     # Header
     c1, c2 = st.columns([5, 1])
     with c1:
-        rm = draft.get("reporting_month", "")
-        if rm:
-            # Show the reporting period (the month being reported ON, e.g. May 2026)
-            # This is always the past month — e.g. a report filed in June covers May.
-            st.markdown(f"## 🔬 R&D Tracker")
+        fm  = draft.get("reporting_month", "")
+        am  = draft.get("activities_month", "")
+        st.markdown("## 🔬 R&D Tracker")
+        if fm and am:
             st.markdown(
-                f"**Reporting Period: {fmt_month(rm)}** "
-                f"<span style='color:#64748b; font-size:14px;'>"
-                f"(activities that took place in {fmt_month(rm)})</span>",
+                f"**Filing:** {fmt_month(fm)} &nbsp;|&nbsp; "
+                f"**Reporting Period (Month/Yr):** {fmt_month(am)}",
                 unsafe_allow_html=True,
             )
+        elif fm:
+            st.markdown(f"**Filing Month:** {fmt_month(fm)}", unsafe_allow_html=True)
         else:
-            st.markdown("## 🔬 R&D Tracker")
             st.markdown(
-                "<span style='color:#c86a2a;'>⚠ Select your reporting period below</span>",
+                "<span style='color:#c86a2a;'>⚠ Complete Report Setup below</span>",
                 unsafe_allow_html=True,
             )
         st.caption(f"Signed in as **{user}**")
@@ -866,60 +869,79 @@ def screen_dashboard():
 
     # ── Report Setup ─────────────────────────────────────────────────────────
     setup_complete = bool(draft.get("entity") and draft.get("reporting_month"))
-    with st.expander(
-        "⚙ Report Setup"
-        + (f"  —  Entity {draft['entity']}  ·  Period: {fmt_month(draft['reporting_month'])}"
-           if setup_complete else "  ⚠ Please select entity and reporting period first"),
-        expanded=not setup_complete,
-    ):
+    filing_lbl     = fmt_month(draft.get("reporting_month",""))
+    act_lbl        = fmt_month(draft.get("activities_month",""))
+    expander_label = (
+        f"⚙ Report Setup  —  Entity {draft['entity']}  ·  Filing: {filing_lbl}  ·  Activities: {act_lbl}"
+        if setup_complete else "⚙ Report Setup  ⚠ Please complete setup first"
+    )
+    with st.expander(expander_label, expanded=not setup_complete):
         st.caption(
-            "The **Reporting Period** is the month your R&D activities took place in — "
-            "typically the previous month. For example, if you are filing in June, "
-            "select **May** as the reporting period. This determines the Month/Yr "
-            "column in the export and the exported filename."
+            "**Filing Month** is the month you are submitting this report in "
+            "— it determines the Group number in the filename (e.g. filing in June → Group 6). "
+            "**Reporting Period** is the month the R&D activities actually took place "
+            "— it appears in the Month/Yr column of the export (typically the previous month)."
         )
-        su1, su2 = st.columns(2)
+        su1, su2, su3 = st.columns(3)
+        mlist = available_months()
+
         with su1:
-            eidx         = ENTITIES.index(draft["entity"]) if draft.get("entity") in ENTITIES else 0
+            eidx          = ENTITIES.index(draft["entity"]) if draft.get("entity") in ENTITIES else 0
             chosen_entity = st.selectbox("Entity", ENTITIES, index=eidx, key="su_entity")
+
         with su2:
-            mlist    = available_months()
-            # Default to previous month — reports are filed for the past month
-            def_rm   = mlist[1] if len(mlist) > 1 else mlist[0]
-            cur_rm   = draft.get("reporting_month") or def_rm
-            rm_idx   = mlist.index(cur_rm) if cur_rm in mlist else 0
-            chosen_rm = st.selectbox(
-                "Reporting Period (month activities took place)",
+            # Filing Month — defaults to CURRENT month (you are filing now)
+            def_filing = mlist[0]
+            cur_filing  = draft.get("reporting_month") or def_filing
+            filing_idx  = mlist.index(cur_filing) if cur_filing in mlist else 0
+            chosen_filing = st.selectbox(
+                "Filing Month",
                 mlist,
-                index=rm_idx,
+                index=filing_idx,
                 format_func=fmt_month,
-                key="su_rm",
-                help="Select the month your R&D work occurred in. Defaults to last month.",
+                key="su_filing",
+                help="The month you are submitting this report in. Sets the Group number in the filename.",
             )
 
-        entity_changed = chosen_entity != draft.get("entity")
-        month_changed  = chosen_rm     != draft.get("reporting_month")
+        with su3:
+            # Reporting Period (activities) — defaults to month BEFORE filing month
+            def_act   = prev_month_of(chosen_filing)
+            cur_act   = draft.get("activities_month") or def_act
+            # If filing month just changed, nudge activities_month to match
+            if chosen_filing != draft.get("reporting_month","") and cur_act == draft.get("activities_month",""):
+                cur_act = prev_month_of(chosen_filing)
+            act_idx   = mlist.index(cur_act) if cur_act in mlist else (1 if len(mlist)>1 else 0)
+            chosen_act = st.selectbox(
+                "Reporting Period (Month/Yr column)",
+                mlist,
+                index=act_idx,
+                format_func=fmt_month,
+                key="su_act",
+                help="The month R&D activities took place. Appears in the Month/Yr column of the export.",
+            )
 
-        if entity_changed or month_changed:
-            if month_changed:
-                # Load existing submission for that month if it exists
-                existing = load_submission(user, chosen_rm)
-                if existing:
-                    draft = existing
-                else:
-                    draft = empty_draft()
+        entity_changed  = chosen_entity  != draft.get("entity")
+        filing_changed  = chosen_filing  != draft.get("reporting_month")
+        act_changed     = chosen_act     != draft.get("activities_month")
+
+        if entity_changed or filing_changed or act_changed:
+            if filing_changed:
+                existing = load_submission(user, chosen_filing)
+                draft    = existing if existing else empty_draft()
             draft["entity"]          = chosen_entity
-            draft["reporting_month"] = chosen_rm
+            draft["reporting_month"] = chosen_filing
+            draft["activities_month"]= chosen_act
             save_draft(user, draft)
             st.session_state.draft = draft
             st.rerun()
 
         if setup_complete:
             fname = export_filename(draft["entity"], draft["reporting_month"])
-            rm_display = fmt_month(draft["reporting_month"])
             st.success(
-                f"✓ Reporting **{rm_display}** activities for Entity **{draft['entity']}**. "
-                f"Export filename: **{fname}**"
+                f"✓ **Filing Month:** {fmt_month(draft['reporting_month'])} "
+                f"(Entity {draft['entity']}, filename: **{fname}**)  |  "
+                f"**Reporting Period (Month/Yr):** {fmt_month(draft.get('activities_month',''))} "
+                f"— this will appear in the Month/Yr column."
             )
 
     if not setup_complete:
@@ -981,9 +1003,10 @@ def screen_dashboard():
     # ── Initiatives list ──────────────────────────────────────────────────────
     c1, c2 = st.columns([5, 1])
     with c1:
-        st.subheader(f"Initiatives — {fmt_month(draft['reporting_month'])}")
+        act_m = draft.get("activities_month") or draft.get("reporting_month","")
+        st.subheader(f"Initiatives — {fmt_month(act_m)}")
         st.caption(
-            f"R&D activities that took place in **{fmt_month(draft['reporting_month'])}**. "
+            f"R&D activities that took place in **{fmt_month(act_m)}**. "
             "This period will appear in the Month/Yr column of your export."
         )
     with c2:
@@ -1253,7 +1276,8 @@ def screen_wizard():
                 # always shows the correct period regardless of later rollovers.
                 # Edit mode preserves whatever month_yr was already on the initiative.
                 if mode in ("new", "carryover") and not init.get("month_yr"):
-                    init["month_yr"] = draft.get("reporting_month", "")
+                    # Use activities_month (the R&D period) not filing month
+                    init["month_yr"] = draft.get("activities_month") or draft.get("reporting_month", "")
                 if mode == "edit":
                     draft["initiatives"] = [i if i["id"] != init["id"] else init for i in draft["initiatives"]]
                 else:
