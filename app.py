@@ -148,11 +148,14 @@ def fmt_month(m: str) -> str:
     return datetime(int(y), int(mo), 1).strftime("%B %Y")
 
 def fmt_month_tab(m: str) -> str:
-    """Short form for Excel sheet tab names, e.g. 'May 26'"""
+    """Short form for Excel sheet tab names, e.g. 'May 2026'. Never returns empty."""
     if not m:
-        return ""
-    y, mo = m.split("-")
-    return datetime(int(y), int(mo), 1).strftime("%b %Y")
+        return "Report"
+    try:
+        y, mo = m.split("-")
+        return datetime(int(y), int(mo), 1).strftime("%b %Y")
+    except Exception:
+        return m or "Report"
 
 def available_months() -> list[str]:
     """6 months back + 1 forward, newest first."""
@@ -1163,7 +1166,7 @@ def screen_admin():
     st.subheader("🔄 Entity Rollover")
     st.caption(
         "Copy all active initiatives from one entity/month period into a new period. "
-        "Only initiatives whose expected end date hasn't passed will be carried. "
+        "All initiatives are included regardless of end date — you are in control. "
         "Users who already have a submission for the target period won't be overwritten."
     )
 
