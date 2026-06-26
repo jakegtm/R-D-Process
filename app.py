@@ -726,7 +726,10 @@ def screen_login():
 def screen_dashboard():
     user      = st.session_state.user
     draft     = st.session_state.draft
-    submitted = draft["status"] != "in-progress"
+    # "rejected" is treated the same as "in-progress" for editing/submitting
+    # — user needs to be able to fix and resubmit after a rejection.
+    # Only truly locked states are "submitted" and "approved".
+    submitted = draft["status"] in ("submitted", "approved")
 
     # Header
     c1, c2 = st.columns([5, 1])
@@ -940,7 +943,7 @@ def screen_dashboard():
                         st.rerun()
                 with c3:
                     if st.button("📤 Submit for Review", key=f"usub_{iid}", disabled=submitted,
-                                 help="Marks your report as Ready for Review"):
+                                 help="Marks your full report as Ready for Review"):
                         draft["status"]       = "submitted"
                         draft["submitted_at"] = int(datetime.now().timestamp()*1000)
                         save_draft(user, draft)
@@ -981,17 +984,23 @@ def screen_dashboard():
     c1, c2 = st.columns([3, 1])
     with c1:
         if not submitted and draft["initiatives"]:
-            st.markdown("#### Ready to submit?")
-            st.caption(
+            was_rejected = draft["status"] == "rejected"
+            label = "Resubmit — Ready for Review ✓" if was_rejected else "Submit — Ready for Review ✓"
+            caption = (
+                "Resubmitting will send your updated report back to the Oversight Lead for review."
+                if was_rejected else
                 f"Sends your {len(draft['initiatives'])} initiative"
                 f"{'s' if len(draft['initiatives'])!=1 else ''} to the Oversight Lead for review."
             )
-            if st.button("Submit — Ready for Review ✓", type="primary"):
+            st.markdown("#### Ready to submit?" if not was_rejected else "#### Ready to resubmit?")
+            st.caption(caption)
+            if st.button(label, type="primary"):
                 draft["status"]       = "submitted"
                 draft["submitted_at"] = int(datetime.now().timestamp()*1000)
+                draft.pop("rejection_comment", None)   # clear old rejection comment
                 save_draft(user, draft)
                 st.session_state.draft = draft
-                st.success("Report submitted!")
+                st.success("Report resubmitted!" if was_rejected else "Report submitted!")
                 st.rerun()
     with c2:
         xlsx = build_excel_individual(user, draft)
