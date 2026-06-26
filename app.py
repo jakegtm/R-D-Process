@@ -145,8 +145,11 @@ def prev_month_of(m: str) -> str:
 def fmt_month(m: str) -> str:
     if not m:
         return ""
-    y, mo = m.split("-")
-    return datetime(int(y), int(mo), 1).strftime("%B %Y")
+    try:
+        y, mo = m.split("-")
+        return datetime(int(y), int(mo), 1).strftime("%B %Y")
+    except Exception:
+        return ""
 
 def fmt_month_tab(m: str) -> str:
     """Short form for Excel sheet tab names, e.g. 'May 2026'. Never returns empty."""
@@ -1324,7 +1327,12 @@ def screen_admin():
             "Save this somewhere safe (Google Drive, OneDrive) after each approval cycle."
         )
         backup_bytes = create_backup_excel(all_data)
-        n_files = len(list(DATA_DIR.glob("*.json")))
+        # Count only real submissions (files with at least one initiative)
+        n_subs = sum(
+            1 for f in DATA_DIR.glob("*.json")
+            if not f.stem.endswith("_months") and f.stem != "registry"
+            and bool(__import__("json").loads(f.read_text()).get("initiatives"))
+        )
         col1, col2 = st.columns([2, 3])
         with col1:
             st.download_button(
@@ -1334,7 +1342,7 @@ def screen_admin():
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
         with col2:
-            st.caption(f"{n_files} data files on disk · {len(backup_bytes)//1024} KB")
+            st.caption(f"{n_subs} submission{'s' if n_subs != 1 else ''} with data · {len(backup_bytes)//1024} KB")
 
         st.divider()
 
