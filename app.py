@@ -1169,23 +1169,21 @@ def screen_admin():
         with ex1:
             if chosen_combos:
                 xlsx = build_excel_consolidated(all_data, chosen_combos, submitted_only=False)
-                # Use first combo for filename, or "Consolidated"
-                fe, frm = chosen_combos[0]
-                tag = "Consolidated_All" if len(chosen_combos) > 1 else "All"
+                today = datetime.now().strftime("%m%d%y")
                 st.download_button(
-                    f"↓ Download — All Statuses ({len(chosen_combos)} period{'s' if len(chosen_combos)!=1 else ''})",
+                    "↓ Download Consolidated Report — All Statuses",
                     data=xlsx,
-                    file_name=export_filename(fe, frm, tag),
+                    file_name=f"Consolidated_Report_{today}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
         with ex2:
             if chosen_combos:
                 xlsx_sub = build_excel_consolidated(all_data, chosen_combos, submitted_only=True)
-                tag2 = "Consolidated_Submitted" if len(chosen_combos) > 1 else "Submitted"
+                today = datetime.now().strftime("%m%d%y")
                 st.download_button(
-                    f"↓ Download — Submitted Only ({len(chosen_combos)} period{'s' if len(chosen_combos)!=1 else ''})",
+                    "↓ Download Consolidated Report — Submitted Only",
                     data=xlsx_sub,
-                    file_name=export_filename(fe, frm, tag2),
+                    file_name=f"Consolidated_Report_Submitted_{today}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
 
