@@ -351,7 +351,9 @@ def rollover_entity(
 
         # Don't overwrite an existing submission for that period
         existing = load_submission(username, target_month)
-        if existing and existing.get("entity") == source_entity:
+        # Only block if they have a real submission (with initiatives),
+        # not just an empty setup draft saved when they picked a reporting month
+        if existing and existing.get("entity") == source_entity and existing.get("initiatives"):
             continue
 
         initiatives = src_sub.get("initiatives") or []
@@ -1294,7 +1296,7 @@ def screen_admin():
             if not sub or sub.get("entity") != src_entity:
                 continue
             existing = load_submission(username, chosen_target)
-            if existing and existing.get("entity") == src_entity:
+            if existing and existing.get("entity") == src_entity and existing.get("initiatives"):
                 continue
             inits = sub.get("initiatives") or []
             if inits:
