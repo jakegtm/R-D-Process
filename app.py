@@ -377,6 +377,10 @@ def new_initiative() -> dict:
         "team_members":          [],
         "notes":                 "",
         "carry_over":            False,
+        # Per-initiative status (set by admin actions)
+        "initiative_status":     "active",   # active | approved | returned
+        "approved_at":           None,       # ms timestamp when admin approved
+        "returned_at":           None,       # ms timestamp when admin returned
     }
 
 def carryover_initiative(src: dict) -> dict:
@@ -432,6 +436,7 @@ _COL_DEF = [
     ("Activities to Eliminate Technical Uncertainty",          "activities",    60,   False),
     ("Team Members",                                           "team_members",  49,   True),
     ("Notes",                                                  "notes",         53,   False),
+    ("Completion Date",                                        "_completion",   22,   False),
     ("Status",                                                 "_status",       22,   False),
 ]
 
@@ -495,6 +500,12 @@ def _sub_to_rows(username: str, sub: dict, include_user: bool) -> list[dict]:
         row = {
             "_month":  fmt_month(rm),
             "_status": status,
+            "_completion": (
+                datetime.fromtimestamp(init["approved_at"] / 1000).strftime("%Y-%m-%d %H:%M")
+                if init.get("approved_at") else
+                datetime.fromtimestamp(sub["approved_at"] / 1000).strftime("%Y-%m-%d")
+                if sub.get("approved_at") else ""
+            ),
             "business_component":    init.get("business_component",    ""),
             "initiative_name":       init.get("initiative_name",        ""),
             "initiative_description":init.get("initiative_description", ""),
@@ -533,7 +544,7 @@ def build_excel_consolidated(
 ) -> bytes:
     """
     Multi-sheet consolidated export.
-    One sheet per (entity, reporting_month) combo.
+    One sheet per (entity, reporting_month) period.
     Sheet name: "107 - May 2026"
     """
     wb = Workbook()
@@ -813,16 +824,36 @@ def screen_dashboard():
                 if init.get("notes"):
                     st.markdown(f"*Notes: {init['notes']}*")
 
+                # Per-initiative status banner (set by admin)
+                istatus = init.get("initiative_status", "active")
+                if istatus == "returned":
+                    ret_ts = init.get("returned_at")
+                    ret_str = f" on {datetime.fromtimestamp(ret_ts/1000).strftime('%b %d %H:%M')}" if ret_ts else ""
+                    st.warning(f"⚠ Admin returned this initiative for revision{ret_str}. Edit and resubmit.")
+                elif istatus == "approved":
+                    appr_ts = init.get("approved_at")
+                    appr_str = f" on {datetime.fromtimestamp(appr_ts/1000).strftime('%b %d %H:%M')}" if appr_ts else ""
+                    st.success(f"✓ Approved by admin{appr_str}.")
+
                 st.write("")
-                c1, c2, c3 = st.columns([3, 0.8, 0.8])
+                c1, c2, c3, c4 = st.columns([2.5, 0.8, 0.8, 0.8])
                 with c2:
-                    if not submitted and st.button("✏ Edit", key=f"edit_{iid}"):
+                    if st.button("✏ Edit", key=f"edit_{iid}"):
                         st.session_state.wiz_init = dict(init)
                         st.session_state.wiz_step = 0
                         st.session_state.wiz_mode = "edit"
                         st.session_state.screen   = "wizard"
                         st.rerun()
                 with c3:
+                    if st.button("📤 Submit", key=f"usub_{iid}", disabled=submitted,
+                                 help="Submit your full report for review"):
+                        draft["status"]       = "submitted"
+                        draft["submitted_at"] = int(datetime.now().timestamp()*1000)
+                        save_draft(user, draft)
+                        st.session_state.draft = draft
+                        st.success("Report submitted!")
+                        st.rerun()
+                with c4:
                     if st.button("🗑 Delete", key=f"del_{iid}"):
                         st.session_state.confirm_del = iid
                         st.rerun()
@@ -1101,7 +1132,7 @@ def screen_admin():
                 fe, frm = chosen_combos[0]
                 tag = "Consolidated_All" if len(chosen_combos) > 1 else "All"
                 st.download_button(
-                    f"↓ Download — All Statuses ({len(chosen_combos)} combo{'s' if len(chosen_combos)!=1 else ''})",
+                    f"↓ Download — All Statuses ({len(chosen_combos)} period{'s' if len(chosen_combos)!=1 else ''})",
                     data=xlsx,
                     file_name=export_filename(fe, frm, tag),
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1111,7 +1142,7 @@ def screen_admin():
                 xlsx_sub = build_excel_consolidated(all_data, chosen_combos, submitted_only=True)
                 tag2 = "Consolidated_Submitted" if len(chosen_combos) > 1 else "Submitted"
                 st.download_button(
-                    f"↓ Download — Submitted Only ({len(chosen_combos)} combo{'s' if len(chosen_combos)!=1 else ''})",
+                    f"↓ Download — Submitted Only ({len(chosen_combos)} period{'s' if len(chosen_combos)!=1 else ''})",
                     data=xlsx_sub,
                     file_name=export_filename(fe, frm, tag2),
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1122,7 +1153,7 @@ def screen_admin():
     # ── Entity Rollover ───────────────────────────────────────────────────────
     st.subheader("🔄 Entity Rollover")
     st.caption(
-        "Copy all active initiatives from one entity/month combo into a new period. "
+        "Copy all active initiatives from one entity/month period into a new period. "
         "Only initiatives whose expected end date hasn't passed will be carried. "
         "Users who already have a submission for the target period won't be overwritten."
     )
@@ -1232,52 +1263,123 @@ def screen_admin():
             with st.expander(
                 f"{icon}  {username}   —  {STATUS_LABELS.get(status,'—')}  "
                 f"({len(inits)} initiative{'s' if len(inits)!=1 else ''})",
-                expanded=False,
+                expanded=(status == "submitted"),
             ):
-                ac1, ac2, ac3 = st.columns([3, 1, 1])
-                with ac1:
+                # ── Report-level info + export ────────────────────────────
+                h1, h2 = st.columns([4, 1])
+                with h1:
                     if sub.get("submitted_at"):
                         ts = datetime.fromtimestamp(sub["submitted_at"]/1000).strftime("%b %d %H:%M")
                         st.caption(f"Submitted: {ts}")
-                with ac2:
-                    if status == "submitted":
-                        if st.button("✓ Approve", key=f"appr_{entity}_{rm}_{username}", type="primary"):
+                    if sub.get("approved_at"):
+                        ts = datetime.fromtimestamp(sub["approved_at"]/1000).strftime("%b %d %H:%M")
+                        st.caption(f"Report approved: {ts}")
+                with h2:
+                    u_xlsx  = build_excel_individual(username, sub)
+                    u_fname = export_filename(entity, rm).replace(".xlsx", f"_{_safe_name(username)}.xlsx")
+                    st.download_button(
+                        "↓ Export",
+                        data=u_xlsx,
+                        file_name=u_fname,
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key=f"dl_{entity}_{rm}_{username}",
+                    )
+
+                # ── Report-level approve / return ─────────────────────────
+                if status == "submitted":
+                    ra1, ra2, ra3 = st.columns([3, 1, 1])
+                    with ra2:
+                        if st.button("✓ Approve All", key=f"appr_rpt_{entity}_{rm}_{username}", type="primary"):
+                            now = int(datetime.now().timestamp()*1000)
                             sub["status"]      = "approved"
-                            sub["approved_at"] = int(datetime.now().timestamp()*1000)
+                            sub["approved_at"] = now
+                            for i in sub.get("initiatives") or []:
+                                if i.get("initiative_status","active") == "active":
+                                    i["initiative_status"] = "approved"
+                                    i["approved_at"]       = now
                             save_draft(username, sub)
-                            st.success(f"{username} approved!")
+                            st.success(f"Report approved!")
                             st.rerun()
-                with ac3:
-                    if status == "submitted":
-                        if st.button("↩ Return", key=f"rej_{entity}_{rm}_{username}"):
+                    with ra3:
+                        if st.button("↩ Return All", key=f"rej_rpt_{entity}_{rm}_{username}"):
+                            now = int(datetime.now().timestamp()*1000)
                             sub["status"]      = "rejected"
-                            sub["rejected_at"] = int(datetime.now().timestamp()*1000)
+                            sub["rejected_at"] = now
                             save_draft(username, sub)
-                            st.warning(f"{username}'s report returned.")
                             st.rerun()
 
-                # Per-user individual export
-                u_xlsx  = build_excel_individual(username, sub)
-                u_fname = export_filename(entity, rm)
-                # Disambiguate filename with username suffix
-                u_fname = u_fname.replace(".xlsx", f"_{_safe_name(username)}.xlsx")
-                st.download_button(
-                    f"↓ Export {username}'s Report",
-                    data=u_xlsx,
-                    file_name=u_fname,
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key=f"dl_{entity}_{rm}_{username}",
-                )
+                st.divider()
 
-                if inits:
-                    st.markdown("**Initiatives:**")
-                    for i in inits:
-                        co = "↩ " if i.get("carry_over") else ""
-                        st.markdown(
-                            f"- **{co}{i.get('initiative_name','Unnamed')}** — "
-                            f"{i.get('business_component','')} · "
-                            f"👥 {', '.join(i.get('team_members') or ['—'])}"
-                        )
+                # ── Per-initiative actions ────────────────────────────────
+                if not inits:
+                    st.caption("No initiatives.")
+                else:
+                    for init in inits:
+                        iid     = init["id"]
+                        istatus = init.get("initiative_status","active")
+                        iname   = init.get("initiative_name","Unnamed")
+                        ico     = {"approved":"✅","returned":"↩","active":"🔵"}.get(istatus,"🔵")
+
+                        ic1, ic2, ic3, ic4 = st.columns([3, 0.8, 0.8, 0.8])
+                        with ic1:
+                            co = "↩ " if init.get("carry_over") else ""
+                            bc   = init.get("business_component","")
+                            team = ", ".join(init.get("team_members") or ["—"])
+                            sd   = init.get("start_date","—")
+                            ed   = init.get("expected_end_date","—")
+                            st.markdown(
+                                f"{ico} **{co}{iname}** — {bc}  \n"
+                                f"<small>👥 {team} &nbsp;|&nbsp; 📅 {sd} → {ed}</small>",
+                                unsafe_allow_html=True,
+                            )
+                            if init.get("approved_at"):
+                                ts = datetime.fromtimestamp(init["approved_at"]/1000).strftime("%b %d %H:%M")
+                                st.caption(f"   Approved {ts}")
+                            if init.get("returned_at"):
+                                ts = datetime.fromtimestamp(init["returned_at"]/1000).strftime("%b %d %H:%M")
+                                st.caption(f"   Returned {ts}")
+
+                        with ic2:
+                            if istatus != "approved":
+                                if st.button("✓ Accept", key=f"appr_i_{entity}_{rm}_{username}_{iid}",
+                                             type="primary"):
+                                    now = int(datetime.now().timestamp()*1000)
+                                    init["initiative_status"] = "approved"
+                                    init["approved_at"]       = now
+                                    init.pop("returned_at", None)
+                                    # If all initiatives approved, approve the report too
+                                    all_approved = all(
+                                        i.get("initiative_status") == "approved"
+                                        for i in sub.get("initiatives",[])
+                                    )
+                                    if all_approved:
+                                        sub["status"]      = "approved"
+                                        sub["approved_at"] = now
+                                    save_draft(username, sub)
+                                    st.rerun()
+
+                        with ic3:
+                            if istatus != "returned":
+                                if st.button("↩ Return", key=f"ret_i_{entity}_{rm}_{username}_{iid}"):
+                                    now = int(datetime.now().timestamp()*1000)
+                                    init["initiative_status"] = "returned"
+                                    init["returned_at"]       = now
+                                    init.pop("approved_at", None)
+                                    # Mark report as rejected so user is notified
+                                    sub["status"] = "rejected"
+                                    save_draft(username, sub)
+                                    st.rerun()
+
+                        with ic4:
+                            if st.button("🗑 Delete", key=f"del_i_{entity}_{rm}_{username}_{iid}"):
+                                sub["initiatives"] = [i for i in sub["initiatives"] if i["id"] != iid]
+                                if not sub["initiatives"]:
+                                    sub["status"] = "in-progress"
+                                save_draft(username, sub)
+                                st.success(f"Deleted: {iname}")
+                                st.rerun()
+
+                        st.write("")
 
         st.write("")  # spacing between combos
 
