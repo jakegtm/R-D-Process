@@ -231,11 +231,14 @@ def save_draft(username: str, draft: dict):
     if username not in reg:
         reg.append(username)
         save_registry(reg)
-    # Per-user month index
-    months = load_user_months(username)
-    if month not in months:
-        months.append(month)
-        save_user_months(username, months)
+    # Per-user month index — only track months that have real content
+    # (avoids empty setup sessions polluting the admin view)
+    has_content = bool(draft.get("initiatives")) or draft.get("status") not in ("in-progress", None)
+    if has_content:
+        months = load_user_months(username)
+        if month not in months:
+            months.append(month)
+            save_user_months(username, months)
 
 def load_all_submissions() -> dict:
     """
@@ -1257,6 +1260,10 @@ def screen_admin():
         for username, sub in combo_rows:
             status = sub.get("status", "not-started")
             inits  = sub.get("initiatives") or []
+            # Skip empty in-progress drafts — user just set up their report
+            # but hasn't added any initiatives yet; not useful for admin to see
+            if not inits and status == "in-progress":
+                continue
             icon   = {"approved":"✅","submitted":"🔵","in-progress":"🟡",
                       "rejected":"🔴","not-started":"⚪"}.get(status,"⚪")
 
