@@ -35,9 +35,9 @@ ENTITIES = ["107", "108", "109", "110"]
 
 STATUS_LABELS = {
     "in-progress": "🟡 In Progress",
-    "submitted":   "🔵 Submitted for Review",
+    "submitted":   "🔵 Ready for Review",
     "approved":    "🟢 Approved",
-    "rejected":    "🔴 Returned — Needs Revision",
+    "rejected":    "🔴 Rejected",
     "not-started": "⚪ Not Started",
 }
 
@@ -358,8 +358,22 @@ def rollover_entity(
         if not initiatives:
             continue
 
+        # Deep-copy every initiative so all content is fully preserved.
+        # Only reset the per-review-cycle fields (approval state) since
+        # this is a new period with a fresh review cycle.
+        import copy as _copy
+        rolled_inits = []
+        for i in initiatives:
+            init = _copy.deepcopy(i)
+            init["id"]                = f"{int(__import__('time').time()*1000)}{len(rolled_inits)}"
+            init["initiative_status"] = "active"   # new period = new review
+            init["approved_at"]       = None
+            init["returned_at"]       = None
+            init["carry_over"]        = True
+            rolled_inits.append(init)
+
         new_sub: dict = {
-            "initiatives":     [carryover_initiative(i) for i in initiatives],
+            "initiatives":     rolled_inits,
             "status":          "in-progress",
             "entity":          source_entity,
             "reporting_month": target_month,
@@ -580,34 +594,40 @@ def build_excel_consolidated(
     submitted_only: bool = False,
 ) -> bytes:
     """
-    Multi-sheet consolidated export.
-    One sheet per (entity, reporting_month) period.
-    Sheet name: "107 - May 2026"
+    One sheet per entity (tab = "Entity 107", "Entity 108", etc.).
+    All periods for that entity appear as rows within the sheet,
+    sorted by reporting_month then username.
     """
     wb = Workbook()
-    wb.remove(wb.active)   # remove blank default sheet
+    wb.remove(wb.active)
 
-    for (entity, rm) in selected_combos:
-        sheet_name = f"{entity} - {fmt_month_tab(rm)}"[:31]
-        ws = wb.create_sheet(title=sheet_name)
+    # Collect unique entities from the selected combos, in sorted order
+    entities = sorted({e for e, _ in selected_combos})
+
+    for entity in entities:
+        ws = wb.create_sheet(title=f"Entity {entity}"[:31])
         subtitle = (
-            f"Entity: {entity}  |  Period: {fmt_month(rm)}"
-            + ("  |  Submitted & Approved only" if submitted_only else "")
+            f"Entity: {entity}"
+            + ("  |  Submitted & Approved only" if submitted_only else "  |  All statuses")
+        )
+
+        # Gather rows for this entity across all selected periods, sorted by period then user
+        entity_combos = sorted(
+            [(e, rm) for e, rm in selected_combos if e == entity],
+            key=lambda x: x[1],   # sort by reporting_month (YYYY-MM)
         )
         rows = []
-        for username, months in all_data.items():
-            sub = months.get(rm)
-            if not sub:
-                continue
-            if sub.get("entity") != entity:
-                continue
-            if submitted_only and sub.get("status") not in ("submitted", "approved"):
-                continue
-            rows.extend(_sub_to_rows(username, sub, include_user=True))
+        for _, rm in entity_combos:
+            for username in sorted(all_data.keys()):
+                sub = all_data[username].get(rm)
+                if not sub or sub.get("entity") != entity:
+                    continue
+                if submitted_only and sub.get("status") not in ("submitted", "approved"):
+                    continue
+                rows.extend(_sub_to_rows(username, sub, include_user=True))
 
         _write_sheet(ws, rows, subtitle)
 
-    # If nothing matched, add a placeholder sheet
     if not wb.sheetnames:
         ws = wb.create_sheet("No Data")
         ws.cell(1, 1, "No matching submissions found.")
@@ -711,8 +731,23 @@ def screen_dashboard():
     # Header
     c1, c2 = st.columns([5, 1])
     with c1:
-        period = fmt_month(draft.get("reporting_month")) or "— Set reporting month below"
-        st.markdown(f"## 🔬 R&D Tracker — {period}")
+        rm = draft.get("reporting_month", "")
+        if rm:
+            # Show the reporting period (the month being reported ON, e.g. May 2026)
+            # This is always the past month — e.g. a report filed in June covers May.
+            st.markdown(f"## 🔬 R&D Tracker")
+            st.markdown(
+                f"**Reporting Period: {fmt_month(rm)}** "
+                f"<span style='color:#64748b; font-size:14px;'>"
+                f"(activities that took place in {fmt_month(rm)})</span>",
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown("## 🔬 R&D Tracker")
+            st.markdown(
+                "<span style='color:#c86a2a;'>⚠ Select your reporting period below</span>",
+                unsafe_allow_html=True,
+            )
         st.caption(f"Signed in as **{user}**")
     with c2:
         st.write("")
@@ -727,13 +762,15 @@ def screen_dashboard():
     setup_complete = bool(draft.get("entity") and draft.get("reporting_month"))
     with st.expander(
         "⚙ Report Setup"
-        + (f"  —  Entity {draft['entity']}  ·  {fmt_month(draft['reporting_month'])}"
-           if setup_complete else "  ⚠ Please select entity and reporting month first"),
+        + (f"  —  Entity {draft['entity']}  ·  Period: {fmt_month(draft['reporting_month'])}"
+           if setup_complete else "  ⚠ Please select entity and reporting period first"),
         expanded=not setup_complete,
     ):
         st.caption(
-            "Export filename: "
-            "`{entity}_Group_{month}_{year}_Monthly_R_D_Tracking_Template.xlsx`"
+            "The **Reporting Period** is the month your R&D activities took place in — "
+            "typically the previous month. For example, if you are filing in June, "
+            "select **May** as the reporting period. This determines the Month/Yr "
+            "column in the export and the exported filename."
         )
         su1, su2 = st.columns(2)
         with su1:
@@ -741,12 +778,17 @@ def screen_dashboard():
             chosen_entity = st.selectbox("Entity", ENTITIES, index=eidx, key="su_entity")
         with su2:
             mlist    = available_months()
+            # Default to previous month — reports are filed for the past month
             def_rm   = mlist[1] if len(mlist) > 1 else mlist[0]
             cur_rm   = draft.get("reporting_month") or def_rm
             rm_idx   = mlist.index(cur_rm) if cur_rm in mlist else 0
             chosen_rm = st.selectbox(
-                "Reporting Month", mlist, index=rm_idx,
-                format_func=fmt_month, key="su_rm",
+                "Reporting Period (month activities took place)",
+                mlist,
+                index=rm_idx,
+                format_func=fmt_month,
+                key="su_rm",
+                help="Select the month your R&D work occurred in. Defaults to last month.",
             )
 
         entity_changed = chosen_entity != draft.get("entity")
@@ -768,7 +810,11 @@ def screen_dashboard():
 
         if setup_complete:
             fname = export_filename(draft["entity"], draft["reporting_month"])
-            st.success(f"Export will be named: **{fname}**")
+            rm_display = fmt_month(draft["reporting_month"])
+            st.success(
+                f"✓ Reporting **{rm_display}** activities for Entity **{draft['entity']}**. "
+                f"Export filename: **{fname}**"
+            )
 
     if not setup_complete:
         st.info("Complete the Report Setup above before adding initiatives.")
@@ -813,7 +859,12 @@ def screen_dashboard():
             ts = datetime.fromtimestamp(draft["submitted_at"]/1000).strftime("%b %d, %Y %H:%M")
             st.caption(f"Submitted {ts}")
         if draft["status"] == "rejected":
-            st.error("Your report was returned. Please revise and resubmit.")
+            rc = draft.get("rejection_comment", "")
+            msg = "Your report was Rejected by the Oversight Lead."
+            if rc:
+                msg += f' Comment: \"{rc}\".'
+            msg += " Please update and resubmit."
+            st.error(msg)
     with c2:
         st.metric("Initiatives", len(draft["initiatives"]))
     with c3:
@@ -824,7 +875,11 @@ def screen_dashboard():
     # ── Initiatives list ──────────────────────────────────────────────────────
     c1, c2 = st.columns([5, 1])
     with c1:
-        st.subheader(f"{fmt_month(draft['reporting_month'])} Initiatives")
+        st.subheader(f"Initiatives — {fmt_month(draft['reporting_month'])}")
+        st.caption(
+            f"R&D activities that took place in **{fmt_month(draft['reporting_month'])}**. "
+            "This period will appear in the Month/Yr column of your export."
+        )
     with c2:
         if not submitted and st.button("＋ Add Initiative", type="primary"):
             st.session_state.wiz_init = new_initiative()
@@ -866,7 +921,9 @@ def screen_dashboard():
                 if istatus == "returned":
                     ret_ts = init.get("returned_at")
                     ret_str = f" on {datetime.fromtimestamp(ret_ts/1000).strftime('%b %d %H:%M')}" if ret_ts else ""
-                    st.warning(f"⚠ Admin returned this initiative for revision{ret_str}. Edit and resubmit.")
+                    rc = init.get("rejection_comment", "")
+                    rc_str = f' Comment: \"{rc}\".' if rc else ""
+                    st.warning(f"⚠ This initiative was Rejected{ret_str}.{rc_str} Edit and resubmit.")
                 elif istatus == "approved":
                     appr_ts = init.get("approved_at")
                     appr_str = f" on {datetime.fromtimestamp(appr_ts/1000).strftime('%b %d %H:%M')}" if appr_ts else ""
@@ -882,8 +939,8 @@ def screen_dashboard():
                         st.session_state.screen   = "wizard"
                         st.rerun()
                 with c3:
-                    if st.button("📤 Submit", key=f"usub_{iid}", disabled=submitted,
-                                 help="Submit your full report for review"):
+                    if st.button("📤 Submit for Review", key=f"usub_{iid}", disabled=submitted,
+                                 help="Marks your report as Ready for Review"):
                         draft["status"]       = "submitted"
                         draft["submitted_at"] = int(datetime.now().timestamp()*1000)
                         save_draft(user, draft)
@@ -929,7 +986,7 @@ def screen_dashboard():
                 f"Sends your {len(draft['initiatives'])} initiative"
                 f"{'s' if len(draft['initiatives'])!=1 else ''} to the Oversight Lead for review."
             )
-            if st.button("Submit for Review ✓", type="primary"):
+            if st.button("Submit — Ready for Review ✓", type="primary"):
                 draft["status"]       = "submitted"
                 draft["submitted_at"] = int(datetime.now().timestamp()*1000)
                 save_draft(user, draft)
@@ -1157,13 +1214,12 @@ def screen_admin():
 
         chosen_combos = [combo_labels[l] for l in chosen_labels]
 
-        submitted_only = st.checkbox("Submitted & Approved only (exclude In Progress / Returned)", value=True)
+        submitted_only = st.checkbox("Ready for Review & Approved only (exclude In Progress / Rejected)", value=True)
 
         if chosen_combos:
-            tab_preview = ", ".join(f'"{e} - {fmt_month_tab(rm)}"' for e,rm in chosen_combos[:4])
-            if len(chosen_combos) > 4:
-                tab_preview += f" +{len(chosen_combos)-4} more"
-            st.caption(f"Excel tabs: {tab_preview}")
+            unique_entities = sorted({e for e,_ in chosen_combos})
+            tab_preview = ", ".join(f'"Entity {e}"' for e in unique_entities)
+            st.caption(f"Excel tabs (one per entity): {tab_preview}")
 
         ex1, ex2 = st.columns(2)
         with ex1:
@@ -1344,11 +1400,30 @@ def screen_admin():
                             st.success(f"Report approved!")
                             st.rerun()
                     with ra3:
-                        if st.button("↩ Return All", key=f"rej_rpt_{entity}_{rm}_{username}"):
+                        if st.button("✕ Reject All", key=f"rej_rpt_{entity}_{rm}_{username}"):
+                            st.session_state[f"reject_report_{entity}_{rm}_{username}"] = True
+                            st.rerun()
+                # Rejection comment input for report-level reject
+                if st.session_state.get(f"reject_report_{entity}_{rm}_{username}"):
+                    reject_comment = st.text_area(
+                        "Rejection comment (will be shown to the user):",
+                        key=f"rc_rpt_{entity}_{rm}_{username}",
+                        placeholder="Explain what needs to be updated...",
+                        height=80,
+                    )
+                    rc1, rc2 = st.columns(2)
+                    with rc1:
+                        if st.button("Confirm Reject", key=f"rc_confirm_rpt_{entity}_{rm}_{username}", type="primary"):
                             now = int(datetime.now().timestamp()*1000)
-                            sub["status"]      = "rejected"
-                            sub["rejected_at"] = now
+                            sub["status"]            = "rejected"
+                            sub["rejected_at"]       = now
+                            sub["rejection_comment"] = reject_comment.strip()
+                            st.session_state.pop(f"reject_report_{entity}_{rm}_{username}", None)
                             save_draft(username, sub)
+                            st.rerun()
+                    with rc2:
+                        if st.button("Cancel", key=f"rc_cancel_rpt_{entity}_{rm}_{username}"):
+                            st.session_state.pop(f"reject_report_{entity}_{rm}_{username}", None)
                             st.rerun()
 
                 st.divider()
@@ -1361,7 +1436,7 @@ def screen_admin():
                         iid     = init["id"]
                         istatus = init.get("initiative_status","active")
                         iname   = init.get("initiative_name","Unnamed")
-                        ico     = {"approved":"✅","returned":"↩","active":"🔵"}.get(istatus,"🔵")
+                        ico     = {"approved":"✅","returned":"🔴","active":"🔵"}.get(istatus,"🔵")
 
                         ic1, ic2, ic3, ic4 = st.columns([3, 0.8, 0.8, 0.8])
                         with ic1:
@@ -1380,7 +1455,9 @@ def screen_admin():
                                 st.caption(f"   Approved {ts}")
                             if init.get("returned_at"):
                                 ts = datetime.fromtimestamp(init["returned_at"]/1000).strftime("%b %d %H:%M")
-                                st.caption(f"   Returned {ts}")
+                                rc = init.get("rejection_comment","")
+                                rc_str = f' — \"{rc}\"' if rc else ""
+                                st.caption(f"   Rejected {ts}{rc_str}")
 
                         with ic2:
                             if istatus != "approved":
@@ -1403,14 +1480,32 @@ def screen_admin():
 
                         with ic3:
                             if istatus != "returned":
-                                if st.button("↩ Return", key=f"ret_i_{entity}_{rm}_{username}_{iid}"):
+                                if st.button("✕ Reject", key=f"ret_i_{entity}_{rm}_{username}_{iid}"):
+                                    st.session_state[f"reject_init_{iid}"] = True
+                                    st.rerun()
+                        # Rejection comment input (shown below initiative row)
+                        if st.session_state.get(f"reject_init_{iid}"):
+                            reject_comment_i = st.text_area(
+                                f"Comment for rejecting \"{iname}\" (will be shown to the user):",
+                                key=f"rc_init_{iid}",
+                                placeholder="Explain what needs to be updated...",
+                                height=80,
+                            )
+                            ri1, ri2 = st.columns(2)
+                            with ri1:
+                                if st.button("Confirm Reject", key=f"rc_conf_init_{iid}", type="primary"):
                                     now = int(datetime.now().timestamp()*1000)
                                     init["initiative_status"] = "returned"
                                     init["returned_at"]       = now
+                                    init["rejection_comment"] = reject_comment_i.strip()
                                     init.pop("approved_at", None)
-                                    # Mark report as rejected so user is notified
                                     sub["status"] = "rejected"
+                                    st.session_state.pop(f"reject_init_{iid}", None)
                                     save_draft(username, sub)
+                                    st.rerun()
+                            with ri2:
+                                if st.button("Cancel", key=f"rc_cancel_init_{iid}"):
+                                    st.session_state.pop(f"reject_init_{iid}", None)
                                     st.rerun()
 
                         with ic4:
