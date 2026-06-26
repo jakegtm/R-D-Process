@@ -433,61 +433,89 @@ def _data_font():
 
 # Column definition for a single-combo sheet (User prepended for consolidated)
 _COL_DEF = [
-    # (header_label,                                            field_key,      width, is_team)
-    ("Month/Yr",                                               "_month",        14,   False),
-    ("Business Component",                                     "business_component", 35, False),
-    ("Initiative Name",                                        "initiative_name",    19, False),
-    ("Initiative Description",                                 "initiative_description", 38, False),
-    ("Tech Uncertainty",                                       "tech_uncertainty",   64, False),
-    ("Start Date",                                             "start_date",    16,   False),
-    ("Expected End Date",                                      "expected_end_date", 16, False),
-    ("Activities to Eliminate Technical Uncertainty",          "activities",    60,   False),
-    ("Team Members",                                           "team_members",  49,   True),
-    ("Notes",                                                  "notes",         53,   False),
-    ("Completion Date",                                        "_completion",   22,   False),
-    ("Status",                                                 "_status",       22,   False),
+    # Widths match original template exactly (measured via openpyxl from source file)
+    ("Month/Yr",                                               "_month",             14.15,  False),
+    ("Business Component",                                     "business_component", 35.0,   False),
+    ("Initiative Name",                                        "initiative_name",    19.26,  False),
+    ("Initiative Description",                                 "initiative_description", 38.15, False),
+    ("Tech Uncertainty",                                       "tech_uncertainty",   64.41,  False),
+    ("Start Date",                                             "start_date",         15.68,  False),
+    ("Expected End Date",                                      "expected_end_date",  15.68,  False),
+    ("Activities to Eliminate Technical Uncertainty",          "activities",         60.26,  False),
+    ("Team Members",                                           "team_members",       49.0,   True),
+    ("Notes",                                                  "notes",              52.57,  False),
+    ("Completion Date",                                        "_completion",        22.0,   False),
+    ("Status",                                                 "_status",            22.0,   False),
 ]
 
 def _write_sheet(ws, rows_data: list[dict], subtitle: str):
     """
-    Write title row, subtitle, spacer, header row, then data rows
-    into worksheet ws.  rows_data is a list of dicts with keys from _COL_DEF
-    plus 'user' for consolidated sheets.
+    Matches the exact structure of the original template:
+      Row 1 : Title (A1) + Legend header cells (C-E or D-F for consolidated)
+      Row 2 : Legend swatches (Selection=yellow, subtitle text)
+      Row 3 : Autofill label
+      Row 4 : Empty spacer
+      Row 5 : Column headers (green, Arial Narrow 12pt bold white)
+      Row 6+: Data rows (auto height, beige fill / yellow for Team Members)
     """
-    border     = _thin_border()
+    border      = _thin_border()
     fill_green  = PatternFill("solid", fgColor=GREEN)
     fill_beige  = PatternFill("solid", fgColor=BEIGE)
     fill_yellow = PatternFill("solid", fgColor=YELLOW)
+    fill_red    = PatternFill("solid", fgColor="FF0000")
 
     has_user_col = any("user" in r for r in rows_data) if rows_data else False
     cols = ([("User", "user", 18, False)] if has_user_col else []) + list(_COL_DEF)
 
-    # Row 1 — title
+    # Legend columns offset right by 1 for consolidated sheet (extra User col)
+    lc = 3 if not has_user_col else 4   # start column for legend
+
+    # ── Row 1: Title + Legend header ─────────────────────────────────────────
     ws.row_dimensions[1].height = 18.3
     c = ws.cell(1, 1, "Monthly R&D Tracking Template")
     c.font = Font(name="Arial Narrow", bold=True, size=14, color=DARK)
+    c = ws.cell(1, lc, "Legend:")
+    c.font = Font(name="Arial Narrow", bold=True, size=12, color=DARK)
+    c.alignment = Alignment(horizontal="right", wrap_text=True)
+    c = ws.cell(1, lc + 1, "Input")
+    c.font = Font(name="Arial Narrow", size=12, color=DARK)
+    c.fill = fill_beige
+    c.alignment = Alignment(wrap_text=True)
+    c = ws.cell(1, lc + 2, "Missing Info")
+    c.font = Font(name="Arial Narrow", size=11, color=DARK)
+    c.fill = fill_red
 
-    # Row 2 — subtitle
-    ws.row_dimensions[2].height = 15
-    c = ws.cell(2, 1, subtitle)
+    # ── Row 2: Selection swatch + subtitle ───────────────────────────────────
+    ws.row_dimensions[2].height = 15.3
+    c = ws.cell(2, lc + 1, "Selection")
+    c.font = Font(name="Arial Narrow", size=12, color=DARK)
+    c.fill = fill_yellow
+    c.alignment = Alignment(wrap_text=True)
+    c = ws.cell(2, lc + 2, subtitle)
     c.font = Font(name="Arial Narrow", size=10, color=GRAY, italic=True)
 
-    # Row 3 — spacer
-    ws.row_dimensions[3].height = 8
+    # ── Row 3: Autofill label ─────────────────────────────────────────────────
+    ws.row_dimensions[3].height = 15.3
+    c = ws.cell(3, lc + 1, "Autofill")
+    c.font = Font(name="Arial Narrow", bold=True, size=12, color=DARK)
+    c.alignment = Alignment(wrap_text=True)
 
-    # Row 4 — column headers
-    ws.row_dimensions[4].height = 30
-    for ci, (hdr, _, width, _is_team) in enumerate(cols, 1):
-        cell = ws.cell(4, ci, hdr)
+    # ── Row 4: Empty spacer ───────────────────────────────────────────────────
+    ws.row_dimensions[4].height = 15
+
+    # ── Row 5: Column headers ─────────────────────────────────────────────────
+    ws.row_dimensions[5].height = 30
+    for ci, (hdr, _, width, _) in enumerate(cols, 1):
+        cell = ws.cell(5, ci, hdr)
         cell.fill      = fill_green
         cell.font      = _hdr_font(12)
         cell.border    = border
         cell.alignment = Alignment(horizontal="center", vertical="top", wrap_text=True)
         ws.column_dimensions[get_column_letter(ci)].width = width
 
-    # Data rows
-    for rn, row in enumerate(rows_data, 5):
-        ws.row_dimensions[rn].height = 45
+    # ── Row 6+: Data rows ─────────────────────────────────────────────────────
+    # No explicit height — Excel auto-fits to content (matches original template behavior)
+    for rn, row in enumerate(rows_data, 6):
         for ci, (_, key, _, is_team) in enumerate(cols, 1):
             val = row.get(key, "")
             cell = ws.cell(rn, ci, val)
@@ -496,7 +524,8 @@ def _write_sheet(ws, rows_data: list[dict], subtitle: str):
             cell.alignment = Alignment(vertical="top", wrap_text=True)
             cell.fill      = fill_yellow if is_team else fill_beige
 
-    ws.freeze_panes = "A5"
+    # Freeze header rows 1-5 (same as original)
+    ws.freeze_panes = "A6"
 
 
 def _sub_to_rows(username: str, sub: dict, include_user: bool) -> list[dict]:
