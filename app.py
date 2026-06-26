@@ -903,26 +903,23 @@ def screen_dashboard():
                 help="The month you are submitting this report in. Sets the Group number in the filename.",
             )
 
-        # ── Key fix: clear the Reporting Period widget state when Filing Month
-        # changes so Streamlit uses the new index instead of its cached value.
-        filing_changed_now = chosen_filing != draft.get("reporting_month", "")
-        if filing_changed_now:
-            st.session_state.pop("su_act", None)   # force widget to re-render at new index
-
         with su3:
+            filing_changed_now = chosen_filing != draft.get("reporting_month", "")
             if filing_changed_now:
                 # Auto-derive from new filing month
                 cur_act = prev_month_of(chosen_filing)
             else:
                 # Filing month unchanged — respect whatever the user has chosen
                 cur_act = draft.get("activities_month") or prev_month_of(chosen_filing)
-            act_idx    = mlist.index(cur_act) if cur_act in mlist else (1 if len(mlist) > 1 else 0)
+            act_idx = mlist.index(cur_act) if cur_act in mlist else (1 if len(mlist) > 1 else 0)
+            # Key includes the filing month — when filing changes, Streamlit treats
+            # this as a completely new widget and renders from index, not cached state.
             chosen_act = st.selectbox(
                 "Reporting Period",
                 mlist,
                 index=act_idx,
                 format_func=fmt_month,
-                key="su_act",
+                key=f"su_act_{chosen_filing}",
                 help="The month R&D activities took place.",
             )
 
