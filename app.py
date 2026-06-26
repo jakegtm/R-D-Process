@@ -320,17 +320,34 @@ def repair_months_index() -> int:
     return repaired
 
 
-def create_backup_zip() -> bytes:
+def create_backup_excel(all_data: dict) -> bytes:
     """
-    Packages the entire data/ directory into a ZIP file and returns the bytes.
-    Used for the admin backup download button.
+    Creates a comprehensive Excel backup of ALL historical data.
+    One sheet per entity (same format as consolidated export).
+    Only includes initiatives that are currently in submissions
+    (deleted initiatives are already removed from the data).
+    Includes all statuses — nothing is filtered out.
     """
-    import zipfile
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for filepath in sorted(DATA_DIR.glob("*.json")):
-            zf.write(filepath, arcname=f"data/{filepath.name}")
-    return buf.getvalue()
+    combos = get_combos(all_data)
+    if not combos:
+        # Return a minimal workbook with a message
+        wb  = Workbook()
+        ws  = wb.active
+        ws.title = "No Data"
+        ws.cell(1, 1, "No submissions found.")
+        buf = io.BytesIO()
+        wb.save(buf)
+        return buf.getvalue()
+    return build_excel_consolidated(all_data, combos, submitted_only=False)
+
+
+def delete_all_history():
+    """
+    Deletes all submission JSON files and index files from the data/ directory.
+    Preserves the directory itself. Irreversible — caller must confirm first.
+    """
+    for filepath in DATA_DIR.glob("*.json"):
+        filepath.unlink()
 
 
 def get_combos(all_data: dict) -> list[tuple[str, str]]:
@@ -1294,25 +1311,59 @@ def screen_admin():
     c4.metric("Approved",         n_appr)
     c5.metric("Total Initiatives",n_inits)
 
-    # Backup — download entire data folder as ZIP
-    with st.expander("🗄 Data Backup", expanded=False):
+    # ── Data Backup & Management ─────────────────────────────────────────────
+    with st.expander("🗄 Data Backup & Management", expanded=False):
+        backup_date = datetime.now().strftime("%m%d%y")
+
+        # Excel backup
+        st.markdown("**Backup**")
         st.caption(
-            "Download a ZIP of all submission data files. Keep a copy somewhere safe "
-            "(Google Drive, OneDrive, email) in case the server is ever reset or lost. "
-            "Recommended: download after each monthly approval cycle."
+            "Downloads all historical data as an Excel file — one tab per entity, "
+            "all periods, all users, all statuses. Only current initiatives are included; "
+            "anything previously deleted is already gone. "
+            "Save this somewhere safe (Google Drive, OneDrive) after each approval cycle."
         )
-        backup_bytes = create_backup_zip()
-        backup_date  = datetime.now().strftime("%m%d%y")
-        st.download_button(
-            "↓ Download Full Data Backup",
-            data=backup_bytes,
-            file_name=f"RD_Data_Backup_{backup_date}.zip",
-            mime="application/zip",
-        )
+        backup_bytes = create_backup_excel(all_data)
+        n_files = len(list(DATA_DIR.glob("*.json")))
+        col1, col2 = st.columns([2, 3])
+        with col1:
+            st.download_button(
+                "↓ Download Full Data Backup (.xlsx)",
+                data=backup_bytes,
+                file_name=f"RD_Data_Backup_{backup_date}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        with col2:
+            st.caption(f"{n_files} data files on disk · {len(backup_bytes)//1024} KB")
+
+        st.divider()
+
+        # Delete all history
+        st.markdown("**⚠ Delete All History**")
         st.caption(
-            f"Backup contains **{len(list(DATA_DIR.glob('*.json')))} files** · "
-            f"{backup_bytes.__len__() // 1024} KB"
+            "Permanently deletes all submission data from the server. "
+            "Download the backup above first. This cannot be undone."
         )
+        if not st.session_state.get("confirm_delete_all"):
+            if st.button("🗑 Delete All History", key="del_all_btn"):
+                st.session_state.confirm_delete_all = True
+                st.rerun()
+        else:
+            st.error(
+                "This will permanently delete ALL submissions for ALL users across ALL periods. "
+                "Are you sure?"
+            )
+            da1, da2 = st.columns(2)
+            with da1:
+                if st.button("Yes, delete everything", key="del_all_confirm", type="primary"):
+                    delete_all_history()
+                    st.session_state.confirm_delete_all = False
+                    st.success("All history deleted. The app will reload.")
+                    st.rerun()
+            with da2:
+                if st.button("Cancel", key="del_all_cancel"):
+                    st.session_state.confirm_delete_all = False
+                    st.rerun()
 
     st.divider()
 
