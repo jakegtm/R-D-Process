@@ -467,6 +467,9 @@ def rollover_entity(
             init["approved_at"]       = None
             init["returned_at"]       = None
             init["carry_over"]        = True
+            # Clear month_yr so the new period's activities_month is used in the export.
+            # Historical month_yr is preserved in the source period's file.
+            init["month_yr"]          = ""
             rolled_inits.append(init)
 
         new_sub: dict = {
