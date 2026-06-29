@@ -473,10 +473,13 @@ def rollover_entity(
             rolled_inits.append(init)
 
         new_sub: dict = {
-            "initiatives":     rolled_inits,
-            "status":          "in-progress",
-            "entity":          source_entity,
-            "reporting_month": target_month,
+            "initiatives":      rolled_inits,
+            "status":           "in-progress",
+            "entity":           source_entity,
+            "reporting_month":  target_month,
+            # Default activities_month to the month before the filing month.
+            # User can change this in Report Setup if needed.
+            "activities_month": prev_month_of(target_month),
         }
         save_draft(username, new_sub)
         rolled.append(username)
