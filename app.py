@@ -1335,6 +1335,12 @@ def screen_dashboard():
         )
         su1, su2, su3 = st.columns(3)
         mlist = available_months()
+        # If the current draft is for a period outside the normal window
+        # (e.g. a rollover created 2+ months ahead), include it so the
+        # dropdown doesn't fall back to the wrong month.
+        cur_draft_rm = draft.get("reporting_month")
+        if cur_draft_rm and cur_draft_rm not in mlist:
+            mlist = sorted(set(mlist) | {cur_draft_rm}, reverse=True)
 
         with su1:
             entity_options = all_entities() + ["+ Add new entity..."]
