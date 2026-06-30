@@ -1704,6 +1704,11 @@ def screen_admin():
         if not combos:
             st.info("No submissions found yet.")
         else:
+            st.caption(
+                "**Filing Month** = the month the report was submitted in (sets the Group # in the filename). "
+                "Each report also has a separate **Reporting Period** — the month the R&D activities took place "
+                "in — shown inside each report below."
+            )
             # ── Filters ──────────────────────────────────────────────────────
             fc1, fc2, fc3 = st.columns([1.2, 1.5, 1.5])
             entities_present = sorted({e for e, _ in combos})
@@ -1715,7 +1720,7 @@ def screen_admin():
                 )
             with fc2:
                 f_period = st.selectbox(
-                    "Period", ["All"] + [fmt_month(p) for p in periods_present], key="f_period"
+                    "Filing Month", ["All"] + [fmt_month(p) for p in periods_present], key="f_period"
                 )
             with fc3:
                 f_status = st.selectbox(
@@ -1755,7 +1760,13 @@ def screen_admin():
                 if not combo_rows:
                     continue
 
-                st.markdown(f"#### Entity {entity} — {fmt_month(rm)}")
+                # Show both Filing Month and the typical Reporting Period for this group
+                sample_am = next(
+                    (s.get("activities_month") for _, s in combo_rows if s.get("activities_month")),
+                    None,
+                )
+                am_suffix = f"  ·  Reporting Period: **{fmt_month(sample_am)}**" if sample_am else ""
+                st.markdown(f"#### Entity {entity} — Filing Month: **{fmt_month(rm)}**{am_suffix}")
 
                 for username, sub in combo_rows:
                     status = sub.get("status", "not-started")
@@ -1771,6 +1782,12 @@ def screen_admin():
                         # ── Report-level info + export ────────────────────────
                         h1, h2 = st.columns([4, 1])
                         with h1:
+                            rep_period = sub.get("activities_month", "")
+                            st.markdown(
+                                f"**Filing Month:** {fmt_month(rm)} &nbsp;|&nbsp; "
+                                f"**Reporting Period:** {fmt_month(rep_period) or '—'}",
+                                unsafe_allow_html=True,
+                            )
                             if sub.get("submitted_at"):
                                 ts = datetime.fromtimestamp(sub["submitted_at"]/1000).strftime("%b %d %H:%M")
                                 st.caption(f"Submitted: {ts}")
@@ -1945,166 +1962,112 @@ def screen_admin():
     # ═══════════════════════════════════════════════════════════════════════
     with tab_rollover:
         st.caption(
-            "Copy all active initiatives from one entity/period into a new period. "
-            "All initiatives are included regardless of end date. "
-            "Users who already have a real submission for the target period are skipped, never overwritten."
+            "Select one or more periods to roll forward — across any mix of entities. "
+            "A target **Filing Month** is suggested automatically (the month after the "
+            "latest period you select) but you can change it. All initiatives are carried "
+            "regardless of end date. Anyone who already has a real submission for the "
+            "target period is skipped, never overwritten."
         )
 
         if not combos:
             st.info("No submissions to roll over yet.")
         else:
-            mode = st.radio(
-                "Rollover mode",
-                ["⚡ Quick Roll Forward", "🎯 Custom Rollover"],
-                horizontal=True,
-                key="rollover_mode",
+            combo_labels_ro = {
+                f"Entity {e} — Filing: {fmt_month(rm)}": (e, rm) for e, rm in combos
+            }
+            # Pre-select each entity's most recent period by default — this gives the
+            # one-click "roll everything forward" experience while staying fully editable.
+            latest_per_entity = get_latest_period_per_entity(combos)
+            default_labels = [
+                f"Entity {e} — Filing: {fmt_month(rm)}" for e, rm in latest_per_entity.items()
+            ]
+
+            chosen_src_labels = st.multiselect(
+                "Roll FROM (one or more periods — any entity)",
+                list(combo_labels_ro.keys()),
+                default=[l for l in default_labels if l in combo_labels_ro],
+                key="ro_src_multi",
+            )
+            src_selection = [combo_labels_ro[l] for l in chosen_src_labels]
+
+            # Auto-suggested target = month after the latest selected source period.
+            # Keyed by the current selection so the dropdown re-renders fresh whenever
+            # the source selection changes, instead of keeping a stale cached value.
+            if src_selection:
+                suggested_target = next_month_of(max(rm for _, rm in src_selection))
+            else:
+                suggested_target = available_months()[0]
+
+            mlist_ro = available_months()
+            if suggested_target not in mlist_ro:
+                mlist_ro = sorted(set(mlist_ro) | {suggested_target}, reverse=True)
+            target_idx = mlist_ro.index(suggested_target)
+
+            selection_key = ",".join(sorted(chosen_src_labels))
+            chosen_target = st.selectbox(
+                "Roll TO (target Filing Month) — auto-suggested, editable",
+                mlist_ro,
+                index=target_idx,
+                format_func=fmt_month,
+                key=f"ro_target_{selection_key}",
             )
 
-            # ── QUICK MODE ──────────────────────────────────────────────────
-            if mode == "⚡ Quick Roll Forward":
-                st.caption(
-                    "One click per entity — automatically rolls each entity's most recent "
-                    "period forward to the next month."
-                )
-                latest = get_latest_period_per_entity(combos)
-
-                for entity, latest_period in sorted(latest.items()):
-                    suggested_target = (
-                        f"{int(latest_period[:4]) + (1 if latest_period[5:] == '12' else 0)}"
-                        f"-{str(int(latest_period[5:]) % 12 + 1).zfill(2)}"
-                    )
-                    qc1, qc2, qc3 = st.columns([2, 2, 1.4])
-                    with qc1:
-                        st.markdown(f"**Entity {entity}**")
-                        st.caption(f"Latest period: {fmt_month(latest_period)}")
-                    with qc2:
-                        st.markdown("→")
-                        st.caption(f"Will roll to: **{fmt_month(suggested_target)}**")
-                    with qc3:
-                        # Count who would actually be rolled
-                        n_eligible = 0
-                        for username, months in all_data.items():
-                            src = months.get(latest_period)
-                            if not src or src.get("entity") != entity or not src.get("initiatives"):
-                                continue
-                            existing = load_submission(username, suggested_target)
-                            if existing and existing.get("entity") == entity and existing.get("initiatives"):
-                                continue
-                            n_eligible += 1
-                        if n_eligible == 0:
-                            st.caption("Nothing to roll")
-                        else:
-                            if st.button(
-                                f"Roll {n_eligible} user{'s' if n_eligible!=1 else ''}",
-                                key=f"quick_roll_{entity}",
-                                type="primary",
-                            ):
-                                rolled = rollover_entity(all_data, entity, latest_period, suggested_target)
-                                if rolled:
-                                    st.success(f"✓ Rolled Entity {entity} → {fmt_month(suggested_target)} for: {', '.join(rolled)}")
-                                    st.rerun()
-                                else:
-                                    st.info("Nothing rolled — targets may already have submissions.")
-                    st.divider()
-
-            # ── CUSTOM MODE ─────────────────────────────────────────────────
-            else:
-                combo_labels_ro = {f"{e} — {fmt_month(rm)}": (e, rm) for e, rm in combos}
-
-                ro1, ro2 = st.columns(2)
-                with ro1:
-                    src_mode = st.radio(
-                        "Source",
-                        ["Single period", "All entities at once"],
-                        key="ro_src_mode",
-                        horizontal=True,
-                    )
-
-                if src_mode == "Single period":
-                    with ro1:
-                        src_label = st.selectbox(
-                            "Source (roll FROM)",
-                            list(combo_labels_ro.keys()),
-                            key="ro_src",
-                        )
-                    src_selection = [combo_labels_ro[src_label]]
-                else:
-                    # All entities — pick a single source PERIOD, roll every entity that has data there
-                    periods_only = sorted({rm for _, rm in combos}, reverse=True)
-                    with ro1:
-                        src_period_label = st.selectbox(
-                            "Source period (all entities)",
-                            [fmt_month(p) for p in periods_only],
-                            key="ro_src_period",
-                        )
-                    src_period = next(p for p in periods_only if fmt_month(p) == src_period_label)
-                    src_selection = [(e, rm) for e, rm in combos if rm == src_period]
-
-                with ro2:
-                    mlist_ro = available_months()
-                    chosen_target = st.selectbox(
-                        "Target (roll TO)",
-                        mlist_ro,
-                        index=0,
-                        format_func=fmt_month,
-                        key="ro_target",
-                    )
-
-                # Build preview across all selected sources
-                preview = []  # (entity, src_month, username, init_names)
-                for src_entity, src_month in src_selection:
-                    if src_month == chosen_target:
+            # Build preview across all selected sources
+            preview = []  # (entity, src_month, username, init_names)
+            for src_entity, src_month in src_selection:
+                if src_month == chosen_target:
+                    continue
+                for username, months in all_data.items():
+                    sub = months.get(src_month)
+                    if not sub or sub.get("entity") != src_entity:
                         continue
-                    for username, months in all_data.items():
-                        sub = months.get(src_month)
-                        if not sub or sub.get("entity") != src_entity:
+                    existing = load_submission(username, chosen_target)
+                    if existing and existing.get("entity") == src_entity and existing.get("initiatives"):
+                        continue
+                    inits = sub.get("initiatives") or []
+                    if inits:
+                        preview.append((src_entity, src_month, username,
+                                         [i.get("initiative_name", "Unnamed") for i in inits]))
+
+            if not src_selection:
+                st.info("Select at least one period above to roll forward.")
+            elif all(sm == chosen_target for _, sm in src_selection):
+                st.warning("Source and target are the same Filing Month — choose a different target.")
+            elif not preview:
+                st.info("No users have active initiatives to roll over into this target period.")
+            else:
+                st.markdown(f"**Preview — rolling into Filing: {fmt_month(chosen_target)}**")
+                by_entity: dict[str, list] = {}
+                for e, sm, u, names in preview:
+                    by_entity.setdefault(e, []).append((sm, u, names))
+
+                for e, rows in sorted(by_entity.items()):
+                    st.markdown(f"**Entity {e}**")
+                    for sm, u, names in rows:
+                        st.markdown(
+                            f"&nbsp;&nbsp;• **{u}** (from Filing: {fmt_month(sm)}) — "
+                            + ", ".join(f"*{n}*" for n in names),
+                            unsafe_allow_html=True,
+                        )
+
+                total_subs = len(preview)
+                if st.button(
+                    f"🔄 Roll Over {total_subs} submission{'s' if total_subs!=1 else ''} "
+                    f"→ Filing: {fmt_month(chosen_target)}",
+                    type="primary",
+                    key="do_rollover_unified",
+                ):
+                    all_rolled = []
+                    for src_entity, src_month in src_selection:
+                        if src_month == chosen_target:
                             continue
-                        existing = load_submission(username, chosen_target)
-                        if existing and existing.get("entity") == src_entity and existing.get("initiatives"):
-                            continue
-                        inits = sub.get("initiatives") or []
-                        if inits:
-                            preview.append((src_entity, src_month, username,
-                                             [i.get("initiative_name","Unnamed") for i in inits]))
-
-                if not src_selection:
-                    st.info("No source data available.")
-                elif all(sm == chosen_target for _, sm in src_selection):
-                    st.warning("Source and target are the same period — choose a different target month.")
-                elif not preview:
-                    st.info("No users have active initiatives to roll over into this target period.")
-                else:
-                    st.markdown(f"**Preview — rolling into {fmt_month(chosen_target)}:**")
-                    by_entity: dict[str, list] = {}
-                    for e, sm, u, names in preview:
-                        by_entity.setdefault(e, []).append((sm, u, names))
-
-                    for e, rows in sorted(by_entity.items()):
-                        st.markdown(f"**Entity {e}**")
-                        for sm, u, names in rows:
-                            st.markdown(
-                                f"&nbsp;&nbsp;• **{u}** ({fmt_month(sm)}) — "
-                                + ", ".join(f"*{n}*" for n in names),
-                                unsafe_allow_html=True,
-                            )
-
-                    total_users = len(preview)
-                    if st.button(
-                        f"🔄 Roll Over {total_users} submission{'s' if total_users!=1 else ''} → {fmt_month(chosen_target)}",
-                        type="primary",
-                        key="do_rollover_custom",
-                    ):
-                        all_rolled = []
-                        for src_entity, src_month in src_selection:
-                            if src_month == chosen_target:
-                                continue
-                            rolled = rollover_entity(all_data, src_entity, src_month, chosen_target)
-                            all_rolled.extend(rolled)
-                        if all_rolled:
-                            st.success(f"✓ Rolled over for: {', '.join(all_rolled)}.")
-                            st.rerun()
-                        else:
-                            st.info("Nothing to roll over.")
+                        rolled = rollover_entity(all_data, src_entity, src_month, chosen_target)
+                        all_rolled.extend(rolled)
+                    if all_rolled:
+                        st.success(f"✓ Rolled over for: {', '.join(all_rolled)}.")
+                        st.rerun()
+                    else:
+                        st.info("Nothing to roll over.")
 
     # ═══════════════════════════════════════════════════════════════════════
     # TAB: Export
@@ -2120,7 +2083,7 @@ def screen_admin():
 
             # ── 1. Periods / Entities ────────────────────────────────────────
             st.markdown("**1. Periods & Entities**")
-            combo_labels = {f"{e} — {fmt_month(rm)}": (e, rm) for e, rm in combos}
+            combo_labels = {f"Entity {e} — Filing: {fmt_month(rm)}": (e, rm) for e, rm in combos}
             all_labels   = list(combo_labels.keys())
 
             sel_all_periods = st.checkbox("Include all periods/entities", value=True, key="sel_all_periods")
