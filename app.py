@@ -1103,6 +1103,50 @@ def badge_html(status: str) -> str:
     label = STATUS_LABELS.get(status, status)
     return f'<span class="rd-badge {cls}">{label}</span>'
 
+def best_draft_for_user(username: str) -> dict:
+    """
+    Picks the most relevant draft to load on login:
+    1. The earliest in-progress period that has real initiatives
+       (likely a rollover waiting to be reviewed and submitted).
+    2. The current calendar month's filing if it exists.
+    3. A fresh empty draft for the current month.
+
+    This ensures the user lands on something actionable — e.g. if
+    they've already submitted June and July, and a rollover created
+    an August in-progress draft, they open directly on August.
+    """
+    months_index = load_user_months(username)
+
+    # Priority 1: any in-progress period with real initiatives
+    # (sort ascending so earliest un-submitted period wins)
+    in_progress = sorted([
+        m for m in months_index
+        if (sub := load_submission(username, m))
+        and sub.get("initiatives")
+        and sub.get("status") == "in-progress"
+    ])
+    if in_progress:
+        return load_submission(username, in_progress[0])
+
+    # Priority 2: current calendar month if it already has a submission
+    cur = cur_month()
+    cur_sub = load_submission(username, cur)
+    if cur_sub and cur_sub.get("initiatives"):
+        return cur_sub
+
+    # Priority 3: most recent period with any real content
+    for month in sorted(months_index, reverse=True):
+        sub = load_submission(username, month)
+        if sub and sub.get("initiatives"):
+            return sub
+
+    # Fallback: empty draft for current month
+    draft = empty_draft()
+    draft["reporting_month"]  = cur
+    draft["activities_month"] = prev_month_of(cur)
+    return draft
+
+
 def init_session():
     defaults = {
         "screen":      "login",
@@ -1142,7 +1186,13 @@ def screen_login():
                 is_admin = "Admin" in sel
                 st.session_state.user     = name
                 st.session_state.is_admin = is_admin
-                st.session_state.draft    = empty_draft()
+                # Auto-load the most actionable period (in-progress rollover first,
+                # then current month, then most recent) so the user lands on the
+                # right report without having to change Report Setup manually.
+                if "Admin" not in sel:
+                    st.session_state.draft = best_draft_for_user(name)
+                else:
+                    st.session_state.draft = empty_draft()
                 st.session_state.screen   = "admin" if is_admin else "dashboard"
                 st.rerun()
         st.markdown(
