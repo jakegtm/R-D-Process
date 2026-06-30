@@ -39,6 +39,7 @@ STATUS_LABELS = {
     "submitted":   "🔵 Ready for Review",
     "approved":    "🟢 Approved",
     "rejected":    "🔴 Rejected",
+    "archived":    "📦 Archived",
     "not-started": "⚪ Not Started",
 }
 
@@ -735,7 +736,7 @@ def build_excel_consolidated(
                 sub = all_data[username].get(rm)
                 if not sub or sub.get("entity") != entity:
                     continue
-                if submitted_only and sub.get("status") not in ("submitted", "approved"):
+                if submitted_only and sub.get("status") not in ("submitted", "approved", "archived"):
                     continue
                 rows.extend(_sub_to_rows(username, sub, include_user=True))
 
@@ -836,13 +837,50 @@ def screen_login():
 
 # ── Dashboard ─────────────────────────────────────────────────────────────────
 
+# ── Reminder banners ──────────────────────────────────────────────────────────
+# Streamlit has no background scheduler — these checks run only when someone
+# opens the app, and simply surface a visible nudge based on today's date.
+
+def render_user_reminder(user: str):
+    """
+    If it's the 5th or later and the user hasn't started this month's
+    filing cycle yet, show a reminder banner on login.
+    """
+    today = date.today()
+    if today.day < 5:
+        return
+    cur = cur_month()
+    existing = load_submission(user, cur)
+    if existing and existing.get("initiatives"):
+        return  # already has a real submission for this period
+    st.warning(
+        f"📅 It's past the 5th and you haven't started your **{fmt_month(cur)}** filing yet. "
+        "Set up your report below to get started."
+    )
+
+
+def render_admin_reminder(all_data: dict):
+    """
+    Surfaces a count of reports still pending review when the admin logs in.
+    """
+    pending = []
+    for username, months in all_data.items():
+        for month, sub in months.items():
+            if sub.get("status") == "submitted" and sub.get("initiatives"):
+                pending.append((username, month))
+    if pending:
+        names = ", ".join(f"{u} ({fmt_month(m)})" for u, m in pending[:5])
+        extra = f" +{len(pending)-5} more" if len(pending) > 5 else ""
+        st.warning(f"🔔 {len(pending)} report(s) pending your review: {names}{extra}")
+
+
 def screen_dashboard():
     user      = st.session_state.user
     draft     = st.session_state.draft
     # "rejected" is treated the same as "in-progress" for editing/submitting
     # — user needs to be able to fix and resubmit after a rejection.
-    # Only truly locked states are "submitted" and "approved".
-    submitted = draft["status"] in ("submitted", "approved")
+    # Locked states: submitted, approved, archived.
+    submitted = draft["status"] in ("submitted", "approved", "archived")
 
     # Header
     c1, c2 = st.columns([5, 1])
@@ -872,6 +910,7 @@ def screen_dashboard():
             st.rerun()
 
     st.divider()
+    render_user_reminder(user)
 
     # ── Report Setup ─────────────────────────────────────────────────────────
     setup_complete = bool(draft.get("entity") and draft.get("reporting_month"))
@@ -1001,6 +1040,10 @@ def screen_dashboard():
                 msg += f' Comment: \"{rc}\".'
             msg += " Please update and resubmit."
             st.error(msg)
+        elif draft["status"] == "archived":
+            arc_ts = draft.get("archived_at")
+            arc_str = f" on {datetime.fromtimestamp(arc_ts/1000).strftime('%b %d, %Y')}" if arc_ts else ""
+            st.info(f"📦 This period was archived{arc_str} and is now locked. Contact the Oversight Lead to reopen it.")
     with c2:
         st.metric("Initiatives", len(draft["initiatives"]))
     with c3:
@@ -1066,10 +1109,12 @@ def screen_dashboard():
                     appr_str = f" on {datetime.fromtimestamp(appr_ts/1000).strftime('%b %d %H:%M')}" if appr_ts else ""
                     st.success(f"✓ Approved by admin{appr_str}.")
 
+                is_archived = draft["status"] == "archived"
                 st.write("")
                 c1, c2, c3, c4 = st.columns([2.5, 0.8, 0.8, 0.8])
                 with c2:
-                    if st.button("✏ Edit", key=f"edit_{iid}"):
+                    if st.button("✏ Edit", key=f"edit_{iid}", disabled=is_archived,
+                                 help="This period is archived and locked." if is_archived else None):
                         st.session_state.wiz_init = dict(init)
                         st.session_state.wiz_step = 0
                         st.session_state.wiz_mode = "edit"
@@ -1085,7 +1130,8 @@ def screen_dashboard():
                         st.success("Report submitted!")
                         st.rerun()
                 with c4:
-                    if st.button("🗑 Delete", key=f"del_{iid}"):
+                    if st.button("🗑 Delete", key=f"del_{iid}", disabled=is_archived,
+                                 help="This period is archived and locked." if is_archived else None):
                         st.session_state.confirm_del = iid
                         st.rerun()
 
@@ -1328,6 +1374,8 @@ def screen_admin():
     all_data = load_all_submissions()
     combos   = get_combos(all_data)   # [(entity, rm), ...]
 
+    render_admin_reminder(all_data)
+
     # ── Summary stats ────────────────────────────────────────────────────────
     # Only count submissions that have actual initiatives (ignore empty setup drafts)
     all_subs  = [
@@ -1337,14 +1385,16 @@ def screen_admin():
     n_users   = sum(1 for ud in all_data.values() if any(s.get("initiatives") for s in ud.values()))
     n_sub     = sum(1 for s in all_subs if s.get("status") in ("submitted","approved"))
     n_appr    = sum(1 for s in all_subs if s.get("status") == "approved")
+    n_arch    = sum(1 for s in all_subs if s.get("status") == "archived")
     n_inits   = sum(len(s.get("initiatives") or []) for s in all_subs)
 
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Team Members",     n_users)
     c2.metric("Periods/Entities", len(combos))
     c3.metric("Submitted",        n_sub)
     c4.metric("Approved",         n_appr)
-    c5.metric("Total Initiatives",n_inits)
+    c5.metric("Archived",         n_arch)
+    c6.metric("Total Initiatives",n_inits)
 
     # ── Data Backup & Management ─────────────────────────────────────────────
     with st.expander("🗄 Data Backup & Management", expanded=False):
@@ -1428,7 +1478,7 @@ def screen_admin():
 
         chosen_combos = [combo_labels[l] for l in chosen_labels]
 
-        submitted_only = st.checkbox("Ready for Review & Approved only (exclude In Progress / Rejected)", value=True)
+        submitted_only = st.checkbox("Ready for Review, Approved & Archived only (exclude In Progress / Rejected)", value=True)
 
         if chosen_combos:
             unique_entities = sorted({e for e,_ in chosen_combos})
@@ -1571,7 +1621,7 @@ def screen_admin():
             if not inits and status == "in-progress":
                 continue
             icon   = {"approved":"✅","submitted":"🔵","in-progress":"🟡",
-                      "rejected":"🔴","not-started":"⚪"}.get(status,"⚪")
+                      "rejected":"🔴","archived":"📦","not-started":"⚪"}.get(status,"⚪")
 
             with st.expander(
                 f"{icon}  {username}   —  {STATUS_LABELS.get(status,'—')}  "
@@ -1617,6 +1667,24 @@ def screen_admin():
                         if st.button("✕ Reject All", key=f"rej_rpt_{entity}_{rm}_{username}"):
                             st.session_state[f"reject_report_{entity}_{rm}_{username}"] = True
                             st.rerun()
+
+                # ── Archive (only available once approved) ─────────────────
+                if status == "approved":
+                    arc1, arc2 = st.columns([4, 1])
+                    with arc1:
+                        st.caption("This report is approved and ready to be closed out for the period.")
+                    with arc2:
+                        if st.button("📦 Archive", key=f"archive_{entity}_{rm}_{username}"):
+                            now = int(datetime.now().timestamp()*1000)
+                            sub["status"]      = "archived"
+                            sub["archived_at"] = now
+                            save_draft(username, sub)
+                            st.success("Report archived.")
+                            st.rerun()
+                elif status == "archived":
+                    arc_ts = sub.get("archived_at")
+                    arc_str = datetime.fromtimestamp(arc_ts/1000).strftime("%b %d, %Y %H:%M") if arc_ts else ""
+                    st.info(f"📦 This report was archived{f' on {arc_str}' if arc_str else ''}. It remains in all exports and the consolidated report.")
                 # Rejection comment input for report-level reject
                 if st.session_state.get(f"reject_report_{entity}_{rm}_{username}"):
                     reject_comment = st.text_area(
