@@ -1197,7 +1197,12 @@ def screen_dashboard():
     # "rejected" is treated the same as "in-progress" for editing/submitting
     # — user needs to be able to fix and resubmit after a rejection.
     # Locked states: submitted, approved, archived.
-    submitted = draft["status"] in ("submitted", "approved", "archived")
+    # Rejected reports are also locked UNTIL the user acknowledges the rejection
+    # (matching PA Flow 3 — user must explicitly confirm they've seen the feedback
+    # before the edit/resubmit cycle opens up).
+    ack_key  = f"ack_rejection_{draft.get('reporting_month')}"
+    rejected_unacked = draft["status"] == "rejected" and not st.session_state.get(ack_key)
+    submitted = draft["status"] in ("submitted", "approved", "archived") or rejected_unacked
 
     # Header
     c1, c2 = st.columns([5, 1])
@@ -1375,9 +1380,21 @@ def screen_dashboard():
             rc = draft.get("rejection_comment", "")
             msg = "Your report was Rejected by the Oversight Lead."
             if rc:
-                msg += f' Comment: \"{rc}\".'
-            msg += " Please update and resubmit."
+                msg += f' Comment: "{rc}".'
             st.error(msg)
+            # Show acknowledgement button matching PA Flow 3 — user must confirm
+            # they've seen the rejection before the resubmit cycle can restart.
+            if not st.session_state.get(f"ack_rejection_{draft.get('reporting_month')}"):
+                st.warning(
+                    "Please review the feedback above, update your initiatives if needed, "
+                    "then click **Acknowledge & Prepare Resubmission** to confirm you've seen "
+                    "the rejection and are ready to update."
+                )
+                if st.button("✓ Acknowledge & Prepare Resubmission", key="ack_rejection_btn"):
+                    st.session_state[f"ack_rejection_{draft.get('reporting_month')}"] = True
+                    st.rerun()
+            else:
+                st.info("✓ Rejection acknowledged. Update your initiatives below, then resubmit.")
         elif draft["status"] == "archived":
             arc_ts = draft.get("archived_at")
             arc_str = f" on {datetime.fromtimestamp(arc_ts/1000).strftime('%b %d, %Y')}" if arc_ts else ""
@@ -1542,6 +1559,8 @@ def screen_dashboard():
                 draft["status"]       = "submitted"
                 draft["submitted_at"] = int(datetime.now().timestamp()*1000)
                 draft.pop("rejection_comment", None)   # clear old rejection comment
+                # Clear the acknowledgement flag since the cycle is now restarted
+                st.session_state.pop(f"ack_rejection_{draft.get('reporting_month')}", None)
                 save_draft(user, draft)
                 st.session_state.draft = draft
                 st.success("Report resubmitted!" if was_rejected else "Report submitted!")
@@ -1949,6 +1968,39 @@ def screen_admin():
 
                         if not inits:
                             st.caption("No initiatives.")
+                        elif status == "in-progress":
+                            # Don't allow accepting/rejecting until the user has
+                            # reviewed the rollover and submitted for review themselves.
+                            st.info(
+                                "🟡 This report is **In Progress** — the user hasn't submitted it yet. "
+                                "They need to log in, review their initiatives, and click "
+                                "**Submit for Review** before you can approve or reject."
+                            )
+                            for init in inits:
+                                iid     = init["id"]
+                                istatus = init.get("initiative_status","active")
+                                iname   = init.get("initiative_name","Unnamed")
+                                ico     = {"approved":"✅","returned":"🔴","active":"🔵"}.get(istatus,"🔵")
+                                ic1, ic4 = st.columns([5, 0.8])
+                                with ic1:
+                                    co   = "↩ " if init.get("carry_over") else ""
+                                    bc   = init.get("business_component","")
+                                    team = ", ".join(init.get("team_members") or ["—"])
+                                    sd   = init.get("start_date","—")
+                                    ed   = init.get("expected_end_date","—")
+                                    st.markdown(
+                                        f"{ico} **{co}{iname}** — {bc}  \n"
+                                        f"<small>👥 {team} &nbsp;|&nbsp; 📅 {sd} → {ed}</small>",
+                                        unsafe_allow_html=True,
+                                    )
+                                with ic4:
+                                    if st.button("🗑 Delete", key=f"del_i_{entity}_{rm}_{username}_{iid}"):
+                                        sub["initiatives"] = [i for i in sub["initiatives"] if i["id"] != iid]
+                                        if not sub["initiatives"]:
+                                            sub["status"] = "in-progress"
+                                        save_draft(username, sub)
+                                        st.success(f"Deleted: {iname}")
+                                        st.rerun()
                         else:
                             for init in inits:
                                 iid     = init["id"]
@@ -2119,7 +2171,12 @@ def screen_admin():
                 ):
                     rolled = rollover_entity(all_data, src_entity, src_month, chosen_target)
                     if rolled:
-                        st.success(f"✓ Rolled over for: {', '.join(rolled)}.")
+                        st.success(
+                            f"✓ Rolled over for: {', '.join(rolled)}. "
+                            f"They'll find a pre-filled draft under Filing Month {fmt_month(chosen_target)} "
+                            f"when they log in. They need to review their initiatives and click "
+                            f"**Submit for Review** before you can approve."
+                        )
                         st.rerun()
                     else:
                         st.info("Nothing to roll over.")
