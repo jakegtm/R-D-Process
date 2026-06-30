@@ -137,6 +137,13 @@ CARRYOVER_FIELDS = {
 def cur_month() -> str:
     return datetime.now().strftime("%Y-%m")
 
+def ts_to_est(ms: int, fmt: str = "%b %d, %Y %I:%M %p") -> str:
+    """Convert a millisecond UTC timestamp to a formatted EST string."""
+    from datetime import timezone, timedelta
+    est = timezone(timedelta(hours=-5))   # EST = UTC-5 (covers ET year-round simply)
+    dt  = datetime.fromtimestamp(ms / 1000, tz=timezone.utc).astimezone(est)
+    return dt.strftime(fmt) + " EST"
+
 def prev_month_of(m: str) -> str:
     y, mo = map(int, m.split("-"))
     if mo == 1:
@@ -971,7 +978,7 @@ def _sub_to_rows(username: str, sub: dict, include_user: bool) -> list[dict]:
             "_filing": fmt_month(rm),
             "_status": status,
             "_completion": (
-                datetime.fromtimestamp(init["approved_at"] / 1000).strftime("%Y-%m-%d %H:%M")
+                ts_to_est(init["approved_at"], "%Y-%m-%d %H:%M")
                 if init.get("approved_at") else
                 datetime.fromtimestamp(sub["approved_at"] / 1000).strftime("%Y-%m-%d")
                 if sub.get("approved_at") else ""
@@ -1221,20 +1228,62 @@ def screen_login():
 # Streamlit has no background scheduler — these checks run only when someone
 # opens the app, and simply surface a visible nudge based on today's date.
 
+def _all_rejection_comments(sub: dict) -> list[str]:
+    """Collect every rejection comment on a submission — report-level and per-initiative."""
+    comments = []
+    rc = sub.get("rejection_comment", "")
+    if rc:
+        comments.append(rc)
+    for init in sub.get("initiatives") or []:
+        irc = init.get("rejection_comment", "")
+        if irc and init.get("initiative_status") == "returned":
+            comments.append(f"{init.get('initiative_name','Initiative')}: {irc}")
+    return comments
+
+
 def render_user_reminder(user: str, current_filing_month: str = ""):
     """
-    Two types of reminders:
-    1. If it's the 5th or later and the user has no submission for this month's filing cycle.
-    2. If the user has in-progress periods (e.g. from a rollover) that they haven't
-       submitted yet — even if they're currently viewing a different period.
+    Three types of alerts, in priority order:
+    1. Rejected periods — shown prominently regardless of what period is currently viewed.
+    2. Unsubmitted in-progress periods from other filing months.
+    3. Monthly filing reminder (past the 5th).
     """
     months_index = load_user_months(user)
 
-    # ── Check all periods for unsubmitted in-progress drafts ────────────────
+    # ── Priority 1: Rejected periods — always show, takes precedence ─────────
+    for month in sorted(months_index, reverse=True):
+        sub = load_submission(user, month)
+        if not sub or not sub.get("initiatives"):
+            continue
+        if sub.get("status") != "rejected":
+            continue
+        ack_key = f"ack_rejection_{month}"
+        already_acked = st.session_state.get(ack_key, False)
+        comments = _all_rejection_comments(sub)
+        comment_str = ""
+        if comments:
+            comment_str = "  " + "  |  ".join(f'"{c}"' for c in comments)
+
+        if month == current_filing_month:
+            # Current period rejection is shown inline in the status strip — skip here
+            continue
+
+        # Show rejection banner for OTHER periods regardless of what's currently loaded
+        st.error(
+            f"🔴 Your **{fmt_month(month)}** report was Rejected by the Oversight Lead."
+            + (f"  Comment: {comment_str}" if comment_str else "")
+        )
+        if not already_acked:
+            st.warning(
+                f"Switch to **Filing: {fmt_month(month)}** in Report Setup above, "
+                "then click **Acknowledge & Prepare Resubmission** to begin updating."
+            )
+
+    # ── Priority 2: Unsubmitted in-progress drafts from other periods ────────
     pending_periods = []
     for month in months_index:
         if month == current_filing_month:
-            continue   # don't double-warn about what they're looking at right now
+            continue
         sub = load_submission(user, month)
         if sub and sub.get("initiatives") and sub.get("status") == "in-progress":
             pending_periods.append(month)
@@ -1247,7 +1296,7 @@ def render_user_reminder(user: str, current_filing_month: str = ""):
             "review your initiatives, and click **Submit for Review**."
         )
 
-    # ── Monthly filing reminder (past the 5th) ───────────────────────────────
+    # ── Priority 3: Monthly filing reminder (past the 5th) ───────────────────
     today = date.today()
     if today.day >= 5:
         cur = cur_month()
@@ -1464,13 +1513,13 @@ def screen_dashboard():
     with c1:
         st.markdown(f"**Report Status:** {badge_html(draft['status'])}", unsafe_allow_html=True)
         if draft.get("submitted_at"):
-            ts = datetime.fromtimestamp(draft["submitted_at"]/1000).strftime("%b %d, %Y %H:%M")
+            ts = ts_to_est(draft["submitted_at"], "%b %d, %Y %I:%M %p")
             st.caption(f"Submitted {ts}")
         if draft["status"] == "rejected":
-            rc = draft.get("rejection_comment", "")
+            comments = _all_rejection_comments(draft)
             msg = "Your report was Rejected by the Oversight Lead."
-            if rc:
-                msg += f' Comment: "{rc}".'
+            if comments:
+                msg += " " + "  |  ".join(f'"{c}"' for c in comments)
             st.error(msg)
             # Show acknowledgement button matching PA Flow 3 — user must confirm
             # they've seen the rejection before the resubmit cycle can restart.
@@ -1487,7 +1536,7 @@ def screen_dashboard():
                 st.info("✓ Rejection acknowledged. Update your initiatives below, then resubmit.")
         elif draft["status"] == "archived":
             arc_ts = draft.get("archived_at")
-            arc_str = f" on {datetime.fromtimestamp(arc_ts/1000).strftime('%b %d, %Y')}" if arc_ts else ""
+            arc_str = f" on {ts_to_est(arc_ts, '%b %d, %Y')}" if arc_ts else ""
             st.info(f"📦 This period was archived{arc_str} and is now locked. Contact the Oversight Lead to reopen it.")
     with c2:
         st.metric("Initiatives", len(draft["initiatives"]))
@@ -1571,13 +1620,13 @@ def screen_dashboard():
                 # Per-initiative status banner (set by admin)
                 if istatus == "returned":
                     ret_ts = init.get("returned_at")
-                    ret_str = f" on {datetime.fromtimestamp(ret_ts/1000).strftime('%b %d %H:%M')}" if ret_ts else ""
+                    ret_str = f" on {ts_to_est(ret_ts, '%b %d %I:%M %p')}" if ret_ts else ""
                     rc = init.get("rejection_comment", "")
                     rc_str = f' Comment: "{rc}".' if rc else ""
                     st.warning(f"⚠ This initiative was Rejected{ret_str}.{rc_str} Edit and resubmit.")
                 elif istatus == "approved":
                     appr_ts = init.get("approved_at")
-                    appr_str = f" on {datetime.fromtimestamp(appr_ts/1000).strftime('%b %d %H:%M')}" if appr_ts else ""
+                    appr_str = f" on {ts_to_est(appr_ts, '%b %d %I:%M %p')}" if appr_ts else ""
                     st.success(f"✓ Approved by admin{appr_str}.")
 
                 is_archived = draft["status"] == "archived"
@@ -1966,10 +2015,10 @@ def screen_admin():
                                 unsafe_allow_html=True,
                             )
                             if sub.get("submitted_at"):
-                                ts = datetime.fromtimestamp(sub["submitted_at"]/1000).strftime("%b %d %H:%M")
+                                ts = ts_to_est(sub["submitted_at"], "%b %d %I:%M %p")
                                 st.caption(f"Submitted: {ts}")
                             if sub.get("approved_at"):
-                                ts = datetime.fromtimestamp(sub["approved_at"]/1000).strftime("%b %d %H:%M")
+                                ts = ts_to_est(sub["approved_at"], "%b %d %I:%M %p")
                                 st.caption(f"Report approved: {ts}")
                         with h2:
                             u_xlsx  = build_excel_individual(username, sub)
@@ -2017,7 +2066,7 @@ def screen_admin():
                                     st.rerun()
                         elif status == "archived":
                             arc_ts = sub.get("archived_at")
-                            arc_str = datetime.fromtimestamp(arc_ts/1000).strftime("%b %d, %Y %H:%M") if arc_ts else ""
+                            arc_str = ts_to_est(arc_ts, "%b %d, %Y %I:%M %p") if arc_ts else ""
                             st.info(f"📦 Archived{f' on {arc_str}' if arc_str else ''}. Remains in all exports.")
 
                         if st.session_state.get(f"reject_report_{entity}_{rm}_{username}"):
@@ -2099,10 +2148,10 @@ def screen_admin():
                                         unsafe_allow_html=True,
                                     )
                                     if init.get("approved_at"):
-                                        ts = datetime.fromtimestamp(init["approved_at"]/1000).strftime("%b %d %H:%M")
+                                        ts = ts_to_est(init["approved_at"], "%b %d %I:%M %p")
                                         st.caption(f"   Approved {ts}")
                                     if init.get("returned_at"):
-                                        ts = datetime.fromtimestamp(init["returned_at"]/1000).strftime("%b %d %H:%M")
+                                        ts = ts_to_est(init["returned_at"], "%b %d %I:%M %p")
                                         rc = init.get("rejection_comment","")
                                         rc_str = f' — "{rc}"' if rc else ""
                                         st.caption(f"   Rejected {ts}{rc_str}")
@@ -2277,33 +2326,45 @@ def screen_admin():
                         f"**Preview — Entity {src_entity}: Filing {fmt_month(src_month)} "
                         f"→ Filing {fmt_month(chosen_target)}**"
                     )
-                    for u, names in preview:
-                        st.markdown(
-                            f"&nbsp;&nbsp;• **{u}** — " + ", ".join(f"*{n}*" for n in names),
-                            unsafe_allow_html=True,
-                        )
                     st.caption(
                         f"After rollover: {fmt_month(src_month)} will be automatically **Archived**. "
                         f"Users will find a pre-filled draft under {fmt_month(chosen_target)}."
                     )
+                    st.write("")
 
-                    total_subs = len(preview)
-                    if st.button(
-                        f"🔄 Roll Over {total_subs} submission{'s' if total_subs!=1 else ''} "
-                        f"→ Filing: {fmt_month(chosen_target)}",
-                        type="primary",
-                        key="do_rollover_single",
-                    ):
-                        rolled = rollover_entity(all_data, src_entity, src_month, chosen_target)
-                        if rolled:
-                            st.success(
-                                f"✓ Rolled over for: {', '.join(rolled)}. "
-                                f"{fmt_month(src_month)} has been archived. "
-                                f"Users will see their {fmt_month(chosen_target)} draft on next login."
+                    # Per-user rows with individual roll buttons
+                    # plus a "Roll All" button at the bottom for convenience
+                    for u, names in preview:
+                        pu1, pu2 = st.columns([5, 1.2])
+                        with pu1:
+                            st.markdown(
+                                f"&nbsp;&nbsp;• **{u}** — " + ", ".join(f"*{n}*" for n in names),
+                                unsafe_allow_html=True,
                             )
-                            st.rerun()
-                        else:
-                            st.info("Nothing to roll over.")
+                        with pu2:
+                            if st.button("Roll →", key=f"roll_user_{src_month}_{chosen_target}_{u}"):
+                                rolled = rollover_entity(
+                                    {u: all_data[u]}, src_entity, src_month, chosen_target
+                                )
+                                if rolled:
+                                    st.success(f"✓ Rolled over for {u}.")
+                                    st.rerun()
+
+                    st.write("")
+                    total_subs = len(preview)
+                    if total_subs > 1:
+                        if st.button(
+                            f"🔄 Roll Over All {total_subs} → Filing: {fmt_month(chosen_target)}",
+                            type="primary",
+                            key="do_rollover_all",
+                        ):
+                            rolled = rollover_entity(all_data, src_entity, src_month, chosen_target)
+                            if rolled:
+                                st.success(
+                                    f"✓ Rolled over for: {', '.join(rolled)}. "
+                                    f"{fmt_month(src_month)} has been archived."
+                                )
+                                st.rerun()
 
     # ═══════════════════════════════════════════════════════════════════════
     # TAB: Export
