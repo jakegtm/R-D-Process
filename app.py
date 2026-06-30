@@ -32,7 +32,7 @@ EMPLOYEES = [
     "Jonathan", "Steven", "Michael", "Joe", "Nicole Browne",
 ]
 
-ENTITIES = ["107", "108", "109", "110"]
+ENTITIES = ["107", "108", "109", "110"]   # base/default entities — custom ones persist separately
 
 STATUS_LABELS = {
     "in-progress": "🟡 In Progress",
@@ -228,6 +228,39 @@ def load_registry() -> list:
 
 def save_registry(users: list):
     registry_path().write_text(json.dumps(users, indent=2))
+
+
+def custom_entities_path() -> Path:
+    return DATA_DIR / "custom_entities.json"
+
+def load_custom_entities() -> list[str]:
+    p = custom_entities_path()
+    return json.loads(p.read_text()) if p.exists() else []
+
+def save_custom_entities(entities: list[str]):
+    custom_entities_path().write_text(json.dumps(entities, indent=2))
+
+def all_entities() -> list[str]:
+    """Base entities (107-110) + any custom ones added by users, in order added."""
+    custom = load_custom_entities()
+    return ENTITIES + [e for e in custom if e not in ENTITIES]
+
+def add_custom_entity(new_entity: str) -> bool:
+    """
+    Adds a new entity so it persists in the dropdown going forward.
+    Returns True if it was newly added, False if it already existed.
+    """
+    new_entity = str(new_entity).strip()
+    if not new_entity:
+        return False
+    existing = all_entities()
+    if new_entity in existing:
+        return False
+    custom = load_custom_entities()
+    custom.append(new_entity)
+    save_custom_entities(custom)
+    return True
+
 
 def months_index_path(username: str) -> Path:
     return DATA_DIR / f"{_safe_name(username)}_months.json"
@@ -1215,8 +1248,29 @@ def screen_dashboard():
         mlist = available_months()
 
         with su1:
-            eidx          = ENTITIES.index(draft["entity"]) if draft.get("entity") in ENTITIES else 0
-            chosen_entity = st.selectbox("Entity", ENTITIES, index=eidx, key="su_entity")
+            entity_options = all_entities() + ["+ Add new entity..."]
+            eidx = entity_options.index(draft["entity"]) if draft.get("entity") in entity_options else 0
+            entity_pick = st.selectbox("Entity", entity_options, index=eidx, key="su_entity")
+
+            if entity_pick == "+ Add new entity...":
+                new_e_col1, new_e_col2 = st.columns([3, 1])
+                with new_e_col1:
+                    new_entity_input = st.text_input(
+                        "New entity number", key="su_new_entity",
+                        placeholder="e.g. 111", label_visibility="collapsed",
+                    )
+                with new_e_col2:
+                    if st.button("Add", key="su_add_entity"):
+                        if new_entity_input.strip():
+                            added = add_custom_entity(new_entity_input.strip())
+                            st.session_state.su_entity = new_entity_input.strip()
+                            if added:
+                                st.success(f"Entity {new_entity_input.strip()} added — it will stay in the dropdown.")
+                            st.rerun()
+                # Keep previous entity selected until a new one is actually added
+                chosen_entity = draft.get("entity") or (all_entities()[0] if all_entities() else "")
+            else:
+                chosen_entity = entity_pick
 
         with su2:
             # Filing Month — defaults to CURRENT month (you are filing now)
@@ -2100,7 +2154,7 @@ def screen_admin():
 
             st.write("")
 
-            # ── 2. Status filter (multi-select, fully flexible) ──────────────
+            # ── 2. Status filter (checkbox dropdown) ──────────────────────────
             st.markdown("**2. Status**")
             status_options = ["In Progress", "Ready for Review", "Approved", "Archived", "Rejected"]
             status_key_map = {
@@ -2111,37 +2165,64 @@ def screen_admin():
                 "Rejected":        "rejected",
             }
 
-            # Quick preset buttons
-            pc1, pc2, pc3, pc4 = st.columns(4)
             if "export_status_sel" not in st.session_state:
                 st.session_state.export_status_sel = ["Ready for Review", "Approved", "Archived"]
+
+            def _apply_status_preset(selected: list[str]):
+                # Update the underlying selection AND clear each checkbox widget's
+                # cached state — otherwise Streamlit keeps showing the checkbox's
+                # old value instead of picking up the new preset (same fix used
+                # elsewhere for selectbox widgets that don't refresh on their own).
+                st.session_state.export_status_sel = selected
+                for opt in status_options:
+                    st.session_state.pop(f"status_chk_{opt}", None)
+                st.rerun()
+
+            # Quick preset buttons
+            pc1, pc2, pc3, pc4 = st.columns(4)
             with pc1:
                 if st.button("All statuses", key="preset_all"):
-                    st.session_state.export_status_sel = status_options.copy()
-                    st.rerun()
+                    _apply_status_preset(status_options.copy())
             with pc2:
                 if st.button("Closed out only", key="preset_closed",
                              help="Approved + Archived"):
-                    st.session_state.export_status_sel = ["Approved", "Archived"]
-                    st.rerun()
+                    _apply_status_preset(["Approved", "Archived"])
             with pc3:
                 if st.button("Needs action", key="preset_action",
                              help="In Progress + Rejected"):
-                    st.session_state.export_status_sel = ["In Progress", "Rejected"]
-                    st.rerun()
+                    _apply_status_preset(["In Progress", "Rejected"])
             with pc4:
                 if st.button("Reviewed only", key="preset_reviewed",
                              help="Ready for Review + Approved + Archived"):
-                    st.session_state.export_status_sel = ["Ready for Review", "Approved", "Archived"]
-                    st.rerun()
+                    _apply_status_preset(["Ready for Review", "Approved", "Archived"])
 
-            chosen_statuses_display = st.multiselect(
-                "Include these statuses:",
-                status_options,
-                default=st.session_state.export_status_sel,
-                key="export_status_multiselect",
+            # Checkbox dropdown — single clean button that opens a checklist panel,
+            # instead of a multiselect whose pills can wrap and overflow.
+            n_sel = len(st.session_state.export_status_sel)
+            n_tot = len(status_options)
+            button_label = (
+                f"☑ {n_sel} of {n_tot} statuses selected ▾"
+                if 0 < n_sel < n_tot else
+                f"☑ All statuses selected ▾" if n_sel == n_tot else
+                "☐ No statuses selected ▾"
             )
-            st.session_state.export_status_sel = chosen_statuses_display
+            with st.popover(button_label, use_container_width=True):
+                for opt in status_options:
+                    checked = st.checkbox(
+                        opt,
+                        value=opt in st.session_state.export_status_sel,
+                        key=f"status_chk_{opt}",
+                    )
+                    if checked and opt not in st.session_state.export_status_sel:
+                        st.session_state.export_status_sel.append(opt)
+                        st.rerun()
+                    elif not checked and opt in st.session_state.export_status_sel:
+                        st.session_state.export_status_sel.remove(opt)
+                        st.rerun()
+
+            chosen_statuses_display = st.session_state.export_status_sel
+            if chosen_statuses_display:
+                st.caption("Selected: " + ", ".join(chosen_statuses_display))
             chosen_status_keys = [status_key_map[s] for s in chosen_statuses_display]
 
             st.write("")
