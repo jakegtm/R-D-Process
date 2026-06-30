@@ -1190,7 +1190,16 @@ def screen_login():
                 # then current month, then most recent) so the user lands on the
                 # right report without having to change Report Setup manually.
                 if "Admin" not in sel:
-                    st.session_state.draft = best_draft_for_user(name)
+                    best = best_draft_for_user(name)
+                    st.session_state.draft = best
+                    # Clear Report Setup widget keys so Streamlit renders
+                    # the selectboxes from the new draft's values rather
+                    # than whatever was cached from a prior session/period.
+                    for k in ["su_entity", "su_filing"]:
+                        st.session_state.pop(k, None)
+                    # Clear the dynamic Reporting Period key too
+                    rm = best.get("reporting_month", "")
+                    st.session_state.pop(f"su_act_{rm}", None)
                 else:
                     st.session_state.draft = empty_draft()
                 st.session_state.screen   = "admin" if is_admin else "dashboard"
@@ -1808,18 +1817,6 @@ def screen_wizard():
 
 
 # ── Admin ─────────────────────────────────────────────────────────────────────
-
-def get_latest_period_per_entity(combos: list[tuple[str, str]]) -> dict:
-    """
-    Given all (entity, period) combos, returns the most recent period
-    for each entity — used to suggest a one-click 'roll forward' target.
-    """
-    latest: dict[str, str] = {}
-    for entity, rm in combos:
-        if entity not in latest or rm > latest[entity]:
-            latest[entity] = rm
-    return latest
-
 
 def screen_admin():
     st.markdown("## ⚙ Admin Dashboard")
