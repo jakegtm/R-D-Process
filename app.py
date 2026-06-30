@@ -7,7 +7,7 @@ import streamlit as st
 import json
 from datetime import datetime, date
 from pathlib import Path
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 import io
@@ -142,6 +142,25 @@ def prev_month_of(m: str) -> str:
     if mo == 1:
         return f"{y-1}-12"
     return f"{y}-{str(mo-1).zfill(2)}"
+
+def next_month_of(m: str) -> str:
+    y, mo = map(int, m.split("-"))
+    if mo == 12:
+        return f"{y+1}-01"
+    return f"{y}-{str(mo+1).zfill(2)}"
+
+def parse_month_label(s: str) -> str:
+    """Parses a display label like 'May 2026' back into '2026-05'. Returns '' if unparseable."""
+    if not s:
+        return ""
+    s = str(s).strip()
+    for fmt in ("%B %Y", "%b %Y"):
+        try:
+            dt = datetime.strptime(s, fmt)
+            return f"{dt.year}-{str(dt.month).zfill(2)}"
+        except Exception:
+            continue
+    return ""
 
 def fmt_month(m: str) -> str:
     if not m:
@@ -354,6 +373,257 @@ def delete_all_history():
         filepath.unlink()
 
 
+# ── Excel Import / Restore ─────────────────────────────────────────────────────
+# Lets an admin (or user) re-upload a previously downloaded backup/export file
+# to reconstruct submissions after the server's storage has been wiped
+# (e.g. app restart on ephemeral hosting). Reads the same layout this app
+# writes — works with the consolidated/backup format (multi-sheet, "User"
+# column) and with individual single-user exports (one sheet, no "User" col).
+
+# Reverse lookup: "Approved" -> "approved", "📦 Archived" -> "archived", etc.
+_STATUS_LABEL_TO_KEY: dict[str, str] = {}
+for _k, _v in STATUS_LABELS.items():
+    _STATUS_LABEL_TO_KEY[_v.strip().lower()] = _k
+    _parts = _v.split(" ", 1)
+    if len(_parts) > 1:
+        _STATUS_LABEL_TO_KEY[_parts[1].strip().lower()] = _k
+
+def _parse_status_label(s: str) -> str:
+    if not s:
+        return "in-progress"
+    return _STATUS_LABEL_TO_KEY.get(str(s).strip().lower(), "in-progress")
+
+
+def _cell_to_date_str(value) -> str:
+    """Normalizes a cell value to a 'YYYY-MM-DD' string, however Excel stored it."""
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d")
+    if isinstance(value, date):
+        return value.strftime("%Y-%m-%d")
+    return str(value).strip()
+
+
+def _find_header_row(ws, max_scan: int = 8) -> tuple[int, dict[str, int]]:
+    """
+    Scans the first few rows of a sheet to find the header row — identified
+    as the row containing 'Initiative Name'. Returns (row_index, {lower_header: col_idx}).
+    Returns (0, {}) if no header row is found.
+    """
+    for r in range(1, max_scan + 1):
+        row_vals = {}
+        found_marker = False
+        for c in range(1, ws.max_column + 1):
+            val = ws.cell(r, c).value
+            if val is None:
+                continue
+            sval = str(val).strip()
+            row_vals[sval.lower()] = c
+            if sval.lower() == "initiative name":
+                found_marker = True
+        if found_marker:
+            return r, row_vals
+    return 0, {}
+
+
+def _extract_entity(ws) -> str:
+    """Tries sheet title 'Entity 107', then row 2 subtitle 'Entity: 107'."""
+    m = re.search(r"Entity\s+(\w+)", ws.title or "")
+    if m:
+        return m.group(1)
+    subtitle = ws.cell(2, 1).value or ""
+    # Subtitle text may live in different columns depending on User-col offset;
+    # scan the first few cells of row 2 for the pattern.
+    for c in range(1, min(ws.max_column, 10) + 1):
+        v = ws.cell(2, c).value
+        if v and "Entity:" in str(v):
+            m2 = re.search(r"Entity:\s*(\w+)", str(v))
+            if m2:
+                return m2.group(1)
+    return ""
+
+
+def _extract_filing_and_username_from_subtitle(ws) -> tuple[str, str]:
+    """
+    For individual (single-user) exports without a 'User' column or
+    'Filing Month' column: pulls 'Submitted by: X' and 'Filing: Month Year'
+    out of the row-2 subtitle text.
+    """
+    username, filing = "", ""
+    for c in range(1, min(ws.max_column, 10) + 1):
+        v = ws.cell(2, c).value
+        if not v:
+            continue
+        sv = str(v)
+        m_user = re.search(r"Submitted by:\s*([^|]+?)\s*(?:\||$)", sv)
+        if m_user:
+            username = m_user.group(1).strip()
+        m_fil = re.search(r"Filing:\s*([A-Za-z]+ \d{4})", sv)
+        if m_fil:
+            filing = parse_month_label(m_fil.group(1))
+    return username, filing
+
+
+def parse_import_workbook(file_bytes: bytes) -> tuple[dict, list[str]]:
+    """
+    Parses an uploaded .xlsx (consolidated/backup or individual export format)
+    back into submission dicts.
+
+    Returns (parsed, warnings) where:
+      parsed   = { (username, entity, reporting_month): {
+                      "entity": str, "reporting_month": str,
+                      "activities_month": str, "status": str,
+                      "initiatives": [ {...new_initiative()-shaped dicts...} ]
+                  } }
+      warnings = list of human-readable strings about rows/sheets that were
+                 skipped or had to be guessed at.
+    """
+    warnings: list[str] = []
+    parsed: dict = {}
+
+    try:
+        wb = load_workbook(io.BytesIO(file_bytes), data_only=True)
+    except Exception as e:
+        return {}, [f"Could not open file as an Excel workbook: {e}"]
+
+    for ws in wb.worksheets:
+        if ws.title in ("No Data",):
+            continue
+
+        hdr_row, hdrs = _find_header_row(ws)
+        if not hdr_row:
+            warnings.append(f"Sheet '{ws.title}': couldn't find a header row — skipped.")
+            continue
+
+        has_user_col = "user" in hdrs
+        sheet_entity = _extract_entity(ws)
+        fallback_username, fallback_filing = _extract_filing_and_username_from_subtitle(ws)
+
+        if not sheet_entity:
+            warnings.append(f"Sheet '{ws.title}': couldn't determine Entity — skipped.")
+            continue
+
+        col = lambda name: hdrs.get(name.lower())
+        n_rows_in_sheet = 0
+
+        for r in range(hdr_row + 1, ws.max_row + 1):
+            name_col = col("initiative name")
+            if not name_col:
+                continue
+            iname = ws.cell(r, name_col).value
+            if not iname or not str(iname).strip():
+                continue   # blank row
+
+            def get(colname, default=""):
+                ci = col(colname)
+                if not ci:
+                    return default
+                v = ws.cell(r, ci).value
+                return v if v is not None else default
+
+            username = str(get("user", "")).strip() or fallback_username
+            if not username:
+                warnings.append(f"Sheet '{ws.title}' row {r}: no username found — skipped.")
+                continue
+
+            month_yr_label = str(get("month/yr", "")).strip()
+            activities_month = parse_month_label(month_yr_label)
+
+            filing_label = str(get("filing month", "")).strip()
+            reporting_month = parse_month_label(filing_label)
+            if not reporting_month:
+                reporting_month = fallback_filing
+            if not reporting_month and activities_month:
+                # Last resort: assume the standard one-month convention
+                reporting_month = next_month_of(activities_month)
+                warnings.append(
+                    f"Sheet '{ws.title}' row {r}: no Filing Month found — "
+                    f"assumed {fmt_month(reporting_month)} (one month after activities)."
+                )
+            if not reporting_month:
+                warnings.append(f"Sheet '{ws.title}' row {r}: couldn't determine a filing period — skipped.")
+                continue
+
+            status_key = _parse_status_label(str(get("status", "")))
+
+            init = new_initiative()
+            init["business_component"]     = str(get("business component", ""))
+            init["initiative_name"]        = str(iname).strip()
+            init["initiative_description"] = str(get("initiative description", ""))
+            init["tech_uncertainty"]        = str(get("tech uncertainty", ""))
+            init["start_date"]              = _cell_to_date_str(get("start date", None)) or None
+            init["expected_end_date"]       = _cell_to_date_str(get("expected end date", None)) or None
+            init["activities"]              = str(get("activities to eliminate technical uncertainty", ""))
+            team_raw                        = str(get("team members", ""))
+            init["team_members"]            = [t.strip() for t in team_raw.split(",") if t.strip()]
+            init["notes"]                   = str(get("notes", ""))
+            init["month_yr"]                = activities_month
+            init["carry_over"]              = False
+
+            if status_key in ("approved", "archived"):
+                init["initiative_status"] = "approved"
+            elif status_key == "rejected":
+                init["initiative_status"] = "returned"
+            else:
+                init["initiative_status"] = "active"
+
+            comp_raw = get("completion date", "")
+            if comp_raw and status_key in ("approved", "archived"):
+                for fmt_str in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
+                    try:
+                        dt = datetime.strptime(str(comp_raw).strip(), fmt_str)
+                        init["approved_at"] = int(dt.timestamp() * 1000)
+                        break
+                    except Exception:
+                        continue
+
+            key = (username, sheet_entity, reporting_month)
+            if key not in parsed:
+                parsed[key] = {
+                    "entity":           sheet_entity,
+                    "reporting_month":  reporting_month,
+                    "activities_month": activities_month or prev_month_of(reporting_month),
+                    "status":           status_key,
+                    "initiatives":      [],
+                }
+            parsed[key]["initiatives"].append(init)
+            n_rows_in_sheet += 1
+
+        if n_rows_in_sheet == 0:
+            warnings.append(f"Sheet '{ws.title}': no usable initiative rows found.")
+
+    return parsed, warnings
+
+
+def apply_import(parsed: dict, overwrite: bool = False) -> dict:
+    """
+    Commits parsed import data to storage via save_draft.
+    Skips (username, entity, period) combos that already have a real
+    submission unless overwrite=True.
+    Returns {"imported": [...], "skipped": [...]} — lists of
+    "username — Entity X — Month Year" strings.
+    """
+    imported, skipped = [], []
+    for (username, entity, rm), data in parsed.items():
+        label = f"{username} — Entity {entity} — {fmt_month(rm)}"
+        existing = load_submission(username, rm)
+        if existing and existing.get("initiatives") and not overwrite:
+            skipped.append(label)
+            continue
+
+        draft = {
+            "initiatives":      data["initiatives"],
+            "status":           data["status"] if data["status"] in STATUS_LABELS else "approved",
+            "entity":           entity,
+            "reporting_month":  rm,
+            "activities_month": data["activities_month"],
+        }
+        save_draft(username, draft)
+        imported.append(label)
+    return {"imported": imported, "skipped": skipped}
+
+
 def get_combos(all_data: dict) -> list[tuple[str, str]]:
     """
     Returns sorted list of unique (entity, reporting_month) tuples
@@ -558,6 +828,7 @@ def _data_font():
 _COL_DEF = [
     # Widths match original template exactly (measured via openpyxl from source file)
     ("Month/Yr",                                               "_month",             14.15,  False),
+    ("Filing Month",                                            "_filing",            13.0,   False),
     ("Business Component",                                     "business_component", 35.0,   False),
     ("Initiative Name",                                        "initiative_name",    19.26,  False),
     ("Initiative Description",                                 "initiative_description", 38.15, False),
@@ -660,6 +931,7 @@ def _sub_to_rows(username: str, sub: dict, include_user: bool) -> list[dict]:
         row = {
             # Use initiative's own month_yr, then activities_month, then filing month
             "_month":  fmt_month(init.get("month_yr") or sub.get("activities_month") or rm),
+            "_filing": fmt_month(rm),
             "_status": status,
             "_completion": (
                 datetime.fromtimestamp(init["approved_at"] / 1000).strftime("%Y-%m-%d %H:%M")
@@ -2019,6 +2291,98 @@ def screen_admin():
                 if st.button("Cancel", key="del_all_cancel"):
                     st.session_state.confirm_delete_all = False
                     st.rerun()
+
+        st.divider()
+
+        # ── Restore from Backup ──────────────────────────────────────────────
+        st.markdown("**📤 Restore from Backup**")
+        st.caption(
+            "If the server restarted and lost its data, upload a previously downloaded "
+            "backup or export (.xlsx) here to rebuild submissions from it. "
+            "Works with the full data backup, a consolidated report, or an individual user's export. "
+            "All statuses are restored exactly as they were — Approved, Archived, In Progress, etc."
+        )
+
+        uploaded = st.file_uploader(
+            "Upload a backup or export file", type=["xlsx"], key="restore_uploader"
+        )
+
+        if uploaded is not None:
+            file_bytes = uploaded.getvalue()
+            parsed, parse_warnings = parse_import_workbook(file_bytes)
+
+            if not parsed:
+                st.error("Couldn't find any usable data in this file.")
+                if parse_warnings:
+                    for w in parse_warnings:
+                        st.caption(f"⚠ {w}")
+            else:
+                # Preview — split into "will import" vs "already has data"
+                will_import, will_skip = [], []
+                for (username, entity, rm), data in parsed.items():
+                    existing = load_submission(username, rm)
+                    already_has_data = bool(existing and existing.get("initiatives"))
+                    row = {
+                        "User": username,
+                        "Entity": entity,
+                        "Period": fmt_month(rm),
+                        "Status": STATUS_LABELS.get(data["status"], data["status"]),
+                        "Initiatives": len(data["initiatives"]),
+                    }
+                    (will_skip if already_has_data else will_import).append(row)
+
+                pc1, pc2, pc3 = st.columns(3)
+                pc1.metric("Periods found", len(parsed))
+                pc2.metric("Will import", len(will_import))
+                pc3.metric("Already have data", len(will_skip))
+
+                if will_import:
+                    st.markdown("**Will be imported:**")
+                    for row in will_import:
+                        st.markdown(
+                            f"&nbsp;&nbsp;• **{row['User']}** — Entity {row['Entity']} — "
+                            f"{row['Period']} — {row['Status']} "
+                            f"({row['Initiatives']} initiative{'s' if row['Initiatives']!=1 else ''})",
+                            unsafe_allow_html=True,
+                        )
+
+                if will_skip:
+                    with st.expander(f"⚠ {len(will_skip)} period(s) already have data — won't be touched unless you choose to overwrite"):
+                        for row in will_skip:
+                            st.markdown(
+                                f"&nbsp;&nbsp;• **{row['User']}** — Entity {row['Entity']} — "
+                                f"{row['Period']} — {row['Status']}",
+                                unsafe_allow_html=True,
+                            )
+
+                if parse_warnings:
+                    with st.expander(f"ℹ {len(parse_warnings)} note(s) about this import"):
+                        for w in parse_warnings:
+                            st.caption(w)
+
+                overwrite = False
+                if will_skip:
+                    overwrite = st.checkbox(
+                        "Overwrite periods that already have data (replaces their current initiatives)",
+                        value=False,
+                        key="restore_overwrite",
+                    )
+
+                n_to_apply = len(parsed) if overwrite else len(will_import)
+                if n_to_apply == 0:
+                    st.info("Nothing to import — every period in this file already has data.")
+                else:
+                    if st.button(
+                        f"📤 Restore {n_to_apply} period{'s' if n_to_apply!=1 else ''}",
+                        type="primary",
+                        key="confirm_restore",
+                    ):
+                        result = apply_import(parsed, overwrite=overwrite)
+                        st.success(
+                            f"✓ Restored {len(result['imported'])} period(s). "
+                            + (f"Skipped {len(result['skipped'])} (already had data)." if result["skipped"] else "")
+                        )
+                        st.rerun()
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
