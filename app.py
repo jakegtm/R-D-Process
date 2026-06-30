@@ -2208,9 +2208,35 @@ def screen_admin():
                     reverse=True,
                 )
 
+                # Default to the most recent eligible period that actually has
+                # users to roll over (at least one user who doesn't already have
+                # a real submission in the next month — nothing to do otherwise).
+                def _has_rollable_users(entity: str, src_month: str) -> bool:
+                    tgt = next_month_of(src_month)
+                    for username, ud in all_data.items():
+                        sub = ud.get(src_month)
+                        if not sub or sub.get("entity") != entity:
+                            continue
+                        if sub.get("status") not in ("approved", "archived"):
+                            continue
+                        if not sub.get("initiatives"):
+                            continue
+                        existing = load_submission(username, tgt)
+                        if not (existing and existing.get("entity") == entity
+                                and existing.get("initiatives")):
+                            return True
+                    return False
+
+                best_label = next(
+                    (l for l in sorted_labels if _has_rollable_users(*combo_labels_ro[l])),
+                    sorted_labels[0],
+                )
+                default_idx = sorted_labels.index(best_label)
+
                 src_label = st.selectbox(
                     "Roll FROM (approved reports only)",
                     sorted_labels,
+                    index=default_idx,
                     key="ro_src_single",
                 )
                 src_entity, src_month = combo_labels_ro[src_label]
@@ -2324,57 +2350,47 @@ def screen_admin():
             if "export_status_sel" not in st.session_state:
                 st.session_state.export_status_sel = ["Ready for Review", "Approved", "Archived"]
 
-            def _apply_status_preset(selected: list[str]):
-                # Update the underlying selection AND clear each checkbox widget's
-                # cached state — otherwise Streamlit keeps showing the checkbox's
-                # old value instead of picking up the new preset (same fix used
-                # elsewhere for selectbox widgets that don't refresh on their own).
-                st.session_state.export_status_sel = selected
-                for opt in status_options:
-                    st.session_state.pop(f"status_chk_{opt}", None)
-                st.rerun()
-
-            # Quick preset buttons
+            # Quick preset buttons — no key-clearing needed since checkboxes below use no key
             pc1, pc2, pc3, pc4 = st.columns(4)
             with pc1:
                 if st.button("All statuses", key="preset_all"):
-                    _apply_status_preset(status_options.copy())
+                    st.session_state.export_status_sel = status_options.copy()
+                    st.rerun()
             with pc2:
-                if st.button("Closed out only", key="preset_closed",
-                             help="Approved + Archived"):
-                    _apply_status_preset(["Approved", "Archived"])
+                if st.button("Closed out only", key="preset_closed", help="Approved + Archived"):
+                    st.session_state.export_status_sel = ["Approved", "Archived"]
+                    st.rerun()
             with pc3:
-                if st.button("Needs action", key="preset_action",
-                             help="In Progress + Rejected"):
-                    _apply_status_preset(["In Progress", "Rejected"])
+                if st.button("Needs action", key="preset_action", help="In Progress + Rejected"):
+                    st.session_state.export_status_sel = ["In Progress", "Rejected"]
+                    st.rerun()
             with pc4:
                 if st.button("Reviewed only", key="preset_reviewed",
                              help="Ready for Review + Approved + Archived"):
-                    _apply_status_preset(["Ready for Review", "Approved", "Archived"])
+                    st.session_state.export_status_sel = ["Ready for Review", "Approved", "Archived"]
+                    st.rerun()
 
-            # Checkbox dropdown — single clean button that opens a checklist panel,
-            # instead of a multiselect whose pills can wrap and overflow.
+            # Checkbox dropdown using NO key on each checkbox — this ensures the `value`
+            # parameter always controls what's shown, so preset buttons work instantly
+            # without Streamlit's widget cache overriding the new selection.
             n_sel = len(st.session_state.export_status_sel)
             n_tot = len(status_options)
             button_label = (
-                f"☑ {n_sel} of {n_tot} statuses selected ▾"
-                if 0 < n_sel < n_tot else
-                f"☑ All statuses selected ▾" if n_sel == n_tot else
+                "☑ All statuses selected ▾" if n_sel == n_tot else
+                f"☑ {n_sel} of {n_tot} statuses selected ▾" if n_sel > 0 else
                 "☐ No statuses selected ▾"
             )
+            new_sel = list(st.session_state.export_status_sel)
             with st.popover(button_label, use_container_width=True):
                 for opt in status_options:
-                    checked = st.checkbox(
-                        opt,
-                        value=opt in st.session_state.export_status_sel,
-                        key=f"status_chk_{opt}",
-                    )
-                    if checked and opt not in st.session_state.export_status_sel:
-                        st.session_state.export_status_sel.append(opt)
-                        st.rerun()
-                    elif not checked and opt in st.session_state.export_status_sel:
-                        st.session_state.export_status_sel.remove(opt)
-                        st.rerun()
+                    checked = st.checkbox(opt, value=opt in new_sel)
+                    if checked and opt not in new_sel:
+                        new_sel.append(opt)
+                    elif not checked and opt in new_sel:
+                        new_sel.remove(opt)
+            if new_sel != st.session_state.export_status_sel:
+                st.session_state.export_status_sel = new_sel
+                st.rerun()
 
             chosen_statuses_display = st.session_state.export_status_sel
             if chosen_statuses_display:
