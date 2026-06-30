@@ -1158,22 +1158,43 @@ def screen_login():
 # Streamlit has no background scheduler — these checks run only when someone
 # opens the app, and simply surface a visible nudge based on today's date.
 
-def render_user_reminder(user: str):
+def render_user_reminder(user: str, current_filing_month: str = ""):
     """
-    If it's the 5th or later and the user hasn't started this month's
-    filing cycle yet, show a reminder banner on login.
+    Two types of reminders:
+    1. If it's the 5th or later and the user has no submission for this month's filing cycle.
+    2. If the user has in-progress periods (e.g. from a rollover) that they haven't
+       submitted yet — even if they're currently viewing a different period.
     """
+    months_index = load_user_months(user)
+
+    # ── Check all periods for unsubmitted in-progress drafts ────────────────
+    pending_periods = []
+    for month in months_index:
+        if month == current_filing_month:
+            continue   # don't double-warn about what they're looking at right now
+        sub = load_submission(user, month)
+        if sub and sub.get("initiatives") and sub.get("status") == "in-progress":
+            pending_periods.append(month)
+
+    if pending_periods:
+        period_list = ", ".join(f"**{fmt_month(m)}**" for m in sorted(pending_periods))
+        st.warning(
+            f"⚠ You have an unsubmitted report for {period_list}. "
+            "Open **Report Setup** above, select that Filing Month, "
+            "review your initiatives, and click **Submit for Review**."
+        )
+
+    # ── Monthly filing reminder (past the 5th) ───────────────────────────────
     today = date.today()
-    if today.day < 5:
-        return
-    cur = cur_month()
-    existing = load_submission(user, cur)
-    if existing and existing.get("initiatives"):
-        return  # already has a real submission for this period
-    st.warning(
-        f"📅 It's past the 5th and you haven't started your **{fmt_month(cur)}** filing yet. "
-        "Set up your report below to get started."
-    )
+    if today.day >= 5:
+        cur = cur_month()
+        existing = load_submission(user, cur)
+        if not existing or not existing.get("initiatives"):
+            st.info(
+                f"📅 It's past the 5th and you haven't started your "
+                f"**{fmt_month(cur)}** filing yet. "
+                "Set up your report below to get started."
+            )
 
 
 def render_admin_reminder(all_data: dict):
@@ -1232,7 +1253,7 @@ def screen_dashboard():
             st.rerun()
 
     st.divider()
-    render_user_reminder(user)
+    render_user_reminder(user, current_filing_month=draft.get("reporting_month", ""))
 
     # ── Report Setup ─────────────────────────────────────────────────────────
     setup_complete = bool(draft.get("entity") and draft.get("reporting_month"))
