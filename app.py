@@ -1409,12 +1409,39 @@ def screen_dashboard():
     if not draft["initiatives"]:
         st.info("No initiatives added yet. Click **＋ Add Initiative** to begin this month's report.")
     else:
+        # ── Quick-scan summary table ────────────────────────────────────────
+        # Lets you see everything at a glance before opening any single card —
+        # this is what matters once there are more than a couple initiatives.
+        status_icon_map = {"approved": "✅", "returned": "🔴", "active": "🔵"}
+        table_rows = []
+        for init in draft["initiatives"]:
+            istatus = init.get("initiative_status", "active")
+            table_rows.append({
+                " ":                  status_icon_map.get(istatus, "🔵"),
+                "Initiative":         init.get("initiative_name", "Unnamed"),
+                "Business Component": init.get("business_component", ""),
+                "Team":               ", ".join(init.get("team_members") or []),
+                "Start":              init.get("start_date", "—"),
+                "End":                init.get("expected_end_date", "—"),
+            })
+        st.dataframe(
+            table_rows,
+            use_container_width=True,
+            hide_index=True,
+            column_config={" ": st.column_config.TextColumn(width="small")},
+        )
+        st.caption("✅ Approved by admin   ·   🔴 Rejected — needs revision   ·   🔵 Active / pending review")
+
+        st.write("")
+
         for init in draft["initiatives"]:
             iid = init["id"]
+            istatus = init.get("initiative_status", "active")
+            status_icon = status_icon_map.get(istatus, "🔵")
             with st.expander(
-                f"{'↩ ' if init.get('carry_over') else ''}"
+                f"{status_icon} {'↩ ' if init.get('carry_over') else ''}"
                 f"{init.get('initiative_name','Unnamed')} — {init.get('business_component','')}",
-                expanded=True,
+                expanded=False,
             ):
                 st.markdown(f"**{init.get('initiative_description','—')}**")
                 st.caption(
@@ -1435,12 +1462,11 @@ def screen_dashboard():
                     st.markdown(f"*Notes: {init['notes']}*")
 
                 # Per-initiative status banner (set by admin)
-                istatus = init.get("initiative_status", "active")
                 if istatus == "returned":
                     ret_ts = init.get("returned_at")
                     ret_str = f" on {datetime.fromtimestamp(ret_ts/1000).strftime('%b %d %H:%M')}" if ret_ts else ""
                     rc = init.get("rejection_comment", "")
-                    rc_str = f' Comment: \"{rc}\".' if rc else ""
+                    rc_str = f' Comment: "{rc}".' if rc else ""
                     st.warning(f"⚠ This initiative was Rejected{ret_str}.{rc_str} Edit and resubmit.")
                 elif istatus == "approved":
                     appr_ts = init.get("approved_at")
