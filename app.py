@@ -706,11 +706,16 @@ def build_excel_consolidated(
     all_data: dict,
     selected_combos: list[tuple[str, str]],
     submitted_only: bool = False,
+    status_filter: list[str] | None = None,
 ) -> bytes:
     """
     One sheet per entity (tab = "Entity 107", "Entity 108", etc.).
     All periods for that entity appear as rows within the sheet,
     sorted by reporting_month then username.
+
+    status_filter: if provided, only include submissions whose status is in
+    this list (e.g. ["approved","archived"]). Takes precedence over submitted_only.
+    If both are omitted/None/False, all statuses are included.
     """
     wb = Workbook()
     wb.remove(wb.active)
@@ -718,12 +723,19 @@ def build_excel_consolidated(
     # Collect unique entities from the selected combos, in sorted order
     entities = sorted({e for e, _ in selected_combos})
 
+    if status_filter is not None:
+        allowed_statuses = set(status_filter)
+        status_desc = ", ".join(STATUS_LABELS.get(s, s).split(" ", 1)[-1] for s in status_filter) or "None selected"
+    elif submitted_only:
+        allowed_statuses = {"submitted", "approved", "archived"}
+        status_desc = "Submitted, Approved & Archived"
+    else:
+        allowed_statuses = None
+        status_desc = "All statuses"
+
     for entity in entities:
         ws = wb.create_sheet(title=f"Entity {entity}"[:31])
-        subtitle = (
-            f"Entity: {entity}"
-            + ("  |  Submitted & Approved only" if submitted_only else "  |  All statuses")
-        )
+        subtitle = f"Entity: {entity}  |  {status_desc}"
 
         # Gather rows for this entity across all selected periods, sorted by period then user
         entity_combos = sorted(
@@ -736,7 +748,7 @@ def build_excel_consolidated(
                 sub = all_data[username].get(rm)
                 if not sub or sub.get("entity") != entity:
                     continue
-                if submitted_only and sub.get("status") not in ("submitted", "approved", "archived"):
+                if allowed_statuses is not None and sub.get("status") not in allowed_statuses:
                     continue
                 rows.extend(_sub_to_rows(username, sub, include_user=True))
 
@@ -1829,52 +1841,126 @@ def screen_admin():
         if not combos:
             st.info("No submissions found yet.")
         else:
-            combo_labels  = {f"{e} — {fmt_month(rm)}": (e, rm) for e, rm in combos}
-            all_labels    = list(combo_labels.keys())
+            st.caption(
+                "Build a custom export by choosing which periods/entities and which "
+                "statuses to include. Excel gets one tab per entity."
+            )
 
-            sel_all = st.checkbox("Select all periods/entities", value=True, key="sel_all_periods")
-            if sel_all:
+            # ── 1. Periods / Entities ────────────────────────────────────────
+            st.markdown("**1. Periods & Entities**")
+            combo_labels = {f"{e} — {fmt_month(rm)}": (e, rm) for e, rm in combos}
+            all_labels   = list(combo_labels.keys())
+
+            sel_all_periods = st.checkbox("Include all periods/entities", value=True, key="sel_all_periods")
+            if sel_all_periods:
                 chosen_labels = all_labels
             else:
                 chosen_labels = st.multiselect(
-                    "Choose which periods/entities to include:",
+                    "Choose specific periods/entities:",
                     all_labels,
                     default=all_labels,
+                    key="chosen_period_labels",
                 )
-
             chosen_combos = [combo_labels[l] for l in chosen_labels]
 
-            submitted_only = st.checkbox(
-                "Ready for Review, Approved & Archived only (exclude In Progress / Rejected)",
-                value=True,
+            st.write("")
+
+            # ── 2. Status filter (multi-select, fully flexible) ──────────────
+            st.markdown("**2. Status**")
+            status_options = ["In Progress", "Ready for Review", "Approved", "Archived", "Rejected"]
+            status_key_map = {
+                "In Progress":     "in-progress",
+                "Ready for Review":"submitted",
+                "Approved":        "approved",
+                "Archived":        "archived",
+                "Rejected":        "rejected",
+            }
+
+            # Quick preset buttons
+            pc1, pc2, pc3, pc4 = st.columns(4)
+            if "export_status_sel" not in st.session_state:
+                st.session_state.export_status_sel = ["Ready for Review", "Approved", "Archived"]
+            with pc1:
+                if st.button("All statuses", key="preset_all"):
+                    st.session_state.export_status_sel = status_options.copy()
+                    st.rerun()
+            with pc2:
+                if st.button("Closed out only", key="preset_closed",
+                             help="Approved + Archived"):
+                    st.session_state.export_status_sel = ["Approved", "Archived"]
+                    st.rerun()
+            with pc3:
+                if st.button("Needs action", key="preset_action",
+                             help="In Progress + Rejected"):
+                    st.session_state.export_status_sel = ["In Progress", "Rejected"]
+                    st.rerun()
+            with pc4:
+                if st.button("Reviewed only", key="preset_reviewed",
+                             help="Ready for Review + Approved + Archived"):
+                    st.session_state.export_status_sel = ["Ready for Review", "Approved", "Archived"]
+                    st.rerun()
+
+            chosen_statuses_display = st.multiselect(
+                "Include these statuses:",
+                status_options,
+                default=st.session_state.export_status_sel,
+                key="export_status_multiselect",
             )
+            st.session_state.export_status_sel = chosen_statuses_display
+            chosen_status_keys = [status_key_map[s] for s in chosen_statuses_display]
 
-            if chosen_combos:
+            st.write("")
+
+            # ── 3. Live summary of what will be included ─────────────────────
+            st.markdown("**3. Summary**")
+            matched_rows  = 0
+            matched_users = set()
+            matched_inits = 0
+            for entity, rm in chosen_combos:
+                for username, months in all_data.items():
+                    sub = months.get(rm)
+                    if not sub or sub.get("entity") != entity:
+                        continue
+                    if sub.get("status") not in chosen_status_keys:
+                        continue
+                    inits = sub.get("initiatives") or []
+                    if not inits:
+                        continue
+                    matched_rows += 1
+                    matched_users.add(username)
+                    matched_inits += len(inits)
+
+            if not chosen_combos or not chosen_status_keys:
+                st.warning("Select at least one period/entity and one status to export.")
+            else:
                 unique_entities = sorted({e for e,_ in chosen_combos})
+                sc1, sc2, sc3, sc4 = st.columns(4)
+                sc1.metric("Entities", len(unique_entities))
+                sc2.metric("Reports", matched_rows)
+                sc3.metric("Users", len(matched_users))
+                sc4.metric("Initiatives", matched_inits)
                 tab_preview = ", ".join(f'"Entity {e}"' for e in unique_entities)
-                st.caption(f"Excel tabs (one per entity): {tab_preview}")
+                st.caption(f"Excel tabs: {tab_preview}")
 
-            ex1, ex2 = st.columns(2)
-            with ex1:
-                if chosen_combos:
-                    xlsx = build_excel_consolidated(all_data, chosen_combos, submitted_only=False)
-                    today = datetime.now().strftime("%m%d%y")
-                    st.download_button(
-                        "↓ Download Consolidated Report — All Statuses",
-                        data=xlsx,
-                        file_name=f"Consolidated_Report_{today}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    )
-            with ex2:
-                if chosen_combos:
-                    xlsx_sub = build_excel_consolidated(all_data, chosen_combos, submitted_only=True)
-                    today = datetime.now().strftime("%m%d%y")
-                    st.download_button(
-                        "↓ Download Consolidated Report — Submitted Only",
-                        data=xlsx_sub,
-                        file_name=f"Consolidated_Report_Submitted_{today}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    )
+            st.write("")
+
+            # ── 4. Download ───────────────────────────────────────────────────
+            st.markdown("**4. Download**")
+            today = datetime.now().strftime("%m%d%y")
+            status_tag = "_".join(s.replace(" ","") for s in chosen_statuses_display) if len(chosen_statuses_display) < len(status_options) else "AllStatuses"
+            fname = f"Consolidated_Report_{status_tag}_{today}.xlsx"
+
+            if chosen_combos and chosen_status_keys and matched_rows > 0:
+                xlsx = build_excel_consolidated(all_data, chosen_combos, status_filter=chosen_status_keys)
+                st.download_button(
+                    f"↓ Download Consolidated Report ({matched_rows} report{'s' if matched_rows!=1 else ''})",
+                    data=xlsx,
+                    file_name=fname,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    type="primary",
+                )
+            elif chosen_combos and chosen_status_keys:
+                st.caption("No reports match this combination — nothing to download yet.")
 
     # ═══════════════════════════════════════════════════════════════════════
     # TAB: Backup & Data
