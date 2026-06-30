@@ -733,12 +733,14 @@ def rollover_entity(
     target_month: str,
 ) -> list[str]:
     """
-    For every user who has a submission under (source_entity, source_month),
-    create a new in-progress draft under (source_entity, target_month)
-    — unless they already have one there.
+    For every user who has an APPROVED or ARCHIVED submission under
+    (source_entity, source_month), create a new in-progress draft under
+    (source_entity, target_month) — unless they already have one there.
 
-    Carries ALL initiatives regardless of end date — the admin is explicitly
-    choosing what to roll over, so the app doesn't second-guess them.
+    Matching the Power Automate flow:
+    - Only approved/archived submissions can be rolled (not in-progress/submitted).
+    - The source submission is automatically archived after rollover.
+
     Returns list of usernames that were rolled over.
     """
     rolled: list[str] = []
@@ -748,10 +750,12 @@ def rollover_entity(
         if not src_sub or src_sub.get("entity") != source_entity:
             continue
 
-        # Don't overwrite an existing submission for that period
+        # Only roll over approved or already-archived submissions
+        if src_sub.get("status") not in ("approved", "archived"):
+            continue
+
+        # Don't overwrite an existing real submission in the target period
         existing = load_submission(username, target_month)
-        # Only block if they have a real submission (with initiatives),
-        # not just an empty setup draft saved when they picked a reporting month
         if existing and existing.get("entity") == source_entity and existing.get("initiatives"):
             continue
 
@@ -759,20 +763,15 @@ def rollover_entity(
         if not initiatives:
             continue
 
-        # Deep-copy every initiative so all content is fully preserved.
-        # Only reset the per-review-cycle fields (approval state) since
-        # this is a new period with a fresh review cycle.
         import copy as _copy
         rolled_inits = []
         for i in initiatives:
             init = _copy.deepcopy(i)
             init["id"]                = f"{int(__import__('time').time()*1000)}{len(rolled_inits)}"
-            init["initiative_status"] = "active"   # new period = new review
+            init["initiative_status"] = "active"
             init["approved_at"]       = None
             init["returned_at"]       = None
             init["carry_over"]        = True
-            # Clear month_yr so the new period's activities_month is used in the export.
-            # Historical month_yr is preserved in the source period's file.
             init["month_yr"]          = ""
             rolled_inits.append(init)
 
@@ -781,11 +780,16 @@ def rollover_entity(
             "status":           "in-progress",
             "entity":           source_entity,
             "reporting_month":  target_month,
-            # Default activities_month to the month before the filing month.
-            # User can change this in Report Setup if needed.
             "activities_month": prev_month_of(target_month),
         }
         save_draft(username, new_sub)
+
+        # Auto-archive the source submission (matching PA Flow 4 behaviour)
+        if src_sub.get("status") != "archived":
+            src_sub["status"]      = "archived"
+            src_sub["archived_at"] = int(__import__("time").time() * 1000)
+            save_draft(username, src_sub)
+
         rolled.append(username)
 
     return rolled
@@ -2162,92 +2166,112 @@ def screen_admin():
     # ═══════════════════════════════════════════════════════════════════════
     with tab_rollover:
         st.caption(
-            "Pick one period to roll forward into a new Filing Month. "
-            "The target list only shows months after the source — you can't "
-            "roll into the same month or an earlier one. All initiatives are "
-            "carried regardless of end date. Anyone who already has a real "
-            "submission for the target period is skipped, never overwritten."
+            "Roll an **Approved** period forward into a new Filing Month. "
+            "Only approved reports can be rolled over — matching the Power Automate process "
+            "where rollover follows approval. The source period is automatically **Archived** "
+            "after rollover. Anyone who already has a real submission in the target period is "
+            "skipped, never overwritten."
         )
 
         if not combos:
             st.info("No submissions to roll over yet.")
         else:
-            combo_labels_ro = {
-                f"Entity {e} — Filing: {fmt_month(rm)}": (e, rm) for e, rm in combos
-            }
-            sorted_labels = sorted(
-                combo_labels_ro.keys(),
-                key=lambda l: combo_labels_ro[l][1],
-                reverse=True,
-            )
-
-            src_label = st.selectbox(
-                "Roll FROM",
-                sorted_labels,
-                key="ro_src_single",
-            )
-            src_entity, src_month = combo_labels_ro[src_label]
-
-            # Target list only ever shows months strictly AFTER the source —
-            # rolling into the same month or an earlier one is not allowed.
-            target_options = [m for m in available_months() if m > src_month]
-            default_target = next_month_of(src_month)
-            if default_target not in target_options:
-                target_options = sorted(set(target_options) | {default_target})
-            target_options = sorted(target_options)
-
-            chosen_target = st.selectbox(
-                "Roll TO (target Filing Month)",
-                target_options,
-                index=target_options.index(default_target) if default_target in target_options else 0,
-                format_func=fmt_month,
-                key=f"ro_target_single_{src_label}",
-            )
-
-            # Build preview for this single source → target
-            preview = []  # (username, init_names)
-            for username, months in all_data.items():
-                sub = months.get(src_month)
-                if not sub or sub.get("entity") != src_entity:
-                    continue
-                existing = load_submission(username, chosen_target)
-                if existing and existing.get("entity") == src_entity and existing.get("initiatives"):
-                    continue
-                inits = sub.get("initiatives") or []
-                if inits:
-                    preview.append((username, [i.get("initiative_name", "Unnamed") for i in inits]))
-
-            if not preview:
-                st.info("No users have active initiatives to roll over into this target period.")
-            else:
-                st.markdown(
-                    f"**Preview — Entity {src_entity}: Filing {fmt_month(src_month)} "
-                    f"→ Filing {fmt_month(chosen_target)}**"
+            # Only approved/archived submissions are eligible to roll over
+            eligible_combos = [
+                (e, rm) for e, rm in combos
+                if any(
+                    sub.get("status") in ("approved", "archived")
+                    for ud in all_data.values()
+                    if (sub := ud.get(rm)) and sub.get("entity") == e
                 )
-                for u, names in preview:
+            ]
+
+            if not eligible_combos:
+                st.info(
+                    "No approved reports to roll over yet. "
+                    "Approve a report in the Submissions tab first."
+                )
+            else:
+                combo_labels_ro = {
+                    f"Entity {e} — Filing: {fmt_month(rm)}": (e, rm)
+                    for e, rm in eligible_combos
+                }
+                sorted_labels = sorted(
+                    combo_labels_ro.keys(),
+                    key=lambda l: combo_labels_ro[l][1],
+                    reverse=True,
+                )
+
+                src_label = st.selectbox(
+                    "Roll FROM (approved reports only)",
+                    sorted_labels,
+                    key="ro_src_single",
+                )
+                src_entity, src_month = combo_labels_ro[src_label]
+
+                target_options = [m for m in available_months() if m > src_month]
+                default_target = next_month_of(src_month)
+                if default_target not in target_options:
+                    target_options = sorted(set(target_options) | {default_target})
+                target_options = sorted(target_options)
+
+                chosen_target = st.selectbox(
+                    "Roll TO (target Filing Month)",
+                    target_options,
+                    index=target_options.index(default_target) if default_target in target_options else 0,
+                    format_func=fmt_month,
+                    key=f"ro_target_single_{src_label}",
+                )
+
+                # Build preview
+                preview = []
+                for username, months in all_data.items():
+                    sub = months.get(src_month)
+                    if not sub or sub.get("entity") != src_entity:
+                        continue
+                    if sub.get("status") not in ("approved", "archived"):
+                        continue
+                    existing = load_submission(username, chosen_target)
+                    if existing and existing.get("entity") == src_entity and existing.get("initiatives"):
+                        continue
+                    inits = sub.get("initiatives") or []
+                    if inits:
+                        preview.append((username, [i.get("initiative_name", "Unnamed") for i in inits]))
+
+                if not preview:
+                    st.info("No users have active initiatives to roll over into this target period.")
+                else:
                     st.markdown(
-                        f"&nbsp;&nbsp;• **{u}** — " + ", ".join(f"*{n}*" for n in names),
-                        unsafe_allow_html=True,
+                        f"**Preview — Entity {src_entity}: Filing {fmt_month(src_month)} "
+                        f"→ Filing {fmt_month(chosen_target)}**"
+                    )
+                    for u, names in preview:
+                        st.markdown(
+                            f"&nbsp;&nbsp;• **{u}** — " + ", ".join(f"*{n}*" for n in names),
+                            unsafe_allow_html=True,
+                        )
+                    st.caption(
+                        f"After rollover: {fmt_month(src_month)} will be automatically **Archived**. "
+                        f"Users will find a pre-filled draft under {fmt_month(chosen_target)}."
                     )
 
-                total_subs = len(preview)
-                if st.button(
-                    f"🔄 Roll Over {total_subs} submission{'s' if total_subs!=1 else ''} "
-                    f"→ Filing: {fmt_month(chosen_target)}",
-                    type="primary",
-                    key="do_rollover_single",
-                ):
-                    rolled = rollover_entity(all_data, src_entity, src_month, chosen_target)
-                    if rolled:
-                        st.success(
-                            f"✓ Rolled over for: {', '.join(rolled)}. "
-                            f"They'll find a pre-filled draft under Filing Month {fmt_month(chosen_target)} "
-                            f"when they log in. They need to review their initiatives and click "
-                            f"**Submit for Review** before you can approve."
-                        )
-                        st.rerun()
-                    else:
-                        st.info("Nothing to roll over.")
+                    total_subs = len(preview)
+                    if st.button(
+                        f"🔄 Roll Over {total_subs} submission{'s' if total_subs!=1 else ''} "
+                        f"→ Filing: {fmt_month(chosen_target)}",
+                        type="primary",
+                        key="do_rollover_single",
+                    ):
+                        rolled = rollover_entity(all_data, src_entity, src_month, chosen_target)
+                        if rolled:
+                            st.success(
+                                f"✓ Rolled over for: {', '.join(rolled)}. "
+                                f"{fmt_month(src_month)} has been archived. "
+                                f"Users will see their {fmt_month(chosen_target)} draft on next login."
+                            )
+                            st.rerun()
+                        else:
+                            st.info("Nothing to roll over.")
 
     # ═══════════════════════════════════════════════════════════════════════
     # TAB: Export
