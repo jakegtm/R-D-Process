@@ -707,6 +707,9 @@ def get_past_ongoing_initiatives(username: str, current_reporting_month: str) ->
             if name in seen:
                 continue   # already have a newer version
             seen.add(name)
+            # Skip resolved initiatives — user marked them as complete
+            if init.get("resolved"):
+                continue
             end = init.get("expected_end_date")
             if end:
                 try:
@@ -825,6 +828,15 @@ def new_initiative() -> dict:
         # Set when first saved; preserved through admin rollovers so each row
         # always shows the correct original period in the export.
         "month_yr":              "",
+        # pathway: which flow the user chose this month for this carry-over initiative.
+        # "continuing" | "resolved" | "new_direction" | "" (not yet chosen)
+        "pathway":               "",
+        # resolved: True once user marks initiative as complete via the Resolved pathway.
+        # Resolved initiatives are excluded from future carry-over suggestions.
+        "resolved":              False,
+        # completion_date: user-set date when resolved (YYYY-MM-DD).
+        # Populates the Completion Date column in the export.
+        "completion_date":       None,
     }
 
 def carryover_initiative(src: dict) -> dict:
@@ -978,10 +990,10 @@ def _sub_to_rows(username: str, sub: dict, include_user: bool) -> list[dict]:
             "_filing": fmt_month(rm),
             "_status": status,
             "_completion": (
-                ts_to_est(init["approved_at"], "%Y-%m-%d %H:%M")
-                if init.get("approved_at") else
-                datetime.fromtimestamp(sub["approved_at"] / 1000).strftime("%Y-%m-%d")
-                if sub.get("approved_at") else ""
+                init.get("completion_date") or
+                (ts_to_est(init["approved_at"], "%Y-%m-%d %H:%M") if init.get("approved_at") else
+                 datetime.fromtimestamp(sub["approved_at"] / 1000).strftime("%Y-%m-%d")
+                 if sub.get("approved_at") else "")
             ),
             "business_component":    init.get("business_component",    ""),
             "initiative_name":       init.get("initiative_name",        ""),
@@ -1637,8 +1649,12 @@ def screen_dashboard():
                                  help="This period is archived and locked." if is_archived else None):
                         st.session_state.wiz_init = dict(init)
                         st.session_state.wiz_step = 0
-                        st.session_state.wiz_mode = "edit"
-                        st.session_state.screen   = "wizard"
+                        # Carry-over initiatives go to the pathway selector first
+                        if init.get("carry_over") and not is_archived:
+                            st.session_state.screen = "pathway_select"
+                        else:
+                            st.session_state.wiz_mode = "edit"
+                            st.session_state.screen   = "wizard"
                         st.rerun()
                 with c3:
                     if st.button("📤 Submit for Review", key=f"usub_{iid}", disabled=submitted,
@@ -2221,17 +2237,32 @@ def screen_admin():
     # ═══════════════════════════════════════════════════════════════════════
     with tab_rollover:
         st.caption(
-            "Roll an **Approved** period forward into a new Filing Month. "
-            "Only approved reports can be rolled over — matching the Power Automate process "
-            "where rollover follows approval. The source period is automatically **Archived** "
-            "after rollover. Anyone who already has a real submission in the target period is "
-            "skipped, never overwritten."
+            "Only **Approved** reports can be rolled over. "
+            "The source period is automatically **Archived** after rollover. "
+            "Anyone who already has a real submission for the target period is skipped."
         )
 
         if not combos:
             st.info("No submissions to roll over yet.")
         else:
-            # Only approved/archived submissions are eligible to roll over
+            # Collect every eligible (entity, period) combo with rollable users
+            def _rollable_users_for(entity: str, src_month: str, target: str) -> list[str]:
+                """Returns list of usernames that can be rolled from src_month → target."""
+                out = []
+                for username, ud in all_data.items():
+                    sub = ud.get(src_month)
+                    if not sub or sub.get("entity") != entity:
+                        continue
+                    if sub.get("status") not in ("approved", "archived"):
+                        continue
+                    if not sub.get("initiatives"):
+                        continue
+                    existing = load_submission(username, target)
+                    if existing and existing.get("entity") == entity and existing.get("initiatives"):
+                        continue
+                    out.append(username)
+                return out
+
             eligible_combos = [
                 (e, rm) for e, rm in combos
                 if any(
@@ -2242,129 +2273,139 @@ def screen_admin():
             ]
 
             if not eligible_combos:
-                st.info(
-                    "No approved reports to roll over yet. "
-                    "Approve a report in the Submissions tab first."
-                )
+                st.info("No approved reports to roll over yet. Approve a report in the Submissions tab first.")
             else:
-                combo_labels_ro = {
-                    f"Entity {e} — Filing: {fmt_month(rm)}": (e, rm)
-                    for e, rm in eligible_combos
-                }
-                sorted_labels = sorted(
-                    combo_labels_ro.keys(),
-                    key=lambda l: combo_labels_ro[l][1],
-                    reverse=True,
-                )
+                ro1, ro2 = st.columns([3, 2])
 
-                # Default to the most recent eligible period that actually has
-                # users to roll over (at least one user who doesn't already have
-                # a real submission in the next month — nothing to do otherwise).
-                def _has_rollable_users(entity: str, src_month: str) -> bool:
-                    tgt = next_month_of(src_month)
-                    for username, ud in all_data.items():
-                        sub = ud.get(src_month)
-                        if not sub or sub.get("entity") != entity:
-                            continue
-                        if sub.get("status") not in ("approved", "archived"):
-                            continue
-                        if not sub.get("initiatives"):
-                            continue
-                        existing = load_submission(username, tgt)
-                        if not (existing and existing.get("entity") == entity
-                                and existing.get("initiatives")):
-                            return True
-                    return False
-
-                best_label = next(
-                    (l for l in sorted_labels if _has_rollable_users(*combo_labels_ro[l])),
-                    sorted_labels[0],
-                )
-                default_idx = sorted_labels.index(best_label)
-
-                src_label = st.selectbox(
-                    "Roll FROM (approved reports only)",
-                    sorted_labels,
-                    index=default_idx,
-                    key="ro_src_single",
-                )
-                src_entity, src_month = combo_labels_ro[src_label]
-
-                target_options = [m for m in available_months() if m > src_month]
-                default_target = next_month_of(src_month)
-                if default_target not in target_options:
-                    target_options = sorted(set(target_options) | {default_target})
-                target_options = sorted(target_options)
-
-                chosen_target = st.selectbox(
-                    "Roll TO (target Filing Month)",
-                    target_options,
-                    index=target_options.index(default_target) if default_target in target_options else 0,
-                    format_func=fmt_month,
-                    key=f"ro_target_single_{src_label}",
-                )
-
-                # Build preview
-                preview = []
-                for username, months in all_data.items():
-                    sub = months.get(src_month)
-                    if not sub or sub.get("entity") != src_entity:
-                        continue
-                    if sub.get("status") not in ("approved", "archived"):
-                        continue
-                    existing = load_submission(username, chosen_target)
-                    if existing and existing.get("entity") == src_entity and existing.get("initiatives"):
-                        continue
-                    inits = sub.get("initiatives") or []
-                    if inits:
-                        preview.append((username, [i.get("initiative_name", "Unnamed") for i in inits]))
-
-                if not preview:
-                    st.info("No users have active initiatives to roll over into this target period.")
-                else:
-                    st.markdown(
-                        f"**Preview — Entity {src_entity}: Filing {fmt_month(src_month)} "
-                        f"→ Filing {fmt_month(chosen_target)}**"
+                # ── Target Filing Month ──────────────────────────────────────
+                with ro2:
+                    st.markdown("**Roll TO — Target Filing Month**")
+                    # Suggest the month after the most recent eligible period
+                    latest_src = max(rm for _, rm in eligible_combos)
+                    all_targets = sorted(
+                        set(m for m in available_months() if m > min(rm for _, rm in eligible_combos))
+                        | {next_month_of(latest_src)}
+                    )
+                    default_tgt = next_month_of(latest_src)
+                    chosen_target = st.selectbox(
+                        "Target Filing Month",
+                        all_targets,
+                        index=all_targets.index(default_tgt) if default_tgt in all_targets else 0,
+                        format_func=fmt_month,
+                        key="ro_target_new",
+                        label_visibility="collapsed",
                     )
                     st.caption(
-                        f"After rollover: {fmt_month(src_month)} will be automatically **Archived**. "
-                        f"Users will find a pre-filled draft under {fmt_month(chosen_target)}."
+                        f"Source periods will be **Archived**. "
+                        f"Users land on {fmt_month(chosen_target)} on next login."
                     )
-                    st.write("")
 
-                    # Per-user rows with individual roll buttons
-                    # plus a "Roll All" button at the bottom for convenience
-                    for u, names in preview:
-                        pu1, pu2 = st.columns([5, 1.2])
-                        with pu1:
+                # ── Source selection — checkboxes grouped by entity then year ──
+                with ro1:
+                    st.markdown("**Roll FROM — Select periods to roll**")
+
+                    # Group eligible combos: entity → year → [months]
+                    from collections import defaultdict
+                    grouped: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
+                    for e, rm in sorted(eligible_combos, reverse=True):
+                        year = rm[:4]
+                        grouped[e][year].append(rm)
+
+                    # Checkbox state key: "ro_chk_{entity}_{month}"
+                    # Pre-tick periods that have rollable users for the chosen target
+                    selected_combos = []
+                    for entity in sorted(grouped.keys()):
+                        st.markdown(f"**Entity {entity}**")
+                        for year in sorted(grouped[entity].keys(), reverse=True):
+                            months_in_year = grouped[entity][year]
+
+                            # "Select all [year]" master checkbox
+                            all_key  = f"ro_all_{entity}_{year}"
+                            year_chks = [f"ro_chk_{entity}_{rm}" for rm in months_in_year]
+
+                            # Determine default: tick if there are rollable users
+                            def should_default(e, rm):
+                                return bool(_rollable_users_for(e, rm, chosen_target)) and rm < chosen_target
+
+                            # Render "select year" toggle
+                            all_currently = all(
+                                st.session_state.get(k, should_default(entity, months_in_year[i]))
+                                for i, k in enumerate(year_chks)
+                            )
+                            year_all = st.checkbox(
+                                f"  {year} — select all",
+                                value=all_currently,
+                                key=all_key,
+                            )
+
+                            for rm in months_in_year:
+                                chk_key = f"ro_chk_{entity}_{rm}"
+                                rollable = _rollable_users_for(e, rm, chosen_target)
+                                default_val = should_default(entity, rm)
+
+                                # If the year-all box was just toggled, cascade
+                                cur_val = st.session_state.get(chk_key, default_val)
+                                if year_all and not cur_val:
+                                    st.session_state[chk_key] = True
+                                elif not year_all and cur_val and all_currently:
+                                    st.session_state[chk_key] = False
+
+                                user_count = len(rollable)
+                                label = (
+                                    f"  {fmt_month(rm)}  —  "
+                                    + (f"{user_count} user{'s' if user_count!=1 else ''} ready"
+                                       if user_count else "nothing to roll")
+                                )
+                                checked = st.checkbox(
+                                    label,
+                                    value=st.session_state.get(chk_key, default_val),
+                                    key=chk_key,
+                                    disabled=(rm >= chosen_target),
+                                )
+                                if checked and rm < chosen_target and rollable:
+                                    selected_combos.append((entity, rm, rollable))
+
+                # ── Preview & Roll button ────────────────────────────────────
+                st.divider()
+
+                if not selected_combos:
+                    st.caption("No periods selected — tick one or more boxes above to begin.")
+                else:
+                    total_users = sum(len(r) for _, _, r in selected_combos)
+                    st.markdown(
+                        f"**Preview → Filing: {fmt_month(chosen_target)}**  "
+                        f"({len(selected_combos)} period{'s' if len(selected_combos)!=1 else ''}, "
+                        f"{total_users} submission{'s' if total_users!=1 else ''})"
+                    )
+                    for entity, src_month, rollable in selected_combos:
+                        st.markdown(f"&nbsp;&nbsp;**Entity {entity} — {fmt_month(src_month)}**", unsafe_allow_html=True)
+                        for u in rollable:
+                            inits = [
+                                i.get("initiative_name", "Unnamed")
+                                for i in (all_data.get(u, {}).get(src_month, {}).get("initiatives") or [])
+                            ]
                             st.markdown(
-                                f"&nbsp;&nbsp;• **{u}** — " + ", ".join(f"*{n}*" for n in names),
+                                f"&nbsp;&nbsp;&nbsp;&nbsp;• **{u}** — " + ", ".join(f"*{n}*" for n in inits),
                                 unsafe_allow_html=True,
                             )
-                        with pu2:
-                            if st.button("Roll →", key=f"roll_user_{src_month}_{chosen_target}_{u}"):
-                                rolled = rollover_entity(
-                                    {u: all_data[u]}, src_entity, src_month, chosen_target
-                                )
-                                if rolled:
-                                    st.success(f"✓ Rolled over for {u}.")
-                                    st.rerun()
 
                     st.write("")
-                    total_subs = len(preview)
-                    if total_subs > 1:
-                        if st.button(
-                            f"🔄 Roll Over All {total_subs} → Filing: {fmt_month(chosen_target)}",
-                            type="primary",
-                            key="do_rollover_all",
-                        ):
-                            rolled = rollover_entity(all_data, src_entity, src_month, chosen_target)
-                            if rolled:
-                                st.success(
-                                    f"✓ Rolled over for: {', '.join(rolled)}. "
-                                    f"{fmt_month(src_month)} has been archived."
-                                )
-                                st.rerun()
+                    if st.button(
+                        f"🔄 Roll Over {total_users} submission{'s' if total_users!=1 else ''} → Filing: {fmt_month(chosen_target)}",
+                        type="primary",
+                        key="do_rollover_multi",
+                    ):
+                        all_rolled = []
+                        for entity, src_month, rollable in selected_combos:
+                            subset = {u: all_data[u] for u in rollable if u in all_data}
+                            rolled = rollover_entity(subset, entity, src_month, chosen_target)
+                            all_rolled.extend(rolled)
+                        if all_rolled:
+                            st.success(
+                                f"✓ Rolled over for: {', '.join(all_rolled)}. "
+                                f"Source periods have been archived."
+                            )
+                            st.rerun()
 
     # ═══════════════════════════════════════════════════════════════════════
     # TAB: Export
@@ -2662,6 +2703,210 @@ def screen_admin():
                         st.rerun()
 
 
+# ── Pathway Screens ────────────────────────────────────────────────────────────
+
+def screen_pathway_select():
+    """
+    Shown before the wizard when a user edits a carry-over initiative.
+    Asks: what happened with this initiative this month?
+    Routes to the appropriate lightweight or full form.
+    """
+    user  = st.session_state.user
+    init  = st.session_state.wiz_init
+    draft = st.session_state.draft
+
+    st.markdown("## What happened with this initiative this month?")
+    st.markdown(
+        f"**{init.get('initiative_name', 'Unnamed')}** — *{init.get('business_component', '')}*"
+    )
+    st.divider()
+
+    existing_pathway = init.get("pathway", "")
+    if existing_pathway:
+        pathway_labels = {"continuing": "Still working on it",
+                          "resolved": "Resolved this month",
+                          "new_direction": "New direction"}
+        st.caption(f"Previously chose: **{pathway_labels.get(existing_pathway, existing_pathway)}** — select again to change.")
+        st.write("")
+
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+        st.markdown("### 🔄 Still working on it")
+        st.caption("Lightweight monthly update — about 90 seconds. Update activities and notes; all other details stay as-is.")
+        if st.button("Select →", key="pw_continuing", use_container_width=True, type="primary"):
+            st.session_state.wiz_init["pathway"] = "continuing"
+            st.session_state.screen = "continuing"
+            st.rerun()
+
+    with c2:
+        st.markdown("### ✅ Resolved this month")
+        st.caption("Capture the resolution and outcome — about 60 seconds. Sets a completion date; won't appear in future carry-overs.")
+        if st.button("Select →", key="pw_resolved", use_container_width=True):
+            st.session_state.wiz_init["pathway"] = "resolved"
+            st.session_state.screen = "resolved"
+            st.rerun()
+
+    with c3:
+        st.markdown("### 🔀 New direction")
+        st.caption("The scope or approach has fundamentally changed. Full structured entry — about 5 minutes.")
+        if st.button("Select →", key="pw_new_direction", use_container_width=True):
+            st.session_state.wiz_init["pathway"] = "new_direction"
+            st.session_state.wiz_mode = "edit"
+            st.session_state.wiz_step = 0
+            st.session_state.screen = "wizard"
+            st.rerun()
+
+    st.write("")
+    if st.button("← Back to dashboard", key="pw_back"):
+        st.session_state.screen = "dashboard"
+        st.rerun()
+
+
+def _save_initiative_update(user: str, init: dict):
+    """Save updated initiative back into the draft and return to dashboard."""
+    draft = st.session_state.draft
+    if not init.get("month_yr"):
+        init["month_yr"] = draft.get("activities_month") or draft.get("reporting_month", "")
+    draft["initiatives"] = [
+        i if i["id"] != init["id"] else init
+        for i in draft["initiatives"]
+    ]
+    save_draft(user, draft)
+    st.session_state.draft  = draft
+    st.session_state.screen = "dashboard"
+    st.rerun()
+
+
+def screen_continuing():
+    """Pathway 1 — Still Working On It. Prominent activities + notes; other fields collapsible."""
+    user  = st.session_state.user
+    init  = dict(st.session_state.wiz_init)
+
+    st.markdown(f"## 🔄 Monthly Update")
+    st.markdown(f"**{init.get('initiative_name', 'Unnamed')}** — *{init.get('business_component', '')}*")
+    st.caption("Update what you worked on this month. All other details from last month are pre-filled — change them only if something has shifted.")
+    st.divider()
+
+    activities = st.text_area(
+        "What did you work on this month? *",
+        value=init.get("activities", ""),
+        height=160,
+        placeholder="Describe the activities you carried out this month to advance this initiative...",
+        key="cont_activities",
+    )
+    notes = st.text_area(
+        "Notes (optional)",
+        value=init.get("notes", ""),
+        height=80,
+        placeholder="Any blockers, upcoming steps, or context worth noting...",
+        key="cont_notes",
+    )
+
+    st.write("")
+
+    with st.expander("✏ Update other details (optional)", expanded=False):
+        st.caption("These fields carried over from last month. Update if anything has changed.")
+        bc   = st.text_input("Business Component", value=init.get("business_component", ""), key="cont_bc")
+        name = st.text_input("Initiative Name",    value=init.get("initiative_name", ""),    key="cont_name")
+        desc = st.text_area("Initiative Description", value=init.get("initiative_description", ""), height=100, key="cont_desc")
+        unc  = st.text_area("Technical Uncertainty",  value=init.get("tech_uncertainty", ""),        height=100, key="cont_unc")
+        dc1, dc2 = st.columns(2)
+        with dc1:
+            sd = st.text_input("Start Date (YYYY-MM-DD)",         value=init.get("start_date") or "",         key="cont_sd")
+        with dc2:
+            ed = st.text_input("Expected End Date (YYYY-MM-DD)",  value=init.get("expected_end_date") or "",  key="cont_ed")
+        team = st.multiselect(
+            "Team Members", EMPLOYEES,
+            default=[m for m in (init.get("team_members") or []) if m in EMPLOYEES],
+            key="cont_team",
+        )
+
+    st.write("")
+    b1, b2 = st.columns([1, 1])
+    with b1:
+        if st.button("← Back", key="cont_back"):
+            st.session_state.screen = "pathway_select"
+            st.rerun()
+    with b2:
+        if st.button("Save Update ✓", type="primary", key="cont_save"):
+            if not activities.strip():
+                st.error("Please describe what you worked on this month.")
+            else:
+                init["activities"]             = activities.strip()
+                init["notes"]                  = notes.strip()
+                init["business_component"]     = st.session_state.get("cont_bc", init["business_component"])
+                init["initiative_name"]        = st.session_state.get("cont_name", init["initiative_name"])
+                init["initiative_description"] = st.session_state.get("cont_desc", init["initiative_description"])
+                init["tech_uncertainty"]       = st.session_state.get("cont_unc", init["tech_uncertainty"])
+                init["start_date"]             = st.session_state.get("cont_sd") or None
+                init["expected_end_date"]      = st.session_state.get("cont_ed") or None
+                init["team_members"]           = st.session_state.get("cont_team", init.get("team_members", []))
+                _save_initiative_update(user, init)
+
+
+def screen_resolved():
+    """Pathway 2 — Resolved This Month. Captures final activities, completion date, and outcome."""
+    user  = st.session_state.user
+    init  = dict(st.session_state.wiz_init)
+
+    st.markdown(f"## ✅ Resolution — {init.get('initiative_name', 'Unnamed')}")
+    st.markdown(f"*{init.get('business_component', '')}*")
+    st.caption("Capture what you did to reach resolution and the outcome. This initiative won't appear in next month's carry-over suggestions.")
+    st.divider()
+
+    activities = st.text_area(
+        "What activities led to resolution this month? *",
+        value=init.get("activities", ""),
+        height=140,
+        placeholder="Describe the final activities that eliminated the technical uncertainty...",
+        key="res_activities",
+    )
+    today_str = date.today().strftime("%Y-%m-%d")
+    completion_date = st.text_input(
+        "Completion Date (YYYY-MM-DD) *",
+        value=init.get("completion_date") or today_str,
+        key="res_completion",
+    )
+    outcome = st.text_area(
+        "Outcome / Notes *",
+        value=init.get("notes", ""),
+        height=120,
+        placeholder="Describe the outcome — what was resolved, what was learned, what the result was...",
+        key="res_outcome",
+    )
+
+    st.write("")
+    b1, b2 = st.columns([1, 1])
+    with b1:
+        if st.button("← Back", key="res_back"):
+            st.session_state.screen = "pathway_select"
+            st.rerun()
+    with b2:
+        if st.button("Save Resolution ✓", type="primary", key="res_save"):
+            errors = []
+            if not activities.strip():
+                errors.append("Please describe the activities that led to resolution.")
+            if not completion_date.strip():
+                errors.append("Please enter a completion date.")
+            else:
+                try:
+                    datetime.strptime(completion_date.strip(), "%Y-%m-%d")
+                except ValueError:
+                    errors.append("Completion date must be in YYYY-MM-DD format.")
+            if not outcome.strip():
+                errors.append("Please describe the outcome.")
+            if errors:
+                for e in errors:
+                    st.error(e)
+            else:
+                init["activities"]      = activities.strip()
+                init["notes"]           = outcome.strip()
+                init["completion_date"] = completion_date.strip()
+                init["resolved"]        = True
+                _save_initiative_update(user, init)
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -2674,6 +2919,12 @@ def main():
         screen_dashboard()
     elif screen == "wizard":
         screen_wizard()
+    elif screen == "pathway_select":
+        screen_pathway_select()
+    elif screen == "continuing":
+        screen_continuing()
+    elif screen == "resolved":
+        screen_resolved()
     elif screen == "admin":
         screen_admin()
 
