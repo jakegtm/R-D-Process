@@ -2237,32 +2237,13 @@ def screen_admin():
     # ═══════════════════════════════════════════════════════════════════════
     with tab_rollover:
         st.caption(
-            "Only **Approved** reports can be rolled over. "
-            "The source period is automatically **Archived** after rollover. "
-            "Anyone who already has a real submission for the target period is skipped."
+            "Only **Approved** reports can be rolled over. The source period is automatically "
+            "**Archived** after rollover. Anyone already in the target period is skipped."
         )
 
         if not combos:
             st.info("No submissions to roll over yet.")
         else:
-            # Collect every eligible (entity, period) combo with rollable users
-            def _rollable_users_for(entity: str, src_month: str, target: str) -> list[str]:
-                """Returns list of usernames that can be rolled from src_month → target."""
-                out = []
-                for username, ud in all_data.items():
-                    sub = ud.get(src_month)
-                    if not sub or sub.get("entity") != entity:
-                        continue
-                    if sub.get("status") not in ("approved", "archived"):
-                        continue
-                    if not sub.get("initiatives"):
-                        continue
-                    existing = load_submission(username, target)
-                    if existing and existing.get("entity") == entity and existing.get("initiatives"):
-                        continue
-                    out.append(username)
-                return out
-
             eligible_combos = [
                 (e, rm) for e, rm in combos
                 if any(
@@ -2275,110 +2256,137 @@ def screen_admin():
             if not eligible_combos:
                 st.info("No approved reports to roll over yet. Approve a report in the Submissions tab first.")
             else:
-                ro1, ro2 = st.columns([3, 2])
+                def _rollable_users_for(entity: str, src_month: str, target: str) -> list[str]:
+                    out = []
+                    for username, ud in all_data.items():
+                        sub = ud.get(src_month)
+                        if not sub or sub.get("entity") != entity:
+                            continue
+                        if sub.get("status") not in ("approved", "archived"):
+                            continue
+                        if not sub.get("initiatives"):
+                            continue
+                        existing = load_submission(username, target)
+                        if existing and existing.get("entity") == entity and existing.get("initiatives"):
+                            continue
+                        out.append(username)
+                    return out
 
-                # ── Target Filing Month ──────────────────────────────────────
-                with ro2:
-                    st.markdown("**Roll TO — Target Filing Month**")
-                    # Suggest the month after the most recent eligible period
-                    latest_src = max(rm for _, rm in eligible_combos)
-                    all_targets = sorted(
-                        set(m for m in available_months() if m > min(rm for _, rm in eligible_combos))
-                        | {next_month_of(latest_src)}
-                    )
-                    default_tgt = next_month_of(latest_src)
-                    chosen_target = st.selectbox(
-                        "Target Filing Month",
-                        all_targets,
-                        index=all_targets.index(default_tgt) if default_tgt in all_targets else 0,
-                        format_func=fmt_month,
-                        key="ro_target_new",
-                        label_visibility="collapsed",
-                    )
-                    st.caption(
-                        f"Source periods will be **Archived**. "
-                        f"Users land on {fmt_month(chosen_target)} on next login."
-                    )
+                from collections import defaultdict
+                grouped: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
+                for e, rm in sorted(eligible_combos, reverse=True):
+                    grouped[e][rm[:4]].append(rm)
 
-                # ── Source selection — checkboxes grouped by entity then year ──
-                with ro1:
-                    st.markdown("**Roll FROM — Select periods to roll**")
+                st.markdown("**Select periods to roll — choose a target month for each:**")
+                st.caption("Check a period to include it in the rollover. Each period can roll to a different target month.")
+                st.write("")
 
-                    # Group eligible combos: entity → year → [months]
-                    from collections import defaultdict
-                    grouped: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
-                    for e, rm in sorted(eligible_combos, reverse=True):
-                        year = rm[:4]
-                        grouped[e][year].append(rm)
+                # Render: entity → year group → individual period rows
+                # Each checked row shows an inline target month picker
+                selections = []   # (entity, src_month, chosen_target, rollable_users)
 
-                    # Checkbox state key: "ro_chk_{entity}_{month}"
-                    # Pre-tick periods that have rollable users for the chosen target
-                    selected_combos = []
-                    for entity in sorted(grouped.keys()):
+                for entity in sorted(grouped.keys()):
+                    with st.container():
                         st.markdown(f"**Entity {entity}**")
+
                         for year in sorted(grouped[entity].keys(), reverse=True):
                             months_in_year = grouped[entity][year]
 
-                            # "Select all [year]" master checkbox
-                            all_key  = f"ro_all_{entity}_{year}"
-                            year_chks = [f"ro_chk_{entity}_{rm}" for rm in months_in_year]
-
-                            # Determine default: tick if there are rollable users
-                            def should_default(e, rm):
-                                return bool(_rollable_users_for(e, rm, chosen_target)) and rm < chosen_target
-
-                            # Render "select year" toggle
-                            all_currently = all(
-                                st.session_state.get(k, should_default(entity, months_in_year[i]))
-                                for i, k in enumerate(year_chks)
+                            # Year-level "select all" toggle
+                            year_all_key = f"ro_all_{entity}_{year}"
+                            # Default: check years that have any rollable period
+                            any_rollable = any(
+                                _rollable_users_for(entity, rm, next_month_of(rm))
+                                for rm in months_in_year
                             )
                             year_all = st.checkbox(
                                 f"  {year} — select all",
-                                value=all_currently,
-                                key=all_key,
+                                value=st.session_state.get(year_all_key, any_rollable),
+                                key=year_all_key,
                             )
 
                             for rm in months_in_year:
                                 chk_key = f"ro_chk_{entity}_{rm}"
-                                rollable = _rollable_users_for(e, rm, chosen_target)
-                                default_val = should_default(entity, rm)
+                                tgt_key = f"ro_target_{entity}_{rm}"
 
-                                # If the year-all box was just toggled, cascade
-                                cur_val = st.session_state.get(chk_key, default_val)
-                                if year_all and not cur_val:
+                                # Default target = next month after source
+                                default_tgt = next_month_of(rm)
+
+                                # If year-all toggled on, force this period checked
+                                if year_all:
                                     st.session_state[chk_key] = True
-                                elif not year_all and cur_val and all_currently:
-                                    st.session_state[chk_key] = False
 
-                                user_count = len(rollable)
-                                label = (
-                                    f"  {fmt_month(rm)}  —  "
-                                    + (f"{user_count} user{'s' if user_count!=1 else ''} ready"
-                                       if user_count else "nothing to roll")
-                                )
-                                checked = st.checkbox(
-                                    label,
-                                    value=st.session_state.get(chk_key, default_val),
-                                    key=chk_key,
-                                    disabled=(rm >= chosen_target),
-                                )
-                                if checked and rm < chosen_target and rollable:
-                                    selected_combos.append((entity, rm, rollable))
+                                is_checked = st.session_state.get(chk_key, year_all)
 
-                # ── Preview & Roll button ────────────────────────────────────
+                                # Build this period's row: [checkbox | label] [→ target picker if checked]
+                                row_cols = st.columns([0.05, 2.2, 0.15, 1.6])
+
+                                with row_cols[0]:
+                                    checked = st.checkbox(
+                                        "##",
+                                        value=is_checked,
+                                        key=chk_key,
+                                        label_visibility="collapsed",
+                                    )
+
+                                with row_cols[1]:
+                                    rollable_for_default = _rollable_users_for(entity, rm, default_tgt)
+                                    user_label = (
+                                        f"{len(rollable_for_default)} user{'s' if len(rollable_for_default)!=1 else ''} ready"
+                                        if rollable_for_default else "nothing to roll"
+                                    )
+                                    color = "#2D6A2D" if rollable_for_default else "#999"
+                                    st.markdown(
+                                        f'<span style="font-size:15px;">{fmt_month(rm)}</span>'
+                                        f'&nbsp;&nbsp;<span style="font-size:13px;color:{color};">{user_label}</span>',
+                                        unsafe_allow_html=True,
+                                    )
+
+                                if checked:
+                                    with row_cols[2]:
+                                        st.markdown('<span style="font-size:18px;">→</span>', unsafe_allow_html=True)
+
+                                    with row_cols[3]:
+                                        # Target options: only months strictly after this source
+                                        tgt_options = sorted(
+                                            set(m for m in available_months() if m > rm)
+                                            | {default_tgt}
+                                        )
+                                        cur_tgt = st.session_state.get(tgt_key, default_tgt)
+                                        if cur_tgt not in tgt_options:
+                                            cur_tgt = default_tgt
+                                        chosen_tgt = st.selectbox(
+                                            "##",
+                                            tgt_options,
+                                            index=tgt_options.index(cur_tgt),
+                                            format_func=fmt_month,
+                                            key=tgt_key,
+                                            label_visibility="collapsed",
+                                        )
+                                        # Compute actual rollable users for the chosen target
+                                        rollable = _rollable_users_for(entity, rm, chosen_tgt)
+                                        if rollable:
+                                            selections.append((entity, rm, chosen_tgt, rollable))
+                                        elif rollable_for_default:
+                                            st.caption("⚠ Already have data for this target")
+
+                        st.write("")
+
                 st.divider()
 
-                if not selected_combos:
-                    st.caption("No periods selected — tick one or more boxes above to begin.")
+                if not selections:
+                    st.caption("No periods selected with rollable users — tick checkboxes above to begin.")
                 else:
-                    total_users = sum(len(r) for _, _, r in selected_combos)
+                    total_users = sum(len(r) for _, _, _, r in selections)
                     st.markdown(
-                        f"**Preview → Filing: {fmt_month(chosen_target)}**  "
-                        f"({len(selected_combos)} period{'s' if len(selected_combos)!=1 else ''}, "
-                        f"{total_users} submission{'s' if total_users!=1 else ''})"
+                        f"**Preview** — {len(selections)} rollover{'s' if len(selections)!=1 else ''}, "
+                        f"{total_users} submission{'s' if total_users!=1 else ''} total"
                     )
-                    for entity, src_month, rollable in selected_combos:
-                        st.markdown(f"&nbsp;&nbsp;**Entity {entity} — {fmt_month(src_month)}**", unsafe_allow_html=True)
+                    for entity, src_month, tgt, rollable in selections:
+                        st.markdown(
+                            f"&nbsp;&nbsp;**Entity {entity}:** {fmt_month(src_month)} → **{fmt_month(tgt)}**",
+                            unsafe_allow_html=True,
+                        )
                         for u in rollable:
                             inits = [
                                 i.get("initiative_name", "Unnamed")
@@ -2391,23 +2399,24 @@ def screen_admin():
 
                     st.write("")
                     if st.button(
-                        f"🔄 Roll Over {total_users} submission{'s' if total_users!=1 else ''} → Filing: {fmt_month(chosen_target)}",
+                        f"🔄 Roll Forward {total_users} submission{'s' if total_users!=1 else ''}",
                         type="primary",
-                        key="do_rollover_multi",
+                        key="do_rollover_dynamic",
                     ):
                         all_rolled = []
-                        for entity, src_month, rollable in selected_combos:
+                        for entity, src_month, tgt, rollable in selections:
                             subset = {u: all_data[u] for u in rollable if u in all_data}
-                            rolled = rollover_entity(subset, entity, src_month, chosen_target)
+                            rolled = rollover_entity(subset, entity, src_month, tgt)
                             all_rolled.extend(rolled)
                         if all_rolled:
+                            targets = sorted({tgt for _, _, tgt, _ in selections})
                             st.success(
                                 f"✓ Rolled over for: {', '.join(all_rolled)}. "
                                 f"Source periods have been archived."
                             )
                             st.rerun()
 
-    # ═══════════════════════════════════════════════════════════════════════
+
     # TAB: Export
     # ═══════════════════════════════════════════════════════════════════════
     with tab_export:
