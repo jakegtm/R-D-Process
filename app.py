@@ -2822,7 +2822,7 @@ def screen_pathway_select():
 
     with c1:
         st.markdown("### 🔄 Still working on it")
-        st.caption("Lightweight monthly update — about 90 seconds. Update activities and notes; all other details stay as-is.")
+        st.caption("Lightweight monthly update. Update activities and notes; all other details carry over as-is.")
         if st.button("Select →", key="pw_continuing", use_container_width=True, type="primary"):
             st.session_state.wiz_init["pathway"] = "continuing"
             st.session_state.screen = "continuing"
@@ -2830,7 +2830,7 @@ def screen_pathway_select():
 
     with c2:
         st.markdown("### ✅ Resolved this month")
-        st.caption("Capture the resolution and outcome — about 60 seconds. Sets a completion date; won't appear in future carry-overs.")
+        st.caption("Capture the resolution and outcome. Sets a completion date; won't appear in future carry-overs.")
         if st.button("Select →", key="pw_resolved", use_container_width=True):
             st.session_state.wiz_init["pathway"] = "resolved"
             st.session_state.screen = "resolved"
@@ -2838,7 +2838,7 @@ def screen_pathway_select():
 
     with c3:
         st.markdown("### 🔀 New direction")
-        st.caption("The scope or approach has fundamentally changed. Full structured entry — about 5 minutes.")
+        st.caption("The scope or approach has fundamentally changed. Full structured entry — same as adding a new initiative.")
         if st.button("Select →", key="pw_new_direction", use_container_width=True):
             st.session_state.wiz_init["pathway"] = "new_direction"
             st.session_state.wiz_mode = "edit"
