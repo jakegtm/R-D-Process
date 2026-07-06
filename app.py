@@ -269,6 +269,26 @@ def add_custom_entity(new_entity: str) -> bool:
     return True
 
 
+def permissions_path() -> Path:
+    return DATA_DIR / "permissions.json"
+
+def load_permissions() -> dict:
+    """Returns {username: [entity_list]} — empty list means user sees all entities."""
+    p = permissions_path()
+    return json.loads(p.read_text()) if p.exists() else {}
+
+def save_permissions(perms: dict):
+    permissions_path().write_text(json.dumps(perms, indent=2))
+
+def get_user_entities(username: str) -> list[str]:
+    """Returns the entities this user is permitted to see.
+    If no restriction is configured, returns all entities."""
+    perms = load_permissions()
+    if username not in perms or not perms[username]:
+        return all_entities()
+    return [e for e in perms[username] if e in all_entities()]
+
+
 def months_index_path(username: str) -> Path:
     return DATA_DIR / f"{_safe_name(username)}_months.json"
 
@@ -1404,7 +1424,7 @@ def screen_dashboard():
             mlist = sorted(set(mlist) | {cur_draft_rm}, reverse=True)
 
         with su1:
-            entity_options = all_entities() + ["+ Add new entity..."]
+            entity_options = get_user_entities(user) + ["+ Add new entity..."]
             eidx = entity_options.index(draft["entity"]) if draft.get("entity") in entity_options else 0
             entity_pick = st.selectbox("Entity", entity_options, index=eidx, key="su_entity")
 
@@ -1935,14 +1955,26 @@ def screen_admin():
 
     st.write("")
 
-    tab_submissions, tab_rollover, tab_export, tab_backup = st.tabs(
-        ["📁 Submissions", "🔄 Rollover", "⬇ Export", "🗄 Backup & Data"]
+    # ── Navigation — radio stores the tab in session state so widget interactions
+    # inside a section don't reset back to Submissions on every rerun. ─────────
+    ADMIN_TABS = ["📁 Submissions", "🔄 Rollover", "⬇ Export", "🗄 Backup & Data", "⚙ Settings"]
+    if "admin_tab" not in st.session_state:
+        st.session_state.admin_tab = ADMIN_TABS[0]
+    active_tab = st.radio(
+        "##nav",
+        ADMIN_TABS,
+        index=ADMIN_TABS.index(st.session_state.admin_tab),
+        horizontal=True,
+        label_visibility="collapsed",
+        key="admin_tab_radio",
     )
+    st.session_state.admin_tab = active_tab
+    st.write("")
 
-    # ═══════════════════════════════════════════════════════════════════════
-    # TAB: Submissions
-    # ═══════════════════════════════════════════════════════════════════════
-    with tab_submissions:
+    # ── Show only the active section ──────────────────────────────────────────
+    # (Previously used st.tabs which resets on every widget rerun inside a tab)
+
+    if active_tab == "📁 Submissions":
         if not combos:
             st.info("No submissions found yet.")
         else:
@@ -2232,10 +2264,8 @@ def screen_admin():
 
                 st.write("")
 
-    # ═══════════════════════════════════════════════════════════════════════
-    # TAB: Rollover
-    # ═══════════════════════════════════════════════════════════════════════
-    with tab_rollover:
+
+    if active_tab == "🔄 Rollover":
         st.caption(
             "Only **Approved** reports can be rolled over. The source period is automatically "
             "**Archived** after rollover. Anyone already in the target period is skipped."
@@ -2347,9 +2377,17 @@ def screen_admin():
                                         st.markdown('<span style="font-size:18px;">→</span>', unsafe_allow_html=True)
 
                                     with row_cols[3]:
-                                        # Target options: only months strictly after this source
+                                        # Target options: all months from source+1 up to 12 months forward
+                                        # (not limited to available_months' normal window)
+                                        import datetime as _dt
+                                        _base = _dt.date.today()
+                                        _ext  = [
+                                            f"{(_base.year + ((_base.month + i - 1) // 12))}"
+                                            f"-{str((_base.month - 1 + i) % 12 + 1).zfill(2)}"
+                                            for i in range(1, 14)
+                                        ]
                                         tgt_options = sorted(
-                                            set(m for m in available_months() if m > rm)
+                                            set(m for m in (_ext + available_months()) if m > rm)
                                             | {default_tgt}
                                         )
                                         cur_tgt = st.session_state.get(tgt_key, default_tgt)
@@ -2417,9 +2455,7 @@ def screen_admin():
                             st.rerun()
 
 
-    # TAB: Export
-    # ═══════════════════════════════════════════════════════════════════════
-    with tab_export:
+    if active_tab == "⬇ Export":
         if not combos:
             st.info("No submissions found yet.")
         else:
@@ -2561,10 +2597,8 @@ def screen_admin():
             elif chosen_combos and chosen_status_keys:
                 st.caption("No reports match this combination — nothing to download yet.")
 
-    # ═══════════════════════════════════════════════════════════════════════
-    # TAB: Backup & Data
-    # ═══════════════════════════════════════════════════════════════════════
-    with tab_backup:
+
+    if active_tab == "🗄 Backup & Data":
         backup_date = datetime.now().strftime("%m%d%y")
 
         st.markdown("**Backup**")
@@ -2710,6 +2744,60 @@ def screen_admin():
                             + (f"Skipped {len(result['skipped'])} (already had data)." if result["skipped"] else "")
                         )
                         st.rerun()
+
+    if active_tab == "⚙ Settings":
+        st.markdown("**Entity Permissions**")
+        st.caption(
+            "By default, team members can see all entities. Set restrictions here "
+            "to limit which entities each user can file reports for. "
+            "Admins always see everything regardless of permissions."
+        )
+
+        all_ents = all_entities()
+        perms = load_permissions()
+        employees_list = [e for e in EMPLOYEES if e != "Admin"]
+
+        changed = False
+        for emp in employees_list:
+            current = perms.get(emp, [])
+            # Empty = all entities
+            col1, col2 = st.columns([2, 4])
+            with col1:
+                st.markdown(f"**{emp}**")
+            with col2:
+                sel = st.multiselect(
+                    f"##perm_{emp}",
+                    all_ents,
+                    default=current if current else all_ents,
+                    key=f"perm_{emp}",
+                    label_visibility="collapsed",
+                    placeholder="All entities (no restriction)",
+                )
+                # If they selected everything, treat as "no restriction" (empty list)
+                new_perm = [] if set(sel) == set(all_ents) else sel
+                if new_perm != current:
+                    perms[emp] = new_perm
+                    changed = True
+
+        st.write("")
+        if changed:
+            save_permissions(perms)
+            st.success("✓ Permissions saved.")
+
+        st.divider()
+        st.markdown("**Current Restrictions** (users with fewer than all entities):")
+        restricted = {u: v for u, v in perms.items() if v}
+        if not restricted:
+            st.caption("No restrictions set — all users can see all entities.")
+        else:
+            for u, ents in restricted.items():
+                st.markdown(f"&nbsp;&nbsp;• **{u}**: {', '.join(ents)}", unsafe_allow_html=True)
+
+        st.write("")
+        if st.button("Reset all to default (all entities)", key="reset_perms"):
+            save_permissions({})
+            st.success("✓ All permissions reset to default.")
+            st.rerun()
 
 
 # ── Pathway Screens ────────────────────────────────────────────────────────────
