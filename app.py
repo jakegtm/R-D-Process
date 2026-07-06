@@ -2459,32 +2459,7 @@ def screen_admin():
         if not combos:
             st.info("No submissions found yet.")
         else:
-            st.caption(
-                "Build a custom export by choosing which periods/entities and which "
-                "statuses to include. Excel gets one tab per entity."
-            )
-
-            # ── 1. Periods / Entities ────────────────────────────────────────
-            st.markdown("**1. Periods & Entities**")
-            combo_labels = {f"Entity {e} — Filing: {fmt_month(rm)}": (e, rm) for e, rm in combos}
-            all_labels   = list(combo_labels.keys())
-
-            sel_all_periods = st.checkbox("Include all periods/entities", value=True, key="sel_all_periods")
-            if sel_all_periods:
-                chosen_labels = all_labels
-            else:
-                chosen_labels = st.multiselect(
-                    "Choose specific periods/entities:",
-                    all_labels,
-                    default=all_labels,
-                    key="chosen_period_labels",
-                )
-            chosen_combos = [combo_labels[l] for l in chosen_labels]
-
-            st.write("")
-
-            # ── 2. Status filter (checkbox dropdown) ──────────────────────────
-            st.markdown("**2. Status**")
+            from collections import defaultdict as _dd
             status_options = ["In Progress", "Ready for Review", "Approved", "Archived", "Rejected"]
             status_key_map = {
                 "In Progress":     "in-progress",
@@ -2493,104 +2468,121 @@ def screen_admin():
                 "Archived":        "archived",
                 "Rejected":        "rejected",
             }
-
             if "export_status_sel" not in st.session_state:
                 st.session_state.export_status_sel = ["Ready for Review", "Approved", "Archived"]
 
-            # Quick preset buttons — no key-clearing needed since checkboxes below use no key
-            pc1, pc2, pc3, pc4 = st.columns(4)
-            with pc1:
-                if st.button("All statuses", key="preset_all"):
-                    st.session_state.export_status_sel = status_options.copy()
-                    st.rerun()
-            with pc2:
-                if st.button("Closed out only", key="preset_closed", help="Approved + Archived"):
-                    st.session_state.export_status_sel = ["Approved", "Archived"]
-                    st.rerun()
-            with pc3:
-                if st.button("Needs action", key="preset_action", help="In Progress + Rejected"):
-                    st.session_state.export_status_sel = ["In Progress", "Rejected"]
-                    st.rerun()
-            with pc4:
-                if st.button("Reviewed only", key="preset_reviewed",
-                             help="Ready for Review + Approved + Archived"):
-                    st.session_state.export_status_sel = ["Ready for Review", "Approved", "Archived"]
-                    st.rerun()
+            ex_left, ex_right = st.columns([1, 1])
 
-            # Checkbox dropdown using NO key on each checkbox — this ensures the `value`
-            # parameter always controls what's shown, so preset buttons work instantly
-            # without Streamlit's widget cache overriding the new selection.
-            n_sel = len(st.session_state.export_status_sel)
-            n_tot = len(status_options)
-            button_label = (
-                "☑ All statuses selected ▾" if n_sel == n_tot else
-                f"☑ {n_sel} of {n_tot} statuses selected ▾" if n_sel > 0 else
-                "☐ No statuses selected ▾"
-            )
-            new_sel = list(st.session_state.export_status_sel)
-            with st.popover(button_label, use_container_width=True):
+            # ── LEFT: Periods & Entities (checkboxes grouped by entity → year) ──
+            with ex_left:
+                st.markdown("**1. Periods & Entities**")
+
+                # Group combos: entity → year → [months]
+                ex_grouped = _dd(lambda: _dd(list))
+                for e, rm in sorted(combos, reverse=True):
+                    ex_grouped[e][rm[:4]].append(rm)
+
+                chosen_combos = []
+                for entity in sorted(ex_grouped.keys()):
+                    st.markdown(f"**Entity {entity}**")
+                    for year in sorted(ex_grouped[entity].keys(), reverse=True):
+                        months_in_year = ex_grouped[entity][year]
+                        year_all_key = f"ex_all_{entity}_{year}"
+
+                        # "Select year" master checkbox — default on
+                        year_all = st.checkbox(
+                            f"  {year} — select all",
+                            value=st.session_state.get(year_all_key, True),
+                            key=year_all_key,
+                        )
+                        for rm in months_in_year:
+                            chk_key = f"ex_chk_{entity}_{rm}"
+                            if year_all:
+                                st.session_state[chk_key] = True
+                            chk = st.checkbox(
+                                f"  {fmt_month(rm)}",
+                                value=st.session_state.get(chk_key, True),
+                                key=chk_key,
+                            )
+                            if chk:
+                                chosen_combos.append((entity, rm))
+                    st.write("")
+
+            # ── RIGHT: Status (flat checkboxes, fully visible) ───────────────
+            with ex_right:
+                st.markdown("**2. Status**")
+
+                # Preset buttons
+                pr1, pr2 = st.columns(2)
+                pr3, pr4 = st.columns(2)
+                with pr1:
+                    if st.button("All", key="preset_all", use_container_width=True):
+                        st.session_state.export_status_sel = status_options.copy(); st.rerun()
+                with pr2:
+                    if st.button("Closed out", key="preset_closed", use_container_width=True, help="Approved + Archived"):
+                        st.session_state.export_status_sel = ["Approved","Archived"]; st.rerun()
+                with pr3:
+                    if st.button("Needs action", key="preset_action", use_container_width=True, help="In Progress + Rejected"):
+                        st.session_state.export_status_sel = ["In Progress","Rejected"]; st.rerun()
+                with pr4:
+                    if st.button("Reviewed", key="preset_reviewed", use_container_width=True, help="Ready for Review + Approved + Archived"):
+                        st.session_state.export_status_sel = ["Ready for Review","Approved","Archived"]; st.rerun()
+
+                st.write("")
+                # Flat visible checkboxes — no popover, no hidden state
+                new_sel = list(st.session_state.export_status_sel)
                 for opt in status_options:
-                    checked = st.checkbox(opt, value=opt in new_sel)
-                    if checked and opt not in new_sel:
+                    chk = st.checkbox(opt, value=opt in new_sel, key=f"st_chk_{opt}")
+                    if chk and opt not in new_sel:
                         new_sel.append(opt)
-                    elif not checked and opt in new_sel:
+                    elif not chk and opt in new_sel:
                         new_sel.remove(opt)
-            if new_sel != st.session_state.export_status_sel:
-                st.session_state.export_status_sel = new_sel
-                st.rerun()
+                if new_sel != st.session_state.export_status_sel:
+                    st.session_state.export_status_sel = new_sel
+                    st.rerun()
+                chosen_statuses_display = st.session_state.export_status_sel
+                chosen_status_keys = [status_key_map[s] for s in chosen_statuses_display]
 
-            chosen_statuses_display = st.session_state.export_status_sel
-            if chosen_statuses_display:
-                st.caption("Selected: " + ", ".join(chosen_statuses_display))
-            chosen_status_keys = [status_key_map[s] for s in chosen_statuses_display]
+            st.divider()
 
-            st.write("")
-
-            # ── 3. Live summary of what will be included ─────────────────────
-            st.markdown("**3. Summary**")
-            matched_rows  = 0
-            matched_users = set()
-            matched_inits = 0
+            # ── Summary ───────────────────────────────────────────────────────
+            matched_rows = matched_inits = 0
+            matched_users: set = set()
             for entity, rm in chosen_combos:
                 for username, months in all_data.items():
                     sub = months.get(rm)
-                    if not sub or sub.get("entity") != entity:
-                        continue
-                    if sub.get("status") not in chosen_status_keys:
-                        continue
+                    if not sub or sub.get("entity") != entity: continue
+                    if sub.get("status") not in chosen_status_keys: continue
                     inits = sub.get("initiatives") or []
-                    if not inits:
-                        continue
-                    matched_rows += 1
-                    matched_users.add(username)
-                    matched_inits += len(inits)
+                    if not inits: continue
+                    matched_rows += 1; matched_users.add(username); matched_inits += len(inits)
 
             if not chosen_combos or not chosen_status_keys:
-                st.warning("Select at least one period/entity and one status to export.")
+                st.warning("Select at least one period and one status to export.")
             else:
                 unique_entities = sorted({e for e,_ in chosen_combos})
                 sc1, sc2, sc3, sc4 = st.columns(4)
-                sc1.metric("Entities", len(unique_entities))
-                sc2.metric("Reports", matched_rows)
-                sc3.metric("Users", len(matched_users))
+                sc1.metric("Entities",    len(unique_entities))
+                sc2.metric("Reports",     matched_rows)
+                sc3.metric("Users",       len(matched_users))
                 sc4.metric("Initiatives", matched_inits)
-                tab_preview = ", ".join(f'"Entity {e}"' for e in unique_entities)
-                st.caption(f"Excel tabs: {tab_preview}")
+                st.caption("Excel tabs: " + ", ".join(f'"Entity {e}"' for e in unique_entities))
 
             st.write("")
 
-            # ── 4. Download ───────────────────────────────────────────────────
-            st.markdown("**4. Download**")
+            # ── Download ──────────────────────────────────────────────────────
             today = datetime.now().strftime("%m%d%y")
-            status_tag = "_".join(s.replace(" ","") for s in chosen_statuses_display) if len(chosen_statuses_display) < len(status_options) else "AllStatuses"
+            status_tag = (
+                "_".join(s.replace(" ","") for s in chosen_statuses_display)
+                if len(chosen_statuses_display) < len(status_options) else "AllStatuses"
+            )
             fname = f"Consolidated_Report_{status_tag}_{today}.xlsx"
 
             if chosen_combos and chosen_status_keys and matched_rows > 0:
                 xlsx = build_excel_consolidated(all_data, chosen_combos, status_filter=chosen_status_keys)
                 st.download_button(
                     f"↓ Download Consolidated Report ({matched_rows} report{'s' if matched_rows!=1 else ''})",
-                    data=xlsx,
-                    file_name=fname,
+                    data=xlsx, file_name=fname,
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     type="primary",
                 )
