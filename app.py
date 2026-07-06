@@ -2512,22 +2512,6 @@ def screen_admin():
             with ex_right:
                 st.markdown("**2. Status**")
 
-                # Preset buttons
-                pr1, pr2 = st.columns(2)
-                pr3, pr4 = st.columns(2)
-                with pr1:
-                    if st.button("All", key="preset_all", use_container_width=True):
-                        st.session_state.export_status_sel = status_options.copy(); st.rerun()
-                with pr2:
-                    if st.button("Closed out", key="preset_closed", use_container_width=True, help="Approved + Archived"):
-                        st.session_state.export_status_sel = ["Approved","Archived"]; st.rerun()
-                with pr3:
-                    if st.button("Needs action", key="preset_action", use_container_width=True, help="In Progress + Rejected"):
-                        st.session_state.export_status_sel = ["In Progress","Rejected"]; st.rerun()
-                with pr4:
-                    if st.button("Reviewed", key="preset_reviewed", use_container_width=True, help="Ready for Review + Approved + Archived"):
-                        st.session_state.export_status_sel = ["Ready for Review","Approved","Archived"]; st.rerun()
-
                 st.write("")
                 # Flat visible checkboxes — no popover, no hidden state
                 new_sel = list(st.session_state.export_status_sel)
