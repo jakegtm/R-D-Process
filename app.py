@@ -2768,7 +2768,7 @@ def screen_admin():
             fname = f"Consolidated_Report_{status_tag}_{today}.xlsx"
 
             if chosen_combos and chosen_status_keys and matched_rows > 0:
-                xlsx = build_excel_consolidated(all_data, chosen_combos, status_filter=chosen_status_keys, group_by="user")
+                xlsx = build_excel_consolidated(all_data, chosen_combos, status_filter=chosen_status_keys, group_by="entity")
                 st.download_button(
                     f"↓ Download Consolidated Report ({matched_rows} report{'s' if matched_rows!=1 else ''})",
                     data=xlsx, file_name=fname,
