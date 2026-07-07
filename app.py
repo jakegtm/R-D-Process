@@ -2941,7 +2941,10 @@ def screen_admin():
         changed = False
         for emp in employees_list:
             current = perms.get(emp, [])
-            # Empty = all entities
+            # Seed widget key on first render or after reset
+            perm_key = f"perm_{emp}"
+            if perm_key not in st.session_state:
+                st.session_state[perm_key] = current if current else all_ents
             col1, col2 = st.columns([2, 4])
             with col1:
                 st.markdown(f"**{emp}**")
@@ -2949,13 +2952,12 @@ def screen_admin():
                 sel = st.multiselect(
                     f"##perm_{emp}",
                     all_ents,
-                    default=current if current else all_ents,
-                    key=f"perm_{emp}",
+                    key=perm_key,
                     label_visibility="collapsed",
                     placeholder="All entities (no restriction)",
                 )
                 # If they selected everything, treat as "no restriction" (empty list)
-                new_perm = [] if set(sel) == set(all_ents) else sel
+                new_perm = [] if set(sel) == set(all_ents) else list(sel)
                 if new_perm != current:
                     perms[emp] = new_perm
                     changed = True
@@ -2977,7 +2979,10 @@ def screen_admin():
         st.write("")
         if st.button("Reset all to default (all entities)", key="reset_perms"):
             save_permissions({})
-            st.success("✓ All permissions reset to default.")
+            # Clear the multiselect widget cache so they re-render
+            # with all entities selected instead of the old restricted values
+            for emp in employees_list:
+                st.session_state.pop(f"perm_{emp}", None)
             st.rerun()
 
 
