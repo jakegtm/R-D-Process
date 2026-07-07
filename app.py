@@ -811,6 +811,9 @@ def rollover_entity(
             "entity":           source_entity,
             "reporting_month":  target_month,
             "activities_month": prev_month_of(target_month),
+            # Tracks that this draft was created by admin rollover, not the user.
+            # Used to show the user a notification on login.
+            "rolled_over_from": source_month,
         }
         save_draft(username, new_sub)
 
@@ -1344,12 +1347,15 @@ def render_user_reminder(user: str, current_filing_month: str = ""):
             continue
         sub = load_submission(user, month)
         if sub and sub.get("initiatives") and sub.get("status") == "in-progress":
-            pending_periods.append(month)
+            pending_periods.append((month, bool(sub.get("rolled_over_from"))))
 
     if pending_periods:
-        period_list = ", ".join(f"**{fmt_month(m)}**" for m in sorted(pending_periods))
+        parts = []
+        for month, was_rolled in pending_periods:
+            label = f"**{fmt_month(month)}**" + (" *(rolled over by admin)*" if was_rolled else "")
+            parts.append(label)
         st.warning(
-            f"⚠ You have an unsubmitted report for {period_list}. "
+            f"⚠ You have an unsubmitted report for {', '.join(parts)}. "
             "Open **Report Setup** above, select that Filing Month, "
             "review your initiatives, and click **Submit for Review**."
         )
@@ -1424,6 +1430,19 @@ def screen_dashboard():
 
     st.divider()
     render_user_reminder(user, current_filing_month=draft.get("reporting_month", ""))
+
+    # ── Rollover notification ─────────────────────────────────────────────────
+    # Show a clear banner when the current draft was created by admin rollover
+    # and hasn't been submitted yet — so the user knows exactly what happened.
+    rolled_from = draft.get("rolled_over_from")
+    if rolled_from and draft.get("status") == "in-progress":
+        st.info(
+            f"📋 **The Oversight Lead has rolled your {fmt_month(rolled_from)} report "
+            f"forward to {fmt_month(draft.get('reporting_month',''))}.**  \n"
+            "Your initiatives have been carried over and are ready for you to review. "
+            "Update your activities for this month, then click **Submit for Review** when ready.",
+            icon="📋",
+        )
 
     # ── Report Setup ─────────────────────────────────────────────────────────
     setup_complete = bool(draft.get("entity") and draft.get("reporting_month"))
@@ -2041,7 +2060,16 @@ def screen_wizard():
         picked  = st.date_input(s["label"], value=parsed)
         new_val = picked.strftime("%Y-%m-%d") if picked else None
     elif s["type"] == "multiselect":
-        new_val = st.multiselect(s["label"], EMPLOYEES, default=val or [])
+        # Use a stable key so Streamlit preserves the selection across reruns.
+        # On first render for this initiative (key not yet in session_state),
+        # seed it from the saved value so edits pre-fill correctly.
+        ms_key = f"wiz_team_{init.get('id','new')}_{step}"
+        if ms_key not in st.session_state:
+            st.session_state[ms_key] = val or []
+        new_val = st.multiselect(
+            s["label"], EMPLOYEES,
+            key=ms_key,
+        )
 
     init[field] = new_val
 
@@ -3033,6 +3061,12 @@ def screen_continuing():
     user  = st.session_state.user
     init  = dict(st.session_state.wiz_init)
 
+    # Seed the team multiselect key on first render so it pre-fills correctly
+    if "cont_team" not in st.session_state:
+        st.session_state["cont_team"] = [
+            m for m in (init.get("team_members") or []) if m in EMPLOYEES
+        ]
+
     st.markdown(f"## 🔄 Monthly Update")
     st.markdown(f"**{init.get('initiative_name', 'Unnamed')}** — *{init.get('business_component', '')}*")
     st.caption("Update what you worked on this month. All other details from last month are pre-filled — change them only if something has shifted.")
@@ -3068,7 +3102,6 @@ def screen_continuing():
             ed = st.text_input("Expected End Date (YYYY-MM-DD)",  value=init.get("expected_end_date") or "",  key="cont_ed")
         team = st.multiselect(
             "Team Members", EMPLOYEES,
-            default=[m for m in (init.get("team_members") or []) if m in EMPLOYEES],
             key="cont_team",
         )
 
