@@ -1038,7 +1038,7 @@ def build_excel_individual(username: str, sub: dict) -> bytes:
     am     = sub.get("activities_month") or sub.get("reporting_month", "")
     fm     = sub.get("reporting_month", "")
     entity = sub.get("entity", "")
-    ws.title = fmt_month_tab(am) or fmt_month_tab(fm) or "Report"
+    ws.title = f"Entity {entity}" if entity else (fmt_month_tab(am) or "Report")
     subtitle = (
         f"Submitted by: {username}  |  Entity: {entity}  |  "
         f"Filing: {fmt_month(fm)}  |  Reporting Period: {fmt_month(am)}"
@@ -1055,21 +1055,24 @@ def build_excel_consolidated(
     selected_combos: list[tuple[str, str]],
     submitted_only: bool = False,
     status_filter: list[str] | None = None,
+    group_by: str = "entity",   # "entity" → one tab per entity | "user" → one tab per person
 ) -> bytes:
     """
-    One sheet per entity (tab = "Entity 107", "Entity 108", etc.).
-    All periods for that entity appear as rows within the sheet,
-    sorted by reporting_month then username.
+    Builds a consolidated Excel workbook.
+
+    group_by="entity" (default, for user self-exports):
+        One sheet per entity tab named "Entity 107". All periods for that
+        entity appear as rows sorted by period then username.
+
+    group_by="user" (for admin consolidated reports):
+        One sheet per team member tab named after the person. All their
+        entities/periods appear as rows sorted by entity then period.
 
     status_filter: if provided, only include submissions whose status is in
-    this list (e.g. ["approved","archived"]). Takes precedence over submitted_only.
-    If both are omitted/None/False, all statuses are included.
+    this list. Takes precedence over submitted_only.
     """
     wb = Workbook()
     wb.remove(wb.active)
-
-    # Collect unique entities from the selected combos, in sorted order
-    entities = sorted({e for e, _ in selected_combos})
 
     if status_filter is not None:
         allowed_statuses = set(status_filter)
@@ -1081,26 +1084,49 @@ def build_excel_consolidated(
         allowed_statuses = None
         status_desc = "All statuses"
 
-    for entity in entities:
-        ws = wb.create_sheet(title=f"Entity {entity}"[:31])
-        subtitle = f"Entity: {entity}  |  {status_desc}"
-
-        # Gather rows for this entity across all selected periods, sorted by period then user
-        entity_combos = sorted(
-            [(e, rm) for e, rm in selected_combos if e == entity],
-            key=lambda x: x[1],   # sort by reporting_month (YYYY-MM)
-        )
-        rows = []
-        for _, rm in entity_combos:
-            for username in sorted(all_data.keys()):
+    if group_by == "user":
+        # ── One tab per person ───────────────────────────────────────────────
+        for username in sorted(all_data.keys()):
+            rows = []
+            # Sort by entity then reporting_month so a user's sheet reads chronologically
+            combos_for_user = sorted(
+                [(e, rm) for e, rm in selected_combos],
+                key=lambda x: (x[0], x[1]),
+            )
+            for entity, rm in combos_for_user:
                 sub = all_data[username].get(rm)
                 if not sub or sub.get("entity") != entity:
                     continue
                 if allowed_statuses is not None and sub.get("status") not in allowed_statuses:
                     continue
-                rows.extend(_sub_to_rows(username, sub, include_user=True))
+                rows.extend(_sub_to_rows(username, sub, include_user=False))
 
-        _write_sheet(ws, rows, subtitle)
+            if not rows:
+                continue
+            ws = wb.create_sheet(title=username[:31])
+            subtitle = f"Team member: {username}  |  {status_desc}"
+            _write_sheet(ws, rows, subtitle)
+
+    else:
+        # ── One tab per entity (original behaviour) ──────────────────────────
+        entities = sorted({e for e, _ in selected_combos})
+        for entity in entities:
+            ws = wb.create_sheet(title=f"Entity {entity}"[:31])
+            subtitle = f"Entity: {entity}  |  {status_desc}"
+            entity_combos = sorted(
+                [(e, rm) for e, rm in selected_combos if e == entity],
+                key=lambda x: x[1],
+            )
+            rows = []
+            for _, rm in entity_combos:
+                for username in sorted(all_data.keys()):
+                    sub = all_data[username].get(rm)
+                    if not sub or sub.get("entity") != entity:
+                        continue
+                    if allowed_statuses is not None and sub.get("status") not in allowed_statuses:
+                        continue
+                    rows.extend(_sub_to_rows(username, sub, include_user=True))
+            _write_sheet(ws, rows, subtitle)
 
     if not wb.sheetnames:
         ws = wb.create_sheet("No Data")
@@ -1744,10 +1770,11 @@ def screen_dashboard():
         xlsx = build_excel_individual(user, draft)
         fname = export_filename(draft.get("entity",""), draft.get("reporting_month",""))
         st.download_button(
-            "↓ Download My Report",
+            "↓ Download This Filing",
             data=xlsx,
             file_name=fname,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            help="Downloads this period's report only. Use Export My Reports below to download across multiple periods.",
         )
 
     # ── Export ────────────────────────────────────────────────────────────────
@@ -1871,8 +1898,9 @@ def render_user_export_section(user: str):
                 month, sub = filtered[0]
                 xlsx  = build_excel_individual(user, sub)
                 fname = export_filename(sub.get("entity",""), month)
+                st.caption("ℹ️ Only 1 period matches — downloading that single filing. Select more periods or change filters to get a consolidated export.")
                 st.download_button(
-                    f"↓ Download — {sub.get('entity','')} {fmt_month(month)}",
+                    f"↓ Download — {sub.get('entity','')} {fmt_month(month)} (1 period)",
                     data=xlsx,
                     file_name=fname,
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1887,6 +1915,7 @@ def render_user_export_section(user: str):
                 xlsx = build_excel_consolidated(
                     user_all_data, chosen_combos,
                     status_filter=chosen_status_keys,
+                    group_by="entity",
                 )
                 today = datetime.now().strftime("%m%d%y")
                 fname = f"{user.replace(' ','_')}_RD_Report_{today}.xlsx"
@@ -1937,11 +1966,12 @@ def render_history_section(user: str, current_reporting_month: str):
                 h_xlsx  = build_excel_individual(user, sub)
                 h_fname = export_filename(sub["entity"], sub["reporting_month"])
                 st.download_button(
-                    f"↓ {entity} — {fmt_month(month)}",
+                    f"↓ {entity} — {fmt_month(month)} (this period only)",
                     data=h_xlsx,
                     file_name=h_fname,
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     key=f"hist_dl_{month}",
+                    help="Downloads this single period's report. Use Export My Reports above for a custom multi-period download.",
                 )
             st.write("")
 
@@ -2708,7 +2738,7 @@ def screen_admin():
             fname = f"Consolidated_Report_{status_tag}_{today}.xlsx"
 
             if chosen_combos and chosen_status_keys and matched_rows > 0:
-                xlsx = build_excel_consolidated(all_data, chosen_combos, status_filter=chosen_status_keys)
+                xlsx = build_excel_consolidated(all_data, chosen_combos, status_filter=chosen_status_keys, group_by="user")
                 st.download_button(
                     f"↓ Download Consolidated Report ({matched_rows} report{'s' if matched_rows!=1 else ''})",
                     data=xlsx, file_name=fname,
