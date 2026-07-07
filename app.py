@@ -3057,7 +3057,7 @@ def _save_initiative_update(user: str, init: dict):
 
 
 def screen_continuing():
-    """Pathway 1 — Still Working On It. Prominent activities + notes; other fields collapsible."""
+    """Pathway 1 — Still Working On It. Prominent activities, dates + notes; other fields collapsible."""
     user  = st.session_state.user
     init  = dict(st.session_state.wiz_init)
 
@@ -3069,7 +3069,7 @@ def screen_continuing():
 
     st.markdown(f"## 🔄 Monthly Update")
     st.markdown(f"**{init.get('initiative_name', 'Unnamed')}** — *{init.get('business_component', '')}*")
-    st.caption("Update what you worked on this month. All other details from last month are pre-filled — change them only if something has shifted.")
+    st.caption("Update what changed this month. All fields are pre-filled from last month.")
     st.divider()
 
     activities = st.text_area(
@@ -3079,6 +3079,21 @@ def screen_continuing():
         placeholder="Describe the activities you carried out this month to advance this initiative...",
         key="cont_activities",
     )
+
+    dc1, dc2 = st.columns(2)
+    with dc1:
+        sd = st.text_input(
+            "Start Date (YYYY-MM-DD)",
+            value=init.get("start_date") or "",
+            key="cont_sd",
+        )
+    with dc2:
+        ed = st.text_input(
+            "Expected End Date (YYYY-MM-DD)",
+            value=init.get("expected_end_date") or "",
+            key="cont_ed",
+        )
+
     notes = st.text_area(
         "Notes (optional)",
         value=init.get("notes", ""),
@@ -3095,11 +3110,6 @@ def screen_continuing():
         name = st.text_input("Initiative Name",    value=init.get("initiative_name", ""),    key="cont_name")
         desc = st.text_area("Initiative Description", value=init.get("initiative_description", ""), height=100, key="cont_desc")
         unc  = st.text_area("Technical Uncertainty",  value=init.get("tech_uncertainty", ""),        height=100, key="cont_unc")
-        dc1, dc2 = st.columns(2)
-        with dc1:
-            sd = st.text_input("Start Date (YYYY-MM-DD)",         value=init.get("start_date") or "",         key="cont_sd")
-        with dc2:
-            ed = st.text_input("Expected End Date (YYYY-MM-DD)",  value=init.get("expected_end_date") or "",  key="cont_ed")
         team = st.multiselect(
             "Team Members", EMPLOYEES,
             key="cont_team",
@@ -3118,18 +3128,18 @@ def screen_continuing():
             else:
                 init["activities"]             = activities.strip()
                 init["notes"]                  = notes.strip()
+                init["start_date"]             = st.session_state.get("cont_sd") or None
+                init["expected_end_date"]      = st.session_state.get("cont_ed") or None
                 init["business_component"]     = st.session_state.get("cont_bc", init["business_component"])
                 init["initiative_name"]        = st.session_state.get("cont_name", init["initiative_name"])
                 init["initiative_description"] = st.session_state.get("cont_desc", init["initiative_description"])
                 init["tech_uncertainty"]       = st.session_state.get("cont_unc", init["tech_uncertainty"])
-                init["start_date"]             = st.session_state.get("cont_sd") or None
-                init["expected_end_date"]      = st.session_state.get("cont_ed") or None
                 init["team_members"]           = st.session_state.get("cont_team", init.get("team_members", []))
                 _save_initiative_update(user, init)
 
 
 def screen_resolved():
-    """Pathway 2 — Resolved This Month. Captures final activities, completion date, and outcome."""
+    """Pathway 2 — Resolved This Month. Captures final activities, dates, completion date, and outcome."""
     user  = st.session_state.user
     init  = dict(st.session_state.wiz_init)
 
@@ -3145,6 +3155,21 @@ def screen_resolved():
         placeholder="Describe the final activities that eliminated the technical uncertainty...",
         key="res_activities",
     )
+
+    rd1, rd2 = st.columns(2)
+    with rd1:
+        sd = st.text_input(
+            "Start Date (YYYY-MM-DD)",
+            value=init.get("start_date") or "",
+            key="res_sd",
+        )
+    with rd2:
+        ed = st.text_input(
+            "Expected End Date (YYYY-MM-DD)",
+            value=init.get("expected_end_date") or "",
+            key="res_ed",
+        )
+
     today_str = date.today().strftime("%Y-%m-%d")
     completion_date = st.text_input(
         "Completion Date (YYYY-MM-DD) *",
@@ -3185,6 +3210,8 @@ def screen_resolved():
             else:
                 init["activities"]      = activities.strip()
                 init["notes"]           = outcome.strip()
+                init["start_date"]      = st.session_state.get("res_sd") or None
+                init["expected_end_date"] = st.session_state.get("res_ed") or None
                 init["completion_date"] = completion_date.strip()
                 init["resolved"]        = True
                 _save_initiative_update(user, init)
