@@ -1750,9 +1750,154 @@ def screen_dashboard():
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
+    # ── Export ────────────────────────────────────────────────────────────────
+    st.write("")
+    render_user_export_section(user)
+
     # ── History ──────────────────────────────────────────────────────────────
     st.write("")
     render_history_section(user, draft.get("reporting_month",""))
+
+
+# ── User Export ───────────────────────────────────────────────────────────────
+
+def render_user_export_section(user: str):
+    """
+    Lets a signed-in user filter and download their own submissions as Excel.
+    Filters: entity, filing month, reporting period, status.
+    """
+    all_months = load_user_months(user)
+    if not all_months:
+        return
+
+    # Collect every submission for this user
+    user_subs = []   # (reporting_month, sub)
+    for month in all_months:
+        sub = load_submission(user, month)
+        if sub and sub.get("initiatives"):
+            user_subs.append((month, sub))
+
+    if not user_subs:
+        return
+
+    with st.expander("⬇ Export My Reports", expanded=False):
+        st.caption("Filter your reports and download a custom Excel file.")
+        st.write("")
+
+        STATUS_LABELS_USER = {
+            "in-progress": "🟡 In Progress",
+            "submitted":   "🔵 Ready for Review",
+            "approved":    "🟢 Approved",
+            "rejected":    "🔴 Rejected",
+            "archived":    "📦 Archived",
+        }
+
+        # ── Filters ──────────────────────────────────────────────────────────
+        fc1, fc2, fc3 = st.columns(3)
+
+        # Entity filter
+        entities_present = sorted({s.get("entity","") for _, s in user_subs if s.get("entity")})
+        with fc1:
+            f_entity = st.selectbox(
+                "Entity",
+                ["All"] + entities_present,
+                key="ue_entity",
+            )
+
+        # Filing Month filter
+        filing_months = sorted({m for m, _ in user_subs}, reverse=True)
+        with fc2:
+            f_filing = st.selectbox(
+                "Filing Month",
+                ["All"] + [fmt_month(m) for m in filing_months],
+                key="ue_filing",
+            )
+
+        # Reporting Period filter
+        act_months = sorted(
+            {s.get("activities_month","") for _, s in user_subs if s.get("activities_month")},
+            reverse=True,
+        )
+        with fc3:
+            f_period = st.selectbox(
+                "Reporting Period",
+                ["All"] + [fmt_month(m) for m in act_months],
+                key="ue_period",
+            )
+
+        # Status checkboxes — flat, fully visible
+        st.write("")
+        st.caption("**Status**")
+        statuses_present = sorted({s.get("status","") for _, s in user_subs})
+        sel_statuses: list[str] = []
+        status_cols = st.columns(len(statuses_present) if statuses_present else 1)
+        for i, status_key in enumerate(statuses_present):
+            with status_cols[i]:
+                if st.checkbox(
+                    STATUS_LABELS_USER.get(status_key, status_key),
+                    value=True,
+                    key=f"ue_status_{status_key}",
+                ):
+                    sel_statuses.append(status_key)
+
+        # ── Apply filters ─────────────────────────────────────────────────────
+        filtered = []
+        for month, sub in user_subs:
+            if f_entity != "All" and sub.get("entity") != f_entity:
+                continue
+            if f_filing != "All" and fmt_month(month) != f_filing:
+                continue
+            if f_period != "All" and fmt_month(sub.get("activities_month","")) != f_period:
+                continue
+            if sub.get("status") not in sel_statuses:
+                continue
+            filtered.append((month, sub))
+
+        st.write("")
+
+        # ── Preview & Download ────────────────────────────────────────────────
+        if not filtered:
+            st.caption("No reports match these filters.")
+        else:
+            # Summary line
+            n_inits = sum(len(s.get("initiatives") or []) for _, s in filtered)
+            st.caption(
+                f"{len(filtered)} report{'s' if len(filtered)!=1 else ''} · "
+                f"{n_inits} initiative{'s' if n_inits!=1 else ''}"
+            )
+
+            if len(filtered) == 1:
+                # Single report → individual export
+                month, sub = filtered[0]
+                xlsx  = build_excel_individual(user, sub)
+                fname = export_filename(sub.get("entity",""), month)
+                st.download_button(
+                    f"↓ Download — {sub.get('entity','')} {fmt_month(month)}",
+                    data=xlsx,
+                    file_name=fname,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    type="primary",
+                    key="ue_dl_single",
+                )
+            else:
+                # Multiple reports → consolidated export (user's data only)
+                user_all_data = {user: {m: s for m, s in filtered}}
+                chosen_combos = list({(s.get("entity",""), m) for m, s in filtered})
+                chosen_status_keys = list(sel_statuses)
+                xlsx = build_excel_consolidated(
+                    user_all_data, chosen_combos,
+                    status_filter=chosen_status_keys,
+                )
+                today = datetime.now().strftime("%m%d%y")
+                fname = f"{user.replace(' ','_')}_RD_Report_{today}.xlsx"
+                st.download_button(
+                    f"↓ Download {len(filtered)} Reports",
+                    data=xlsx,
+                    file_name=fname,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    type="primary",
+                    key="ue_dl_multi",
+                )
 
 
 # ── History (shown below submit on the dashboard) ───────────────────────────
