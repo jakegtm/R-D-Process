@@ -1767,15 +1767,16 @@ def screen_dashboard():
                 st.success("Report resubmitted!" if was_rejected else "Report submitted!")
                 st.rerun()
     with c2:
-        xlsx = build_excel_individual(user, draft)
-        fname = export_filename(draft.get("entity",""), draft.get("reporting_month",""))
-        st.download_button(
-            "↓ Download This Filing",
-            data=xlsx,
-            file_name=fname,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            help="Downloads this period's report only. Use Export My Reports below to download across multiple periods.",
-        )
+        if draft.get("initiatives"):
+            xlsx = build_excel_individual(user, draft)
+            fname = export_filename(draft.get("entity",""), draft.get("reporting_month",""))
+            st.download_button(
+                "↓ Download This Filing",
+                data=xlsx,
+                file_name=fname,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                help="Downloads this period's report only. Use Export My Reports below to download across multiple periods.",
+            )
 
     # ── Export ────────────────────────────────────────────────────────────────
     st.write("")
@@ -1961,8 +1962,8 @@ def render_history_section(user: str, current_reporting_month: str):
                     )
                     if i.get("tech_uncertainty"):
                         st.caption(f"   Uncertainty: {i['tech_uncertainty'][:120]}{'…' if len(i.get('tech_uncertainty',''))>120 else ''}")
-            # Export button for this past period
-            if sub.get("entity") and sub.get("reporting_month"):
+            # Export button for this past period — only if there are initiatives
+            if sub.get("entity") and sub.get("reporting_month") and inits:
                 h_xlsx  = build_excel_individual(user, sub)
                 h_fname = export_filename(sub["entity"], sub["reporting_month"])
                 st.download_button(
@@ -2244,15 +2245,16 @@ def screen_admin():
                                 ts = ts_to_est(sub["approved_at"], "%b %d %I:%M %p")
                                 st.caption(f"Report approved: {ts}")
                         with h2:
-                            u_xlsx  = build_excel_individual(username, sub)
-                            u_fname = export_filename(entity, rm).replace(".xlsx", f"_{_safe_name(username)}.xlsx")
-                            st.download_button(
-                                "↓ Export",
-                                data=u_xlsx,
-                                file_name=u_fname,
-                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                key=f"dl_{entity}_{rm}_{username}",
-                            )
+                            if inits:
+                                u_xlsx  = build_excel_individual(username, sub)
+                                u_fname = export_filename(entity, rm).replace(".xlsx", f"_{_safe_name(username)}.xlsx")
+                                st.download_button(
+                                    "↓ Export",
+                                    data=u_xlsx,
+                                    file_name=u_fname,
+                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                    key=f"dl_{entity}_{rm}_{username}",
+                                )
 
                         # ── Report-level approve / return ─────────────────────
                         if status == "submitted":
