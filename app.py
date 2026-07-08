@@ -1649,27 +1649,8 @@ def screen_dashboard():
                 st.caption(" · ".join(parts) + " — adding more will include them in the same submission.")
 
             if st.button("＋ Add Initiative", type="primary", use_container_width=True):
-                st.session_state.show_entry_picker = not st.session_state.get("show_entry_picker", False)
-
-            if st.session_state.get("show_entry_picker"):
-                st.write("")
-                pick_a, pick_b = st.columns(2)
-                with pick_a:
-                    if st.button("📝 Guided Entry", use_container_width=True, type="primary",
-                                 help="Step-by-step wizard — one initiative at a time"):
-                        st.session_state.show_entry_picker = False
-                        st.session_state.wiz_init = new_initiative()
-                        st.session_state.wiz_step = 0
-                        st.session_state.wiz_mode = "new"
-                        st.session_state.screen   = "wizard"
-                        st.rerun()
-                with pick_b:
-                    if st.button("📊 Bulk Entry", use_container_width=True,
-                                 help="Spreadsheet grid — add many at once"):
-                        st.session_state.show_entry_picker = False
-                        st.session_state.pop("bulk_df", None)
-                        st.session_state.screen = "bulk_entry"
-                        st.rerun()
+                st.session_state.screen = "entry_picker"
+                st.rerun()
 
     if not draft["initiatives"]:
         st.info("No initiatives added yet. Use **＋ Guided Entry** to add one at a time, or **📊 Bulk Entry** to fill a spreadsheet grid for multiple initiatives at once.")
@@ -3018,6 +2999,62 @@ def screen_admin():
             st.rerun()
 
 
+# ── Entry Picker Screen ───────────────────────────────────────────────────────
+
+def screen_entry_picker():
+    """
+    Shown after clicking + Add Initiative.
+    Lets the user choose between Guided Entry (wizard) or Bulk Entry (grid).
+    """
+    draft  = st.session_state.draft
+    entity = draft.get("entity", "")
+    rm     = draft.get("reporting_month", "")
+    am     = draft.get("activities_month", "") or rm
+
+    st.markdown("## ＋ Add Initiative")
+    st.caption(
+        f"Entity **{entity}** · Filing: **{fmt_month(rm)}** · "
+        f"Reporting Period: **{fmt_month(am)}**"
+    )
+    st.divider()
+    st.markdown("### How would you like to enter your initiative(s)?")
+    st.write("")
+
+    c1, c2 = st.columns(2)
+
+    with c1:
+        st.markdown("#### 📝 Guided Entry")
+        st.write(
+            "Step-by-step wizard that walks you through each field one at a time. "
+            "Best for adding one or two initiatives with full detail."
+        )
+        st.write("")
+        if st.button("Start Guided Entry →", type="primary", use_container_width=True, key="pick_guided"):
+            st.session_state.wiz_init = new_initiative()
+            st.session_state.wiz_step = 0
+            st.session_state.wiz_mode = "new"
+            st.session_state.screen   = "wizard"
+            st.rerun()
+
+    with c2:
+        st.markdown("#### 📊 Bulk Entry")
+        st.write(
+            "Spreadsheet-style grid where you fill in multiple rows at once. "
+            "Best for entering several initiatives in one sitting."
+        )
+        st.write("")
+        if st.button("Start Bulk Entry →", use_container_width=True, key="pick_bulk"):
+            st.session_state.pop("bulk_df", None)
+            st.session_state.screen = "bulk_entry"
+            st.rerun()
+
+    st.write("")
+    st.divider()
+    if st.button("← Back to Dashboard", key="pick_back"):
+        st.session_state.screen = "dashboard"
+        st.rerun()
+
+
 # ── Bulk Entry Screen ──────────────────────────────────────────────────────────
 
 def screen_bulk_entry():
@@ -3452,6 +3489,8 @@ def main():
         screen_wizard()
     elif screen == "bulk_entry":
         screen_bulk_entry()
+    elif screen == "entry_picker":
+        screen_entry_picker()
     elif screen == "pathway_select":
         screen_pathway_select()
     elif screen == "continuing":
