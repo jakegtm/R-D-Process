@@ -1632,15 +1632,39 @@ def screen_dashboard():
             "This is the period that will appear in the export."
         )
     with c2:
-        if not submitted and st.button("＋ Add Initiative", type="primary"):
-            st.session_state.wiz_init = new_initiative()
-            st.session_state.wiz_step = 0
-            st.session_state.wiz_mode = "new"
-            st.session_state.screen   = "wizard"
-            st.rerun()
+        if not submitted:
+            existing_inits = draft.get("initiatives", [])
+            n_existing = len(existing_inits)
+
+            # Show context if there are already initiatives in this report
+            if n_existing > 0:
+                n_approved = sum(1 for i in existing_inits if i.get("initiative_status") == "approved")
+                n_returned = sum(1 for i in existing_inits if i.get("initiative_status") == "returned")
+                parts = [f"{n_existing} initiative{'s' if n_existing!=1 else ''} already in this report"]
+                if n_approved:
+                    parts.append(f"{n_approved} accepted by admin")
+                if n_returned:
+                    parts.append(f"⚠ {n_returned} need{'s' if n_returned==1 else ''} revision")
+                st.caption(" · ".join(parts) + " — adding more will include them in the same submission.")
+
+            btn_a, btn_b = st.columns(2)
+            with btn_a:
+                if st.button("＋ Guided Entry", type="primary", use_container_width=True,
+                             help="Step-by-step wizard — best for 1–2 initiatives"):
+                    st.session_state.wiz_init = new_initiative()
+                    st.session_state.wiz_step = 0
+                    st.session_state.wiz_mode = "new"
+                    st.session_state.screen   = "wizard"
+                    st.rerun()
+            with btn_b:
+                if st.button("📊 Bulk Entry", use_container_width=True,
+                             help="Spreadsheet grid — best for 3+ initiatives at once"):
+                    st.session_state.pop("bulk_df", None)   # reset grid on each open
+                    st.session_state.screen = "bulk_entry"
+                    st.rerun()
 
     if not draft["initiatives"]:
-        st.info("No initiatives added yet. Click **＋ Add Initiative** to begin this month's report.")
+        st.info("No initiatives added yet. Use **＋ Guided Entry** to add one at a time, or **📊 Bulk Entry** to fill a spreadsheet grid for multiple initiatives at once.")
     else:
         # ── Quick-scan summary table ────────────────────────────────────────
         # Lets you see everything at a glance before opening any single card —
@@ -2986,6 +3010,190 @@ def screen_admin():
             st.rerun()
 
 
+# ── Bulk Entry Screen ──────────────────────────────────────────────────────────
+
+def screen_bulk_entry():
+    """
+    Spreadsheet-style bulk initiative entry.
+    Each row = one initiative. Adds to the existing draft on save.
+    """
+    import pandas as pd
+    from datetime import date as _date
+
+    user  = st.session_state.user
+    draft = st.session_state.draft
+    entity = draft.get("entity", "")
+    rm     = draft.get("reporting_month", "")
+    am     = draft.get("activities_month", "") or rm
+
+    st.markdown("## 📊 Bulk Initiative Entry")
+    st.caption(
+        f"Entity **{entity}** · Filing: **{fmt_month(rm)}** · Reporting Period: **{fmt_month(am)}**  \n"
+        "Fill in each row — one initiative per row. Required fields are marked \\*. "
+        "Completely blank rows are skipped. Click **← Back** to return to the dashboard without saving."
+    )
+    st.divider()
+
+    REQUIRED = ["Initiative Name", "Business Component", "Description",
+                "Tech Uncertainty", "Start Date", "End Date", "Activities"]
+
+    # ── Initialise the grid dataframe ─────────────────────────────────────────
+    if "bulk_df" not in st.session_state:
+        # Start with 5 blank rows; user can add more with the + button in the grid
+        st.session_state.bulk_df = pd.DataFrame({
+            "Initiative Name *":   [""] * 5,
+            "Business Component *":[""] * 5,
+            "Description *":       [""] * 5,
+            "Tech Uncertainty *":  [""] * 5,
+            "Start Date *":        [None] * 5,
+            "End Date *":          [None] * 5,
+            "Activities *":        [""] * 5,
+            "Team Member":         [None] * 5,   # single-select dropdown
+            "Notes":               [""] * 5,
+        })
+
+    # ── Render the grid ───────────────────────────────────────────────────────
+    st.caption(
+        "💡 **Tips:** Tab to move between cells · Click a Team Member cell for the dropdown "
+        "· Click a date cell for the calendar picker · Use the ＋ row button at the bottom to add more rows"
+    )
+
+    edited = st.data_editor(
+        st.session_state.bulk_df,
+        num_rows="dynamic",
+        use_container_width=True,
+        hide_index=False,   # Row numbers visible so initiatives are identifiable
+        column_config={
+            "Initiative Name *": st.column_config.TextColumn(
+                "Initiative Name *", width="medium",
+                help="Short, unique name for this initiative",
+            ),
+            "Business Component *": st.column_config.TextColumn(
+                "Business Component *", width="medium",
+                help="The business component this R&D work belongs to",
+            ),
+            "Description *": st.column_config.TextColumn(
+                "Initiative Description *", width="large",
+                help="What this initiative is trying to accomplish",
+            ),
+            "Tech Uncertainty *": st.column_config.TextColumn(
+                "Technical Uncertainty *", width="large",
+                help="What technical question or uncertainty you are trying to resolve",
+            ),
+            "Start Date *": st.column_config.DateColumn(
+                "Start Date *", format="YYYY-MM-DD",
+                help="When work on this initiative began",
+            ),
+            "End Date *": st.column_config.DateColumn(
+                "Expected End Date *", format="YYYY-MM-DD",
+                help="Expected completion date",
+            ),
+            "Activities *": st.column_config.TextColumn(
+                "Activities *", width="large",
+                help="Activities carried out this month to eliminate the technical uncertainty",
+            ),
+            "Team Member": st.column_config.SelectboxColumn(
+                "Team Member", width="medium",
+                options=EMPLOYEES,
+                help="Primary team member. Add more via the initiative card after saving.",
+            ),
+            "Notes": st.column_config.TextColumn(
+                "Notes", width="medium",
+                help="Optional — any additional context, blockers, or upcoming steps",
+            ),
+        },
+        key="bulk_editor",
+    )
+    st.session_state.bulk_df = edited
+
+    st.write("")
+
+    # ── Validate & save ───────────────────────────────────────────────────────
+    b1, b2 = st.columns([1, 1])
+    with b1:
+        if st.button("← Back to Dashboard", key="bulk_back"):
+            st.session_state.screen = "dashboard"
+            st.rerun()
+    with b2:
+        if st.button("Save Initiatives ✓", type="primary", key="bulk_save"):
+            errors   = []
+            to_add   = []
+
+            for idx, row in edited.iterrows():
+                row_num = idx + 1  # 1-based for user-facing messages
+
+                name  = str(row.get("Initiative Name *",  "") or "").strip()
+                bc    = str(row.get("Business Component *","") or "").strip()
+                desc  = str(row.get("Description *",      "") or "").strip()
+                unc   = str(row.get("Tech Uncertainty *", "") or "").strip()
+                acts  = str(row.get("Activities *",       "") or "").strip()
+                notes = str(row.get("Notes",              "") or "").strip()
+                sd    = row.get("Start Date *")
+                ed    = row.get("End Date *")
+                team  = row.get("Team Member")
+
+                # Completely blank row → skip silently
+                text_vals = [name, bc, desc, unc, acts]
+                if not any(text_vals) and sd is None and ed is None:
+                    continue
+
+                # Partially filled → collect errors
+                row_errors = []
+                if not name:  row_errors.append("Initiative Name")
+                if not bc:    row_errors.append("Business Component")
+                if not desc:  row_errors.append("Description")
+                if not unc:   row_errors.append("Tech Uncertainty")
+                if not acts:  row_errors.append("Activities")
+                if sd is None:row_errors.append("Start Date")
+                if ed is None:row_errors.append("End Date")
+
+                if row_errors:
+                    errors.append(f"Row {row_num} — missing: {', '.join(row_errors)}")
+                    continue
+
+                # Convert date objects to strings
+                sd_str = sd.strftime("%Y-%m-%d") if hasattr(sd, "strftime") else str(sd)
+                ed_str = ed.strftime("%Y-%m-%d") if hasattr(ed, "strftime") else str(ed)
+
+                # Duplicate initiative name check within this batch + existing draft
+                existing_names = [i.get("initiative_name","").strip().lower()
+                                  for i in draft.get("initiatives", [])]
+                batch_names    = [r.get("initiative_name","").strip().lower() for r in to_add]
+                if name.lower() in existing_names or name.lower() in batch_names:
+                    errors.append(f"Row {row_num} — \"{name}\" already exists in this report. "
+                                  "Each initiative needs a unique name.")
+                    continue
+
+                init = new_initiative()
+                init["initiative_name"]         = name
+                init["business_component"]      = bc
+                init["initiative_description"]  = desc
+                init["tech_uncertainty"]        = unc
+                init["start_date"]              = sd_str
+                init["expected_end_date"]       = ed_str
+                init["activities"]              = acts
+                init["team_members"]            = [team] if team else []
+                init["notes"]                   = notes
+                init["month_yr"]               = am
+                to_add.append(init)
+
+            if errors:
+                for e in errors:
+                    st.error(e)
+            elif not to_add:
+                st.warning("No initiatives to save — fill in at least one row.")
+            else:
+                draft["initiatives"] = draft.get("initiatives", []) + to_add
+                save_draft(user, draft)
+                st.session_state.draft = draft
+                st.session_state.pop("bulk_df", None)
+                st.session_state.pop("bulk_editor", None)
+                n = len(to_add)
+                st.success(f"✓ Saved {n} initiative{'s' if n!=1 else ''}.")
+                st.session_state.screen = "dashboard"
+                st.rerun()
+
+
 # ── Pathway Screens ────────────────────────────────────────────────────────────
 
 def screen_pathway_select():
@@ -3234,6 +3442,8 @@ def main():
         screen_dashboard()
     elif screen == "wizard":
         screen_wizard()
+    elif screen == "bulk_entry":
+        screen_bulk_entry()
     elif screen == "pathway_select":
         screen_pathway_select()
     elif screen == "continuing":
