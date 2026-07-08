@@ -1540,6 +1540,7 @@ def screen_dashboard():
             draft["activities_month"] = chosen_act
             save_draft(user, draft)
             st.session_state.draft = draft
+            st.session_state.show_entry_picker = False   # close picker when period changes
             st.rerun()
 
         if setup_complete:
@@ -1647,21 +1648,28 @@ def screen_dashboard():
                     parts.append(f"⚠ {n_returned} need{'s' if n_returned==1 else ''} revision")
                 st.caption(" · ".join(parts) + " — adding more will include them in the same submission.")
 
-            btn_a, btn_b = st.columns(2)
-            with btn_a:
-                if st.button("＋ Guided Entry", type="primary", use_container_width=True,
-                             help="Step-by-step wizard — best for 1–2 initiatives"):
-                    st.session_state.wiz_init = new_initiative()
-                    st.session_state.wiz_step = 0
-                    st.session_state.wiz_mode = "new"
-                    st.session_state.screen   = "wizard"
-                    st.rerun()
-            with btn_b:
-                if st.button("📊 Bulk Entry", use_container_width=True,
-                             help="Spreadsheet grid — best for 3+ initiatives at once"):
-                    st.session_state.pop("bulk_df", None)   # reset grid on each open
-                    st.session_state.screen = "bulk_entry"
-                    st.rerun()
+            if st.button("＋ Add Initiative", type="primary", use_container_width=True):
+                st.session_state.show_entry_picker = not st.session_state.get("show_entry_picker", False)
+
+            if st.session_state.get("show_entry_picker"):
+                st.write("")
+                pick_a, pick_b = st.columns(2)
+                with pick_a:
+                    if st.button("📝 Guided Entry", use_container_width=True, type="primary",
+                                 help="Step-by-step wizard — one initiative at a time"):
+                        st.session_state.show_entry_picker = False
+                        st.session_state.wiz_init = new_initiative()
+                        st.session_state.wiz_step = 0
+                        st.session_state.wiz_mode = "new"
+                        st.session_state.screen   = "wizard"
+                        st.rerun()
+                with pick_b:
+                    if st.button("📊 Bulk Entry", use_container_width=True,
+                                 help="Spreadsheet grid — add many at once"):
+                        st.session_state.show_entry_picker = False
+                        st.session_state.pop("bulk_df", None)
+                        st.session_state.screen = "bulk_entry"
+                        st.rerun()
 
     if not draft["initiatives"]:
         st.info("No initiatives added yet. Use **＋ Guided Entry** to add one at a time, or **📊 Bulk Entry** to fill a spreadsheet grid for multiple initiatives at once.")
