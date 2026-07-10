@@ -3084,23 +3084,24 @@ def screen_bulk_entry():
 
     # ── Initialise the grid dataframe ─────────────────────────────────────────
     if "bulk_df" not in st.session_state:
-        # Start with 5 blank rows; user can add more with the + button in the grid
+        n = 5
         st.session_state.bulk_df = pd.DataFrame({
-            "Initiative Name *":   [""] * 5,
-            "Business Component *":[""] * 5,
-            "Description *":       [""] * 5,
-            "Tech Uncertainty *":  [""] * 5,
-            "Start Date *":        [None] * 5,
-            "End Date *":          [None] * 5,
-            "Activities *":        [""] * 5,
-            "Team Member":         [None] * 5,   # single-select dropdown
-            "Notes":               [""] * 5,
-        })
+            "Initiative Name *":   [""] * n,
+            "Business Component *":[""] * n,
+            "Description *":       [""] * n,
+            "Tech Uncertainty *":  [""] * n,
+            "Start Date *":        [None] * n,
+            "End Date *":          [None] * n,
+            "Activities *":        [""] * n,
+            "Team Member":         [None] * n,
+            "Notes":               [""] * n,
+        }, index=range(1, n + 1))  # 1-based row numbers
 
     # ── Render the grid ───────────────────────────────────────────────────────
     st.caption(
-        "💡 **Tips:** Tab to move between cells · Click a Team Member cell for the dropdown "
-        "· Click a date cell for the calendar picker · Use the ＋ row button at the bottom to add more rows"
+        "💡 **Tips:** Tab between cells · Click a date cell for the calendar · "
+        "Click a Team Member cell for the dropdown · Use the ＋ row button at the bottom to add more rows · "
+        "Completely blank rows are automatically skipped on save"
     )
 
     edited = st.data_editor(
@@ -3147,7 +3148,6 @@ def screen_bulk_entry():
                 help="Optional — any additional context, blockers, or upcoming steps",
             ),
         },
-        key="bulk_editor",
     )
     st.session_state.bulk_df = edited
 
@@ -3165,7 +3165,7 @@ def screen_bulk_entry():
             to_add   = []
 
             for idx, row in edited.iterrows():
-                row_num = idx + 1  # 1-based for user-facing messages
+                row_num = idx if isinstance(idx, int) else int(idx)   # already 1-based
 
                 name  = str(row.get("Initiative Name *",  "") or "").strip()
                 bc    = str(row.get("Business Component *","") or "").strip()
@@ -3232,7 +3232,6 @@ def screen_bulk_entry():
                 save_draft(user, draft)
                 st.session_state.draft = draft
                 st.session_state.pop("bulk_df", None)
-                st.session_state.pop("bulk_editor", None)
                 n = len(to_add)
                 st.success(f"✓ Saved {n} initiative{'s' if n!=1 else ''}.")
                 st.session_state.screen = "dashboard"
