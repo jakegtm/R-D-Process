@@ -831,8 +831,9 @@ def rollover_entity(
 # ── Initiative helpers ────────────────────────────────────────────────────────
 
 def new_initiative() -> dict:
+    import random as _rnd
     return {
-        "id": f"{int(datetime.now().timestamp()*1000)}",
+        "id": f"{int(datetime.now().timestamp()*1000)}_{_rnd.randint(10000,99999)}",
         "business_component":    "",
         "initiative_name":       "",
         "initiative_description":"",
