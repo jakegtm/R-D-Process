@@ -3084,13 +3084,14 @@ def screen_bulk_entry():
 
     if "bulk_df" not in st.session_state:
         n = 5
+        import pandas as _pd
         st.session_state.bulk_df = pd.DataFrame({
             "Initiative Name *":   [""] * n,
             "Business Component *":[""] * n,
             "Description *":       [""] * n,
             "Tech Uncertainty *":  [""] * n,
-            "Start Date *":        [""] * n,
-            "End Date *":          [""] * n,
+            "Start Date *":        [_pd.NaT] * n,
+            "End Date *":          [_pd.NaT] * n,
             "Activities *":        [""] * n,
             "Notes":               [""] * n,
         }, index=range(1, n + 1))
@@ -3127,15 +3128,13 @@ def screen_bulk_entry():
                     "Technical Uncertainty *", width="large",
                     help="What technical question or uncertainty you are trying to resolve",
                 ),
-                "Start Date *": st.column_config.TextColumn(
-                    "Start Date *",
-                    help="When work on this initiative began (YYYY-MM-DD)",
-                    validate=r"^\d{4}-\d{2}-\d{2}$",
+                "Start Date *": st.column_config.DateColumn(
+                    "Start Date *", format="YYYY-MM-DD",
+                    help="When work on this initiative began",
                 ),
-                "End Date *": st.column_config.TextColumn(
-                    "Expected End Date *",
-                    help="Expected completion date (YYYY-MM-DD)",
-                    validate=r"^\d{4}-\d{2}-\d{2}$",
+                "End Date *": st.column_config.DateColumn(
+                    "Expected End Date *", format="YYYY-MM-DD",
+                    help="Expected completion date",
                 ),
                 "Activities *": st.column_config.TextColumn(
                     "Activities *", width="large",
@@ -3175,8 +3174,24 @@ def screen_bulk_entry():
             unc   = str(row.get("Tech Uncertainty *", "") or "").strip()
             acts  = str(row.get("Activities *",       "") or "").strip()
             notes = str(row.get("Notes",              "") or "").strip()
-            sd    = str(row.get("Start Date *") or "").strip()
-            ed    = str(row.get("End Date *") or "").strip()
+            import pandas as _pd
+            sd_raw = row.get("Start Date *")
+            ed_raw = row.get("End Date *")
+            # DateColumn returns date objects or pd.NaT — normalise to str or None
+            def _to_str(v):
+                if v is None or (hasattr(v, "__class__") and v.__class__.__name__ == "NaTType"):
+                    return ""
+                try:
+                    import pandas as __pd
+                    if __pd.isnull(v):
+                        return ""
+                except Exception:
+                    pass
+                if hasattr(v, "strftime"):
+                    return v.strftime("%Y-%m-%d")
+                return str(v).strip()
+            sd = _to_str(sd_raw)
+            ed = _to_str(ed_raw)
 
             if not any([name, bc, desc, unc, acts]) and not sd and not ed:
                 continue
@@ -3194,19 +3209,6 @@ def screen_bulk_entry():
                 errors.append(f"Row {row_num} — missing: {', '.join(row_errors)}")
                 continue
 
-            # Validate date format
-            import datetime as _datetime
-            for date_val, date_label in [(sd, "Start Date"), (ed, "End Date")]:
-                try:
-                    _datetime.datetime.strptime(date_val, "%Y-%m-%d")
-                except ValueError:
-                    errors.append(f"Row {row_num} — {date_label} must be YYYY-MM-DD (e.g. 2026-01-15)")
-                    break
-            else:
-                sd_str, ed_str = sd, ed
-                pass
-            if any(f"Row {row_num}" in e for e in errors):
-                continue
             sd_str, ed_str = sd, ed
 
             existing_names = [i.get("initiative_name","").strip().lower()
