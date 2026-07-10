@@ -3089,8 +3089,8 @@ def screen_bulk_entry():
             "Business Component *":[""] * n,
             "Description *":       [""] * n,
             "Tech Uncertainty *":  [""] * n,
-            "Start Date *":        [None] * n,
-            "End Date *":          [None] * n,
+            "Start Date *":        [""] * n,
+            "End Date *":          [""] * n,
             "Activities *":        [""] * n,
             "Notes":               [""] * n,
         }, index=range(1, n + 1))
@@ -3127,13 +3127,15 @@ def screen_bulk_entry():
                     "Technical Uncertainty *", width="large",
                     help="What technical question or uncertainty you are trying to resolve",
                 ),
-                "Start Date *": st.column_config.DateColumn(
-                    "Start Date *", format="YYYY-MM-DD",
-                    help="When work on this initiative began",
+                "Start Date *": st.column_config.TextColumn(
+                    "Start Date *",
+                    help="When work on this initiative began (YYYY-MM-DD)",
+                    validate=r"^\d{4}-\d{2}-\d{2}$",
                 ),
-                "End Date *": st.column_config.DateColumn(
-                    "Expected End Date *", format="YYYY-MM-DD",
-                    help="Expected completion date",
+                "End Date *": st.column_config.TextColumn(
+                    "Expected End Date *",
+                    help="Expected completion date (YYYY-MM-DD)",
+                    validate=r"^\d{4}-\d{2}-\d{2}$",
                 ),
                 "Activities *": st.column_config.TextColumn(
                     "Activities *", width="large",
@@ -3173,10 +3175,10 @@ def screen_bulk_entry():
             unc   = str(row.get("Tech Uncertainty *", "") or "").strip()
             acts  = str(row.get("Activities *",       "") or "").strip()
             notes = str(row.get("Notes",              "") or "").strip()
-            sd    = row.get("Start Date *")
-            ed    = row.get("End Date *")
+            sd    = str(row.get("Start Date *") or "").strip()
+            ed    = str(row.get("End Date *") or "").strip()
 
-            if not any([name, bc, desc, unc, acts]) and sd is None and ed is None:
+            if not any([name, bc, desc, unc, acts]) and not sd and not ed:
                 continue
 
             row_errors = []
@@ -3185,15 +3187,27 @@ def screen_bulk_entry():
             if not desc:   row_errors.append("Description")
             if not unc:    row_errors.append("Tech Uncertainty")
             if not acts:   row_errors.append("Activities")
-            if sd is None: row_errors.append("Start Date")
-            if ed is None: row_errors.append("End Date")
+            if not sd:     row_errors.append("Start Date")
+            if not ed:     row_errors.append("End Date")
 
             if row_errors:
                 errors.append(f"Row {row_num} — missing: {', '.join(row_errors)}")
                 continue
 
-            sd_str = sd.strftime("%Y-%m-%d") if hasattr(sd, "strftime") else str(sd)
-            ed_str = ed.strftime("%Y-%m-%d") if hasattr(ed, "strftime") else str(ed)
+            # Validate date format
+            import datetime as _datetime
+            for date_val, date_label in [(sd, "Start Date"), (ed, "End Date")]:
+                try:
+                    _datetime.datetime.strptime(date_val, "%Y-%m-%d")
+                except ValueError:
+                    errors.append(f"Row {row_num} — {date_label} must be YYYY-MM-DD (e.g. 2026-01-15)")
+                    break
+            else:
+                sd_str, ed_str = sd, ed
+                pass
+            if any(f"Row {row_num}" in e for e in errors):
+                continue
+            sd_str, ed_str = sd, ed
 
             existing_names = [i.get("initiative_name","").strip().lower()
                               for i in draft.get("initiatives", [])]
