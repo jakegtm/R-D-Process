@@ -3092,7 +3092,9 @@ def screen_bulk_entry():
             "Start Date *":        [None] * n,
             "End Date *":          [None] * n,
             "Activities *":        [""] * n,
-            "Team Member":         [None] * n,
+            "Member 1":            [None] * n,
+            "Member 2":            [None] * n,
+            "Member 3":            [None] * n,
             "Notes":               [""] * n,
         }, index=range(1, n + 1))
 
@@ -3140,10 +3142,20 @@ def screen_bulk_entry():
                     "Activities *", width="large",
                     help="Activities this month to eliminate the technical uncertainty",
                 ),
-                "Team Member": st.column_config.SelectboxColumn(
-                    "Team Member", width="medium",
+                "Member 1": st.column_config.SelectboxColumn(
+                    "Member 1", width="small",
                     options=EMPLOYEES,
-                    help="Primary team member. Add more via the initiative card after saving.",
+                    help="Team member working on this initiative",
+                ),
+                "Member 2": st.column_config.SelectboxColumn(
+                    "Member 2", width="small",
+                    options=EMPLOYEES,
+                    help="Additional team member (optional)",
+                ),
+                "Member 3": st.column_config.SelectboxColumn(
+                    "Member 3", width="small",
+                    options=EMPLOYEES,
+                    help="Additional team member (optional)",
                 ),
                 "Notes": st.column_config.TextColumn(
                     "Notes", width="medium",
@@ -3157,15 +3169,15 @@ def screen_bulk_entry():
         with fb1:
             go_back = st.form_submit_button("← Back to Dashboard")
         with fb3:
-            do_save = st.form_submit_button("Save Initiatives ✓", type="primary")
+            do_next = st.form_submit_button("Next → Add Team Members", type="primary")
 
     # Handle buttons outside the form context
     if go_back:
         st.session_state.screen = "dashboard"
         st.rerun()
 
-    if do_save:
-        st.session_state.bulk_df = edited   # persist grid in case of validation errors
+    if do_next:
+        st.session_state.bulk_df = edited
 
         errors, to_add = [], []
 
@@ -3180,9 +3192,7 @@ def screen_bulk_entry():
             notes = str(row.get("Notes",              "") or "").strip()
             sd    = row.get("Start Date *")
             ed    = row.get("End Date *")
-            team  = row.get("Team Member")
 
-            # Completely blank row → skip silently
             if not any([name, bc, desc, unc, acts]) and sd is None and ed is None:
                 continue
 
@@ -3206,7 +3216,7 @@ def screen_bulk_entry():
                               for i in draft.get("initiatives", [])]
             batch_names    = [r.get("initiative_name","").strip().lower() for r in to_add]
             if name.lower() in existing_names or name.lower() in batch_names:
-                errors.append(f"Row {row_num} — \"{name}\" already exists in this report.")
+                errors.append(f'Row {row_num} — "{name}" already exists in this report.')
                 continue
 
             init = new_initiative()
@@ -3217,7 +3227,7 @@ def screen_bulk_entry():
             init["start_date"]             = sd_str
             init["expected_end_date"]      = ed_str
             init["activities"]             = acts
-            init["team_members"]           = [team] if team else []
+            init["team_members"]           = []
             init["notes"]                  = notes
             init["month_yr"]               = am
             to_add.append(init)
@@ -3228,16 +3238,87 @@ def screen_bulk_entry():
         elif not to_add:
             st.warning("No initiatives to save — fill in at least one row.")
         else:
-            draft["initiatives"] = draft.get("initiatives", []) + to_add
-            save_draft(user, draft)
-            st.session_state.draft = draft
-            st.session_state.pop("bulk_df", None)
-            n = len(to_add)
-            st.success(f"✓ Saved {n} initiative{'s' if n!=1 else ''}.")
-            st.session_state.screen = "dashboard"
+            st.session_state.bulk_pending = to_add
+            st.session_state.screen = "bulk_team"
             st.rerun()
 
 
+# ── Bulk Team Member Assignment ───────────────────────────────────────────────
+
+def screen_bulk_team():
+    """
+    Step 2 of bulk entry — assign team members to each validated initiative.
+    Shows initiative name and reporting period so the user knows exactly
+    which one they're adding members to.
+    """
+    user  = st.session_state.user
+    draft = st.session_state.draft
+    inits = st.session_state.get("bulk_pending", [])
+    am    = draft.get("activities_month", "") or draft.get("reporting_month", "")
+
+    if not inits:
+        st.session_state.screen = "dashboard"
+        st.rerun()
+
+    st.markdown("## 👥 Add Team Members")
+    st.caption(
+        f"Reporting Period: **{fmt_month(am)}**  \n"
+        "Select team members for each initiative. You can leave any blank and add them later via Edit."
+    )
+    st.divider()
+
+    # Collect selections — use seeded session state keys so they persist
+    # if the user goes back and forward
+    for i, init in enumerate(inits):
+        iname = init.get("initiative_name", f"Initiative {i+1}")
+        bc    = init.get("business_component", "")
+        sd    = init.get("start_date", "—")
+        ed    = init.get("expected_end_date", "—")
+
+        st.markdown(f"**{iname}** — *{bc}*")
+        st.caption(f"📅 {sd} → {ed}  ·  Reporting Period: {fmt_month(am)}")
+
+        key = f"bulk_team_{i}"
+        if key not in st.session_state:
+            st.session_state[key] = init.get("team_members", [])
+
+        st.multiselect(
+            "Team Members",
+            EMPLOYEES,
+            key=key,
+            label_visibility="collapsed",
+            placeholder="Select team members...",
+        )
+        st.write("")
+
+    st.divider()
+
+    b1, b2, b3 = st.columns([1, 1, 1])
+    with b1:
+        if st.button("← Back to Grid", key="bt_back"):
+            st.session_state.screen = "bulk_entry"
+            st.rerun()
+    with b3:
+        if st.button("Save All Initiatives ✓", type="primary", key="bt_save"):
+            # Assign team members from each multiselect into the initiatives
+            for i, init in enumerate(inits):
+                init["team_members"] = st.session_state.get(f"bulk_team_{i}", [])
+
+            # Append all to the draft and save
+            draft["initiatives"] = draft.get("initiatives", []) + inits
+            save_draft(user, draft)
+            st.session_state.draft = draft
+
+            # Clean up
+            st.session_state.pop("bulk_pending", None)
+            st.session_state.pop("bulk_df", None)
+            for i in range(len(inits)):
+                st.session_state.pop(f"bulk_team_{i}", None)
+
+            n = len(inits)
+            st.success(f"✓ Saved {n} initiative{'s' if n!=1 else ''}.")
+            st.session_state.screen = "dashboard"
+            st.rerun()
 
 
 # ── Pathway Screens ────────────────────────────────────────────────────────────
@@ -3490,6 +3571,8 @@ def main():
         screen_wizard()
     elif screen == "bulk_entry":
         screen_bulk_entry()
+    elif screen == "bulk_team":
+        screen_bulk_team()
     elif screen == "entry_picker":
         screen_entry_picker()
     elif screen == "pathway_select":
