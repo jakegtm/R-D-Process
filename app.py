@@ -3092,9 +3092,6 @@ def screen_bulk_entry():
             "Start Date *":        [None] * n,
             "End Date *":          [None] * n,
             "Activities *":        [""] * n,
-            "Member 1":            [None] * n,
-            "Member 2":            [None] * n,
-            "Member 3":            [None] * n,
             "Notes":               [""] * n,
         }, index=range(1, n + 1))
 
@@ -3142,21 +3139,7 @@ def screen_bulk_entry():
                     "Activities *", width="large",
                     help="Activities this month to eliminate the technical uncertainty",
                 ),
-                "Member 1": st.column_config.SelectboxColumn(
-                    "Member 1", width="small",
-                    options=EMPLOYEES,
-                    help="Team member working on this initiative",
-                ),
-                "Member 2": st.column_config.SelectboxColumn(
-                    "Member 2", width="small",
-                    options=EMPLOYEES,
-                    help="Additional team member (optional)",
-                ),
-                "Member 3": st.column_config.SelectboxColumn(
-                    "Member 3", width="small",
-                    options=EMPLOYEES,
-                    help="Additional team member (optional)",
-                ),
+
                 "Notes": st.column_config.TextColumn(
                     "Notes", width="medium",
                     help="Optional — any additional context, blockers, or upcoming steps",
