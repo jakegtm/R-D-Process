@@ -814,96 +814,133 @@ def get_user_history(username: str) -> list[dict]:
 
 # ── Entity rollover ───────────────────────────────────────────────────────────
 
+def advance_report(report: dict, target_month: str | None = None) -> tuple[bool, str, str]:
+    """Archive one accepted report and create the next period's draft from it.
+
+    This is the app's version of Power Automate Flow 4: the file is copied, the
+    copy is retitled to the next period, and the original is archived. Called
+    automatically the moment a report becomes approved.
+
+    The copy KEEPS every existing row unchanged — the record of what was done in
+    each earlier month — and adds one fresh row per ongoing initiative, stamped
+    with the new period and with the activities field blank for the preparer.
+    Resolved initiatives get no new row.
+
+    target_month defaults to the month after the source, regardless of how far
+    back the source is. Accepting a May report in September rolls it to June, not
+    to October, because the periods have to be filed in sequence.
+
+    Returns (rolled, target_month, reason_if_not_rolled).
+    """
+    import copy as _copy
+
+    username     = report.get("user", "")
+    entity       = report.get("entity", "")
+    source_month = report.get("reporting_month", "")
+    if not (username and entity and source_month):
+        return False, "", "report is missing its identity"
+
+    target_month = target_month or next_month_of(source_month)
+    now          = int(time.time() * 1000)
+    target_am    = prev_month_of(target_month)
+
+    if not (report.get("initiatives") or []):
+        return False, target_month, "report has no initiatives"
+
+    # Archive the source either way — that part is not conditional on the copy.
+    if report.get("status") != "archived":
+        report["status"]      = "archived"
+        report["archived_at"] = now
+        store.save_report(report)
+
+    existing = load_submission(username, entity, target_month)
+    if existing and existing.get("initiatives"):
+        return False, target_month, f"{fmt_month(target_month)} already has data"
+
+    new_inits: list[dict] = []
+
+    # 1. Every existing row carries over untouched, frozen as history.
+    for i in report.get("initiatives") or []:
+        hist = _copy.deepcopy(i)
+        hist["series_id"]  = series_id_of(i)
+        hist["historical"] = True
+        if not hist.get("month_yr"):
+            hist["month_yr"] = report.get("activities_month") or source_month
+        new_inits.append(hist)
+
+    # 2. One new row per ongoing series, for the new period.
+    for series in latest_per_series(report):
+        if series.get("resolved"):
+            continue
+        fresh = _copy.deepcopy(series)
+        fresh["id"]                = f"{now}_{len(new_inits)}"
+        fresh["series_id"]         = series_id_of(series)
+        fresh["month_yr"]          = target_am
+        fresh["historical"]        = False
+        fresh["carry_over"]        = True
+        fresh["activities"]        = ""
+        fresh["notes"]             = ""
+        fresh["pathway"]           = ""
+        fresh["initiative_status"] = "active"
+        fresh["approved_at"]       = None
+        fresh["returned_at"]       = None
+        fresh["review_comment"]    = ""
+        fresh["review_history"]    = []
+        fresh["completion_date"]   = None
+        fresh["resolved"]          = False
+        new_inits.append(fresh)
+
+    save_draft(username, {
+        "user":             username,
+        "initiatives":      new_inits,
+        "status":           "in-progress",
+        "entity":           entity,
+        "reporting_month":  target_month,
+        "activities_month": target_am,
+        "rolled_over_from": source_month,
+    })
+    return True, target_month, ""
+
+
+def accept_report(report: dict) -> tuple[bool, str, str]:
+    """Accept every current-period initiative, then archive and roll forward.
+
+    Acceptance is the trigger, exactly as the status change to Complete triggered
+    Flow 4 — the admin does not have to visit the Rollover tab for the normal
+    monthly cycle.
+    """
+    now = int(time.time() * 1000)
+    for i in current_rows(report):
+        clear_return_flag(i, reason="accepted")
+        i["initiative_status"] = "approved"
+        i["approved_at"]       = now
+    report["approved_at"] = now
+    save_draft(report.get("user", ""), report)
+    return advance_report(report)
+
+
 def rollover_entity(
     source_entity: str,
     source_month: str,
     target_month: str,
     only_users: list[str] | None = None,
 ) -> list[str]:
-    """
-    Roll an approved period forward, mirroring the Power Automate flow: the file
-    is copied, the copy is retitled to the next period, and the original is
-    archived.
+    """Bulk rollover from the admin's Rollover tab.
 
-    The copy KEEPS every existing row unchanged — those are the historical record
-    of what was done in each earlier month — and adds one fresh row per ongoing
-    initiative, stamped with the new period and with the activities field cleared
-    for the preparer to fill in. Resolved initiatives get no new row.
-
-    So September's report contains August's rows and a new September row for each
-    ongoing initiative, and the preparer adds rows for anything brand new.
+    With acceptance now rolling reports forward on its own, this is the exception
+    path: catching up after a gap, or sending a period to a month other than the
+    next one.
     """
-    import copy as _copy
     rolled: list[str] = []
-    now = int(time.time() * 1000)
-    target_am = prev_month_of(target_month)
-
-    for src_rep in all_reports(entity=source_entity, period=source_month):
-        username = src_rep.get("user", "")
+    for rep in all_reports(entity=source_entity, period=source_month):
+        username = rep.get("user", "")
         if only_users is not None and username not in only_users:
             continue
-        # Only a report the Oversight Lead has accepted may roll forward.
-        if computed_status(src_rep) not in ("approved", "archived"):
+        if computed_status(rep) not in ("approved", "archived"):
             continue
-        if not (src_rep.get("initiatives") or []):
-            continue
-
-        existing = load_submission(username, source_entity, target_month)
-        if existing and existing.get("initiatives"):
-            continue
-
-        new_inits: list[dict] = []
-
-        # 1. Every existing row carries over untouched, frozen as history.
-        for i in src_rep.get("initiatives") or []:
-            hist = _copy.deepcopy(i)
-            hist["series_id"]  = series_id_of(i)
-            hist["historical"] = True
-            if not hist.get("month_yr"):
-                hist["month_yr"] = src_rep.get("activities_month") or source_month
-            new_inits.append(hist)
-
-        # 2. One new row per ongoing series, for the new period.
-        for series in latest_per_series(src_rep):
-            if series.get("resolved"):
-                continue
-            fresh = _copy.deepcopy(series)
-            fresh["id"]                = f"{now}_{len(new_inits)}"
-            fresh["series_id"]         = series_id_of(series)
-            fresh["month_yr"]          = target_am
-            fresh["historical"]        = False
-            fresh["carry_over"]        = True
-            # This month's work hasn't been described yet — that's the preparer's job.
-            fresh["activities"]        = ""
-            fresh["notes"]             = ""
-            fresh["pathway"]           = ""
-            fresh["initiative_status"] = "active"
-            fresh["approved_at"]       = None
-            fresh["returned_at"]       = None
-            fresh["review_comment"]    = ""
-            fresh["review_history"]    = []
-            fresh["completion_date"]   = None
-            fresh["resolved"]          = False
-            new_inits.append(fresh)
-
-        save_draft(username, {
-            "user":             username,
-            "initiatives":      new_inits,
-            "status":           "in-progress",
-            "entity":           source_entity,
-            "reporting_month":  target_month,
-            "activities_month": target_am,
-            "rolled_over_from": source_month,
-        })
-
-        # The source period is archived, as the flow did on completion.
-        if src_rep.get("status") != "archived":
-            src_rep["status"]      = "archived"
-            src_rep["archived_at"] = now
-            store.save_report(src_rep)
-
-        rolled.append(username)
-
+        did, _, _ = advance_report(rep, target_month)
+        if did:
+            rolled.append(username)
     return rolled
 
 
@@ -2575,16 +2612,21 @@ def screen_admin():
                             ra1, ra2, ra3 = st.columns([3, 1, 1])
                             with ra2:
                                 if st.button("✓ Accept all", key=f"appr_rpt_{rkey}", type="primary"):
-                                    now = int(time.time() * 1000)
-                                    # Only this period's rows. Earlier months were
-                                    # already accepted in their own period.
-                                    for i in current_rows(rep):
-                                        clear_return_flag(i, reason="accepted")
-                                        i["initiative_status"] = "approved"
-                                        i["approved_at"]       = now
-                                    rep["approved_at"] = now
-                                    save_draft(username, rep)
-                                    st.success(f"Accepted {username}'s report.")
+                                    # Accepting archives this period and creates the
+                                    # next one in a single step, the way Flow 4 was
+                                    # triggered by the status change to Complete.
+                                    did, tgt, why = accept_report(rep)
+                                    if did:
+                                        st.success(
+                                            f"Accepted {username}'s report. "
+                                            f"{fmt_month(rm)} is archived and "
+                                            f"{fmt_month(tgt)} is waiting for them."
+                                        )
+                                    else:
+                                        st.success(
+                                            f"Accepted and archived {username}'s report. "
+                                            f"Not rolled forward — {why}."
+                                        )
                                     st.rerun()
                             with ra3:
                                 if st.button("✕ Return all", key=f"rej_rpt_{rkey}"):
@@ -2620,7 +2662,10 @@ def screen_admin():
                         if rstatus == "approved":
                             arc1, arc2 = st.columns([4, 1])
                             with arc1:
-                                st.caption("Approved. Archive it to close the period out.")
+                                st.caption(
+                                    "Accepted but not archived — usually because it was "
+                                    "reopened. Archive it to close the period out."
+                                )
                             with arc2:
                                 if st.button("📦 Archive", key=f"archive_{rkey}"):
                                     rep["status"]      = "archived"
@@ -2721,10 +2766,23 @@ def screen_admin():
                                             clear_return_flag(init, reason="accepted")
                                             init["initiative_status"] = "approved"
                                             init["approved_at"]       = now
-                                            if all(i.get("initiative_status") == "approved"
-                                                   for i in current_rows(rep)):
-                                                rep["approved_at"] = now
                                             save_draft(username, rep)
+                                            # Accepting the LAST outstanding initiative
+                                            # completes the report, so the same trigger
+                                            # fires here as on Accept all — otherwise the
+                                            # two review paths would behave differently.
+                                            if computed_status(rep) == "approved":
+                                                did, tgt, why = accept_report(rep)
+                                                if did:
+                                                    st.success(
+                                                        f"Report complete. {fmt_month(rm)} archived, "
+                                                        f"{fmt_month(tgt)} created for {username}."
+                                                    )
+                                                else:
+                                                    st.success(
+                                                        f"Report complete and archived. "
+                                                        f"Not rolled forward — {why}."
+                                                    )
                                             st.rerun()
 
                                 with ic3:
@@ -2768,10 +2826,10 @@ def screen_admin():
     # ══ Rollover ══════════════════════════════════════════════════════════════
     if active_tab == "🔄 Rollover":
         st.caption(
-            "Only approved reports can be rolled forward. Anyone who already has "
-            "data in the target month is skipped. Rolling forward no longer "
-            "archives the source period — archive it yourself in Submissions when "
-            "you're ready to close it out."
+            "Accepting a report already archives it and creates the next period, so "
+            "you don't normally need this tab. Use it to catch up after a gap, or to "
+            "send a period to a month other than the next one. Anyone who already has "
+            "data in the target month is skipped."
         )
 
         eligible = sorted(
