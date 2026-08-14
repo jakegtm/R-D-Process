@@ -7,11 +7,15 @@ import streamlit as st
 import json
 from datetime import datetime, date
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 import io
 import re
+import time
+
+import store
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -35,13 +39,25 @@ EMPLOYEES = [
 ENTITIES = ["107", "108", "109", "110"]   # base/default entities — custom ones persist separately
 
 STATUS_LABELS = {
-    "in-progress": "🟡 In Progress",
-    "submitted":   "🔵 Ready for Review",
-    "approved":    "🟢 Approved",
-    "rejected":    "🔴 Rejected",
-    "archived":    "📦 Archived",
-    "not-started": "⚪ Not Started",
+    "in-progress":       "🟡 In Progress",
+    "submitted":         "🔵 Ready for Review",
+    "rejected":          "🔴 Rejected",
+    "approved":          "🟢 Approved",
+    "archived":          "📦 Archived",
+    "not-started":       "⚪ Not Started",
 }
+
+# Report status is DERIVED from the initiatives it contains rather than set
+# directly. Previously, returning a single initiative flipped the whole report to
+# "rejected", locked the user out of editing until they clicked an
+# acknowledgement button, and left a report reading as rejected while most of its
+# initiatives were approved. See computed_status().
+#
+# A report in "rejected" stays editable — that is the whole point.
+LOCKED_STATUSES = ("submitted", "approved", "archived")
+
+# Kept for the import parser, which may meet labels from older exports.
+LEGACY_STATUS_ALIASES = {"changes requested": "rejected"}
 
 # Wizard steps — exactly the 9 columns in the Excel template
 # (Month/Yr is derived from reporting_month, not asked separately)
@@ -137,12 +153,27 @@ CARRYOVER_FIELDS = {
 def cur_month() -> str:
     return datetime.now().strftime("%Y-%m")
 
-def ts_to_est(ms: int, fmt: str = "%b %d, %Y %I:%M %p") -> str:
-    """Convert a millisecond UTC timestamp to a formatted EST string."""
-    from datetime import timezone, timedelta
-    est = timezone(timedelta(hours=-5))   # EST = UTC-5 (covers ET year-round simply)
-    dt  = datetime.fromtimestamp(ms / 1000, tz=timezone.utc).astimezone(est)
-    return dt.strftime(fmt) + " EST"
+_ET = ZoneInfo("America/New_York")
+
+def ts_to_et(ms: int, fmt: str = "%b %d, %Y %I:%M %p") -> str:
+    """Format a millisecond UTC timestamp in US Eastern time.
+
+    Uses a real timezone rather than a fixed offset, so daylight saving is
+    handled correctly — a fixed -5 was an hour off from March to November,
+    including in the export's Completion Date column.
+    """
+    from datetime import timezone
+    if not ms:
+        return ""
+    dt = datetime.fromtimestamp(ms / 1000, tz=timezone.utc).astimezone(_ET)
+    out = dt.strftime(fmt)
+    # Only label the zone when a time is actually shown.
+    if any(t in fmt for t in ("%I", "%H", "%M")):
+        out += " EDT" if dt.dst() else " EST"
+    return out
+
+# Kept so older call sites keep working.
+ts_to_est = ts_to_et
 
 def prev_month_of(m: str) -> str:
     y, mo = map(int, m.split("-"))
@@ -221,216 +252,249 @@ def export_filename(entity: str, reporting_month: str, tag: str = "") -> str:
     return "_".join(parts) + ".xlsx"
 
 
+# ── Initiative series ─────────────────────────────────────────────────────────
+# An initiative persists across months. Each month it gets its OWN ROW, stamped
+# with that month, and earlier rows are kept unchanged — that is what makes a
+# single file a month-by-month record of the work rather than a snapshot.
+#
+# series_id ties those rows together: "Initiative A in August" and
+# "Initiative A in September" share a series_id but have different month_yr.
+
+def series_id_of(init: dict) -> str:
+    """Stable identity for an initiative across months.
+
+    Falls back to a slug of the name so rows restored from an Excel export —
+    which has no series column — still group correctly.
+    """
+    sid = (init.get("series_id") or "").strip()
+    if sid:
+        return sid
+    name = (init.get("initiative_name") or "").strip().lower()
+    return re.sub(r"[^a-z0-9]+", "-", name).strip("-") or init.get("id", "")
+
+
+def is_historical(init: dict) -> bool:
+    """True for a row carried in from an earlier month. Read-only."""
+    return bool(init.get("historical"))
+
+
+def current_rows(report: dict) -> list[dict]:
+    """Rows belonging to this report's own reporting period — the editable ones."""
+    return [i for i in (report.get("initiatives") or []) if not is_historical(i)]
+
+
+def historical_rows(report: dict) -> list[dict]:
+    """Rows carried forward from earlier months, kept for the record."""
+    return [i for i in (report.get("initiatives") or []) if is_historical(i)]
+
+
+def latest_per_series(report: dict) -> list[dict]:
+    """The most recent row for each series in a report."""
+    newest: dict[str, dict] = {}
+    for init in report.get("initiatives") or []:
+        sid = series_id_of(init)
+        prev = newest.get(sid)
+        if prev is None or (init.get("month_yr") or "") >= (prev.get("month_yr") or ""):
+            newest[sid] = init
+    return list(newest.values())
+
+
+# ── Report status ─────────────────────────────────────────────────────────────
+
+def computed_status(report: dict) -> str:
+    """The report's status, derived from its initiatives.
+
+    archived     set explicitly by the admin; terminal until reopened
+    in-progress  never submitted
+    rejected     at least one initiative sent back for revision
+    approved     every initiative accepted
+    submitted    waiting on review
+
+    Only CURRENT-PERIOD rows count. Rows carried in from earlier months are a
+    historical record already accepted in their own period, so they must not make
+    a fresh report look approved.
+    """
+    if report.get("status") == "archived":
+        return "archived"
+
+    inits = report.get("initiatives") or []
+    if not inits:
+        return "in-progress"
+    reviewable = current_rows(report) or inits
+    if not report.get("submitted_at"):
+        return "in-progress"
+    if any(i.get("initiative_status") == "returned" for i in reviewable):
+        return "rejected"
+    if all(i.get("initiative_status") == "approved" for i in reviewable):
+        return "approved"
+    return "submitted"
+
+
+def refresh_status(report: dict) -> dict:
+    """Recompute and store the report's status. Called on every save."""
+    report["status"] = computed_status(report)
+    return report
+
+
+def is_locked(report: dict) -> bool:
+    """True when the preparer may not edit. rejected is NOT locked —
+    the user needs to be able to fix what was flagged and resubmit."""
+    return computed_status(report) in LOCKED_STATUSES
+
+
+def clear_return_flag(init: dict, reason: str = "revised") -> dict:
+    """Move an outstanding review comment into history and reset the initiative
+    to active. Without this, a returned initiative kept showing the reviewer's
+    comment as a live problem even after the user had fixed it."""
+    if init.get("initiative_status") == "returned":
+        comment = (init.get("review_comment") or "").strip()
+        if comment:
+            init.setdefault("review_history", []).append({
+                "comment":     comment,
+                "at":          init.get("returned_at"),
+                "resolved_by": reason,
+            })
+        init["initiative_status"] = "active"
+        init["review_comment"]    = ""
+        init["returned_at"]       = None
+    return init
+
+
+def outstanding_returns(report: dict) -> list[dict]:
+    """Current-period initiatives flagged for revision."""
+    return [
+        i for i in current_rows(report)
+        if i.get("initiative_status") == "returned"
+    ]
+
+
+def review_started(report: dict) -> bool:
+    """True once the reviewer has accepted or returned anything in this report.
+    Until then the preparer may withdraw the submission and keep editing."""
+    return any(
+        i.get("initiative_status") in ("approved", "returned")
+        for i in current_rows(report)
+    )
+
+
+def unsubmit(report: dict) -> dict:
+    """Withdraw a submission so the preparer can keep working. Only valid before
+    the reviewer has touched anything."""
+    report.pop("submitted_at", None)
+    report.pop("approved_at", None)
+    return refresh_status(report)
+
+
+def mark_submitted(report: dict) -> dict:
+    """Submit or resubmit. Any outstanding review flags are cleared — the user is
+    asserting they've addressed the feedback, and the comments stay in history so
+    the reviewer can still see what was asked."""
+    for init in current_rows(report):
+        clear_return_flag(init, reason="resubmitted")
+    report["submitted_at"] = int(time.time() * 1000)
+    return refresh_status(report)
+
+
 # ── Storage ───────────────────────────────────────────────────────────────────
+# All persistence goes through store.py — this section is only thin adapters.
+# A report is identified by (user, entity, filing period). Entity is part of the
+# key, so filing two entities in the same month no longer overwrites one with
+# the other.
 
 def _safe_name(s: str) -> str:
     return s.replace(" ", "_").replace("/", "_")
 
-def registry_path() -> Path:
-    return DATA_DIR / "registry.json"
 
-def load_registry() -> list:
-    p = registry_path()
-    return json.loads(p.read_text()) if p.exists() else []
-
-def save_registry(users: list):
-    registry_path().write_text(json.dumps(users, indent=2))
-
-
-def custom_entities_path() -> Path:
-    return DATA_DIR / "custom_entities.json"
-
-def load_custom_entities() -> list[str]:
-    p = custom_entities_path()
-    return json.loads(p.read_text()) if p.exists() else []
-
-def save_custom_entities(entities: list[str]):
-    custom_entities_path().write_text(json.dumps(entities, indent=2))
+# ── Entities ──────────────────────────────────────────────────────────────────
 
 def all_entities() -> list[str]:
-    """Base entities (107-110) + any custom ones added by users, in order added."""
-    custom = load_custom_entities()
+    """Base entities plus any added through the UI, in the order they were added."""
+    custom = store.get_config("custom_entities", []) or []
     return ENTITIES + [e for e in custom if e not in ENTITIES]
 
 def add_custom_entity(new_entity: str) -> bool:
-    """
-    Adds a new entity so it persists in the dropdown going forward.
-    Returns True if it was newly added, False if it already existed.
-    """
+    """Adds an entity so it persists in the dropdown. False if it already exists."""
     new_entity = str(new_entity).strip()
-    if not new_entity:
+    if not new_entity or new_entity in all_entities():
         return False
-    existing = all_entities()
-    if new_entity in existing:
-        return False
-    custom = load_custom_entities()
+    custom = store.get_config("custom_entities", []) or []
     custom.append(new_entity)
-    save_custom_entities(custom)
+    store.set_config("custom_entities", custom)
     return True
 
 
-def permissions_path() -> Path:
-    return DATA_DIR / "permissions.json"
+# ── Permissions ───────────────────────────────────────────────────────────────
 
 def load_permissions() -> dict:
-    """Returns {username: [entity_list]} — empty list means user sees all entities."""
-    p = permissions_path()
-    return json.loads(p.read_text()) if p.exists() else {}
+    """{username: [entity, ...]}. An empty list means no restriction."""
+    return store.get_config("permissions", {}) or {}
 
 def save_permissions(perms: dict):
-    permissions_path().write_text(json.dumps(perms, indent=2))
+    store.set_config("permissions", perms)
 
 def get_user_entities(username: str) -> list[str]:
-    """Returns the entities this user is permitted to see.
-    If no restriction is configured, returns all entities."""
+    """Entities this user may FILE reports for.
+
+    Note: this governs filing only. The Archive tab deliberately shows every
+    entity to everyone — it is a shared record, not a per-entity permission.
+    """
     perms = load_permissions()
     if username not in perms or not perms[username]:
         return all_entities()
     return [e for e in perms[username] if e in all_entities()]
 
 
-def months_index_path(username: str) -> Path:
-    return DATA_DIR / f"{_safe_name(username)}_months.json"
+# ── Reports ───────────────────────────────────────────────────────────────────
 
-def load_user_months(username: str) -> list:
-    p = months_index_path(username)
-    return json.loads(p.read_text()) if p.exists() else []
-
-def save_user_months(username: str, months: list):
-    months_index_path(username).write_text(json.dumps(months, indent=2))
-
-def submission_path(username: str, month: str) -> Path:
-    return DATA_DIR / f"{_safe_name(username)}_{month}.json"
-
-def load_submission(username: str, month: str) -> dict | None:
-    p = submission_path(username, month)
-    return json.loads(p.read_text()) if p.exists() else None
+def load_submission(username: str, entity: str, month: str) -> dict | None:
+    return store.get_report(username, entity, month)
 
 def save_draft(username: str, draft: dict):
-    """
-    Always keys by draft['reporting_month'] — this is the fix that ensures
-    May submissions don't appear under June.
-    """
-    month = draft.get("reporting_month") or cur_month()
-    submission_path(username, month).write_text(json.dumps(draft, indent=2))
-    # Registry
-    reg = load_registry()
-    if username not in reg:
-        reg.append(username)
-        save_registry(reg)
-    # Per-user month index — only track months that have real content
-    # (avoids empty setup sessions polluting the admin view)
-    has_content = bool(draft.get("initiatives")) or draft.get("status") not in ("in-progress", None)
-    if has_content:
-        months = load_user_months(username)
-        if month not in months:
-            months.append(month)
-            save_user_months(username, months)
+    """Persist a draft. Silently does nothing until Report Setup is complete,
+    since a report with no entity or period has no identity to be stored under."""
+    draft["user"] = username
+    if not (draft.get("entity") and draft.get("reporting_month")):
+        return
+    refresh_status(draft)
+    store.save_report(draft)
 
-def load_all_submissions() -> dict:
-    """
-    Returns { username: { reporting_month: submission_dict } }
-    Uses each user's month index so we find ALL months, not just current.
-    """
-    reg = load_registry()
-    all_data: dict[str, dict] = {}
-    for user in reg:
-        all_data[user] = {}
-        for month in load_user_months(user):
-            sub = load_submission(user, month)
-            if sub:
-                all_data[user][month] = sub
-    return all_data
+def all_reports(**filters) -> list[dict]:
+    """Every non-empty report, newest period first. Filters pass through to store."""
+    return store.list_reports(**filters)
 
-def repair_months_index() -> int:
-    """
-    Scans the data/ folder for all submission JSON files and ensures every
-    file with real initiatives is correctly registered in:
-      - registry.json  (user list)
-      - {username}_months.json  (per-user month index)
+def load_user_months(username: str) -> list[str]:
+    """Filing months where this user has real data, newest first."""
+    return store.list_periods(user=username)
 
-    Runs automatically on every admin page load.
-    Returns the number of entries that were repaired/added.
-    """
-    repaired = 0
-    pattern  = re.compile(r'^(.+)_(\d{4}-\d{2})\.json$')
-
-    for filepath in DATA_DIR.glob("*.json"):
-        # Skip index/registry files
-        if filepath.stem in ("registry", ) or filepath.stem.endswith("_months"):
-            continue
-
-        m = pattern.match(filepath.name)
-        if not m:
-            continue
-
-        raw_user = m.group(1).replace("_", " ")   # reverse _safe_name (best effort)
-        month    = m.group(2)
-
-        try:
-            data = json.loads(filepath.read_text())
-        except Exception:
-            continue
-
-        # Only index if it has real initiatives
-        if not data.get("initiatives"):
-            continue
-
-        # Determine the actual username from registry (handles multi-word names)
-        reg = load_registry()
-        # Try to find matching user in registry
-        username = None
-        for u in reg:
-            if _safe_name(u) == m.group(1):
-                username = u
-                break
-        if username is None:
-            # Not in registry — use the raw_user and add to registry
-            # Check if the safe name of raw_user matches
-            username = raw_user
-            if username not in reg:
-                reg.append(username)
-                save_registry(reg)
-                repaired += 1
-
-        # Ensure month is in user's months index
-        months = load_user_months(username)
-        if month not in months:
-            months.append(month)
-            save_user_months(username, months)
-            repaired += 1
-
-    return repaired
+def user_reports(username: str) -> list[dict]:
+    return store.list_reports(user=username)
 
 
-def create_backup_excel(all_data: dict) -> bytes:
-    """
-    Creates a comprehensive Excel backup of ALL historical data.
-    One sheet per entity (same format as consolidated export).
-    Only includes initiatives that are currently in submissions
-    (deleted initiatives are already removed from the data).
-    Includes all statuses — nothing is filtered out.
-    """
-    combos = get_combos(all_data)
-    if not combos:
-        # Return a minimal workbook with a message
-        wb  = Workbook()
-        ws  = wb.active
+# ── Backup / bulk delete ──────────────────────────────────────────────────────
+
+def create_backup_excel() -> bytes:
+    """Every report, every status, one tab per entity."""
+    reports = all_reports()
+    if not reports:
+        wb = Workbook()
+        ws = wb.active
         ws.title = "No Data"
-        ws.cell(1, 1, "No submissions found.")
+        ws.cell(1, 1, "No reports found.")
         buf = io.BytesIO()
         wb.save(buf)
         return buf.getvalue()
-    return build_excel_consolidated(all_data, combos, submitted_only=False)
+    # dedupe=False: a backup must be able to rebuild every period file, so it
+    # keeps the carried-forward copies that the deliverable export collapses.
+    return build_excel_consolidated(
+        reports, group_by="entity", status_desc="All statuses (backup)", dedupe=False
+    )
 
 
-def delete_all_history():
-    """
-    Deletes all submission JSON files and index files from the data/ directory.
-    Preserves the directory itself. Irreversible — caller must confirm first.
-    """
-    for filepath in DATA_DIR.glob("*.json"):
-        filepath.unlink()
+def delete_all_history() -> int:
+    """Deletes every report. Entity list and permissions live in a separate
+    directory and are preserved — they used to be caught by the same glob and
+    wiped along with the data, with no way to recover them."""
+    return store.delete_all_reports()
 
 
 # ── Excel Import / Restore ─────────────────────────────────────────────────────
@@ -451,7 +515,11 @@ for _k, _v in STATUS_LABELS.items():
 def _parse_status_label(s: str) -> str:
     if not s:
         return "in-progress"
-    return _STATUS_LABEL_TO_KEY.get(str(s).strip().lower(), "in-progress")
+    key = _STATUS_LABEL_TO_KEY.get(str(s).strip().lower(), "")
+    if not key:
+        # Files exported before the status rename say "Rejected".
+        key = LEGACY_STATUS_ALIASES.get(str(s).strip().lower().lstrip("🔴 ").strip(), "")
+    return key or "in-progress"
 
 
 def _cell_to_date_str(value) -> str:
@@ -620,6 +688,14 @@ def parse_import_workbook(file_bytes: bytes) -> tuple[dict, list[str]]:
             init["notes"]                   = str(get("notes", ""))
             init["month_yr"]                = activities_month
             init["carry_over"]              = False
+            # No series column in the export, so group by name within the entity.
+            init["series_id"]               = series_id_of(init)
+            # A row whose month predates the report's own period is a carried-in
+            # historical row, not this period's work.
+            init["historical"] = bool(
+                activities_month and reporting_month
+                and activities_month < prev_month_of(reporting_month)
+            )
 
             if status_key in ("approved", "archived"):
                 init["initiative_status"] = "approved"
@@ -667,165 +743,184 @@ def apply_import(parsed: dict, overwrite: bool = False) -> dict:
     imported, skipped = [], []
     for (username, entity, rm), data in parsed.items():
         label = f"{username} — Entity {entity} — {fmt_month(rm)}"
-        existing = load_submission(username, rm)
+        existing = load_submission(username, entity, rm)
         if existing and existing.get("initiatives") and not overwrite:
             skipped.append(label)
             continue
 
         draft = {
+            "user":             username,
             "initiatives":      data["initiatives"],
             "status":           data["status"] if data["status"] in STATUS_LABELS else "approved",
             "entity":           entity,
             "reporting_month":  rm,
             "activities_month": data["activities_month"],
         }
+        # Restored reports were submitted at some point or they wouldn't exist in
+        # an export, so give them a submitted_at — status is derived from it.
+        if draft["status"] != "in-progress":
+            draft.setdefault("submitted_at", int(time.time() * 1000))
         save_draft(username, draft)
         imported.append(label)
     return {"imported": imported, "skipped": skipped}
 
 
-def get_combos(all_data: dict) -> list[tuple[str, str]]:
-    """
-    Returns sorted list of unique (entity, reporting_month) tuples
-    found across submissions that have at least one initiative.
-    """
-    combos: set[tuple[str, str]] = set()
-    for user, months in all_data.items():
-        for month, sub in months.items():
-            if not sub.get("initiatives"):
-                continue   # skip empty setup drafts
-            e  = sub.get("entity", "")
-            rm = sub.get("reporting_month", month)
-            if e and rm:
-                combos.add((e, rm))
-    return sorted(combos, key=lambda x: (x[1], x[0]))
+def get_combos() -> list[tuple[str, str]]:
+    """Unique (entity, filing period) pairs that have data, oldest first."""
+    return store.list_combos()
 
 
 # ── Memory / history helpers ─────────────────────────────────────────────────
 
 def get_past_ongoing_initiatives(username: str, current_reporting_month: str) -> list[dict]:
     """
-    Returns all initiatives from ALL past submissions for this user where
-    expected_end_date is still in the future (or not set).
-    Deduplicates by initiative_name so the same initiative doesn't appear
-    multiple times if it was carried over in earlier months.
+    Ongoing initiatives from all of this user's earlier reports — anything whose
+    expected end date is still ahead of us and that hasn't been marked resolved.
+    Deduplicated by name, keeping the most recent version of each.
     """
-    months    = load_user_months(username)
-    today     = date.today()
-    seen      = set()
-    result    = []
+    today  = date.today()
+    seen   = set()
+    result = []
 
-    # Walk months newest-first so we get the most recent version of each initiative
-    for month in sorted(months, reverse=True):
-        if month >= current_reporting_month:
-            continue   # skip current or future periods
-        sub = load_submission(username, month)
-        if not sub:
+    for rep in sorted(
+        user_reports(username),
+        key=lambda r: r.get("reporting_month", ""),
+        reverse=True,
+    ):
+        if rep.get("reporting_month", "") >= current_reporting_month:
             continue
-        for init in (sub.get("initiatives") or []):
-            name = init.get("initiative_name", "").strip().lower()
-            if name in seen:
-                continue   # already have a newer version
-            seen.add(name)
-            # Skip resolved initiatives — user marked them as complete
+        for init in latest_per_series(rep):
+            sid = series_id_of(init)
+            if not sid or sid in seen:
+                continue
+            seen.add(sid)
             if init.get("resolved"):
                 continue
             end = init.get("expected_end_date")
             if end:
                 try:
                     if datetime.strptime(str(end), "%Y-%m-%d").date() < today:
-                        continue   # already ended
-                except Exception:
+                        continue
+                except ValueError:
                     pass
             result.append(init)
     return result
 
 
-def get_user_history(username: str) -> list[tuple[str, dict]]:
-    """
-    Returns [(month_str, submission_dict), ...] sorted newest-first.
-    """
-    months = load_user_months(username)
-    history = []
-    for month in sorted(months, reverse=True):
-        sub = load_submission(username, month)
-        if sub:
-            history.append((month, sub))
-    return history
+def get_user_history(username: str) -> list[dict]:
+    """This user's reports, newest filing period first."""
+    return user_reports(username)
 
 
 # ── Entity rollover ───────────────────────────────────────────────────────────
 
 def rollover_entity(
-    all_data: dict,
     source_entity: str,
     source_month: str,
     target_month: str,
+    only_users: list[str] | None = None,
 ) -> list[str]:
     """
-    For every user who has an APPROVED or ARCHIVED submission under
-    (source_entity, source_month), create a new in-progress draft under
-    (source_entity, target_month) — unless they already have one there.
+    Roll an approved period forward, mirroring the Power Automate flow: the file
+    is copied, the copy is retitled to the next period, and the original is
+    archived.
 
-    Matching the Power Automate flow:
-    - Only approved/archived submissions can be rolled (not in-progress/submitted).
-    - The source submission is automatically archived after rollover.
+    The copy KEEPS every existing row unchanged — those are the historical record
+    of what was done in each earlier month — and adds one fresh row per ongoing
+    initiative, stamped with the new period and with the activities field cleared
+    for the preparer to fill in. Resolved initiatives get no new row.
 
-    Returns list of usernames that were rolled over.
+    So September's report contains August's rows and a new September row for each
+    ongoing initiative, and the preparer adds rows for anything brand new.
     """
+    import copy as _copy
     rolled: list[str] = []
+    now = int(time.time() * 1000)
+    target_am = prev_month_of(target_month)
 
-    for username, months in all_data.items():
-        src_sub = months.get(source_month)
-        if not src_sub or src_sub.get("entity") != source_entity:
+    for src_rep in all_reports(entity=source_entity, period=source_month):
+        username = src_rep.get("user", "")
+        if only_users is not None and username not in only_users:
+            continue
+        # Only a report the Oversight Lead has accepted may roll forward.
+        if computed_status(src_rep) not in ("approved", "archived"):
+            continue
+        if not (src_rep.get("initiatives") or []):
             continue
 
-        # Only roll over approved or already-archived submissions
-        if src_sub.get("status") not in ("approved", "archived"):
+        existing = load_submission(username, source_entity, target_month)
+        if existing and existing.get("initiatives"):
             continue
 
-        # Don't overwrite an existing real submission in the target period
-        existing = load_submission(username, target_month)
-        if existing and existing.get("entity") == source_entity and existing.get("initiatives"):
-            continue
+        new_inits: list[dict] = []
 
-        initiatives = src_sub.get("initiatives") or []
-        if not initiatives:
-            continue
+        # 1. Every existing row carries over untouched, frozen as history.
+        for i in src_rep.get("initiatives") or []:
+            hist = _copy.deepcopy(i)
+            hist["series_id"]  = series_id_of(i)
+            hist["historical"] = True
+            if not hist.get("month_yr"):
+                hist["month_yr"] = src_rep.get("activities_month") or source_month
+            new_inits.append(hist)
 
-        import copy as _copy
-        rolled_inits = []
-        for i in initiatives:
-            init = _copy.deepcopy(i)
-            init["id"]                = f"{int(__import__('time').time()*1000)}{len(rolled_inits)}"
-            init["initiative_status"] = "active"
-            init["approved_at"]       = None
-            init["returned_at"]       = None
-            init["carry_over"]        = True
-            init["month_yr"]          = ""
-            rolled_inits.append(init)
+        # 2. One new row per ongoing series, for the new period.
+        for series in latest_per_series(src_rep):
+            if series.get("resolved"):
+                continue
+            fresh = _copy.deepcopy(series)
+            fresh["id"]                = f"{now}_{len(new_inits)}"
+            fresh["series_id"]         = series_id_of(series)
+            fresh["month_yr"]          = target_am
+            fresh["historical"]        = False
+            fresh["carry_over"]        = True
+            # This month's work hasn't been described yet — that's the preparer's job.
+            fresh["activities"]        = ""
+            fresh["notes"]             = ""
+            fresh["pathway"]           = ""
+            fresh["initiative_status"] = "active"
+            fresh["approved_at"]       = None
+            fresh["returned_at"]       = None
+            fresh["review_comment"]    = ""
+            fresh["review_history"]    = []
+            fresh["completion_date"]   = None
+            fresh["resolved"]          = False
+            new_inits.append(fresh)
 
-        new_sub: dict = {
-            "initiatives":      rolled_inits,
+        save_draft(username, {
+            "user":             username,
+            "initiatives":      new_inits,
             "status":           "in-progress",
             "entity":           source_entity,
             "reporting_month":  target_month,
-            "activities_month": prev_month_of(target_month),
-            # Tracks that this draft was created by admin rollover, not the user.
-            # Used to show the user a notification on login.
+            "activities_month": target_am,
             "rolled_over_from": source_month,
-        }
-        save_draft(username, new_sub)
+        })
 
-        # Auto-archive the source submission (matching PA Flow 4 behaviour)
-        if src_sub.get("status") != "archived":
-            src_sub["status"]      = "archived"
-            src_sub["archived_at"] = int(__import__("time").time() * 1000)
-            save_draft(username, src_sub)
+        # The source period is archived, as the flow did on completion.
+        if src_rep.get("status") != "archived":
+            src_rep["status"]      = "archived"
+            src_rep["archived_at"] = now
+            store.save_report(src_rep)
 
         rolled.append(username)
 
     return rolled
+
+
+def rollable_users(entity: str, source_month: str, target_month: str) -> list[str]:
+    """Users who would actually be rolled by the given move."""
+    out = []
+    for rep in all_reports(entity=entity, period=source_month):
+        if computed_status(rep) not in ("approved", "archived"):
+            continue
+        if not (rep.get("initiatives") or []):
+            continue
+        username = rep.get("user", "")
+        existing = load_submission(username, entity, target_month)
+        if existing and existing.get("initiatives"):
+            continue
+        out.append(username)
+    return sorted(out)
 
 
 # ── Initiative helpers ────────────────────────────────────────────────────────
@@ -848,6 +943,14 @@ def new_initiative() -> dict:
         "initiative_status":     "active",   # active | approved | returned
         "approved_at":           None,       # ms timestamp when admin approved
         "returned_at":           None,       # ms timestamp when admin returned
+        # review_comment: the outstanding reviewer note, shown only while the
+        # initiative is returned. Cleared into review_history once revised.
+        "review_comment":        "",
+        "review_history":        [],
+        # series_id: stable across months. Each month's row shares it.
+        "series_id":             f"s{int(datetime.now().timestamp()*1000)}_{_rnd.randint(10000,99999)}",
+        # historical: True for a row carried in from an earlier month (read-only).
+        "historical":            False,
         # month_yr: the reporting period this initiative row belongs to.
         # Set when first saved; preserved through admin rollovers so each row
         # always shows the correct original period in the export.
@@ -864,10 +967,14 @@ def new_initiative() -> dict:
     }
 
 def carryover_initiative(src: dict) -> dict:
+    """Manual carry-over from the dashboard. Continues the same series, so the
+    export groups it with the earlier months of the same initiative."""
     init = new_initiative()
     for f in CARRYOVER_FIELDS:
         init[f] = src.get(f, init[f])
     init["carry_over"] = True
+    init["series_id"]  = series_id_of(src)
+    init["historical"] = False
     return init
 
 def empty_draft() -> dict:
@@ -1005,7 +1112,7 @@ def _write_sheet(ws, rows_data: list[dict], subtitle: str):
 def _sub_to_rows(username: str, sub: dict, include_user: bool) -> list[dict]:
     """Convert a submission dict into a list of row dicts for _write_sheet."""
     rm     = sub.get("reporting_month", "")
-    status = STATUS_LABELS.get(sub.get("status", ""), sub.get("status", ""))
+    status = STATUS_LABELS.get(computed_status(sub), sub.get("status", ""))
     rows   = []
     for init in sub.get("initiatives") or []:
         row = {
@@ -1013,11 +1120,14 @@ def _sub_to_rows(username: str, sub: dict, include_user: bool) -> list[dict]:
             "_month":  fmt_month(init.get("month_yr") or sub.get("activities_month") or rm),
             "_filing": fmt_month(rm),
             "_status": status,
+            # Completion date: the user's own date if they resolved the
+            # initiative, otherwise when it was accepted. Both formatted in
+            # Eastern time via the same helper, rather than one going through a
+            # fixed -5 offset and the other through the server's local timezone.
             "_completion": (
-                init.get("completion_date") or
-                (ts_to_est(init["approved_at"], "%Y-%m-%d %H:%M") if init.get("approved_at") else
-                 datetime.fromtimestamp(sub["approved_at"] / 1000).strftime("%Y-%m-%d")
-                 if sub.get("approved_at") else "")
+                init.get("completion_date")
+                or ts_to_et(init.get("approved_at"), "%Y-%m-%d")
+                or ts_to_et(sub.get("approved_at"), "%Y-%m-%d")
             ),
             "business_component":    init.get("business_component",    ""),
             "initiative_name":       init.get("initiative_name",        ""),
@@ -1047,7 +1157,8 @@ def build_excel_individual(username: str, sub: dict) -> bytes:
         f"Submitted by: {username}  |  Entity: {entity}  |  "
         f"Filing: {fmt_month(fm)}  |  Reporting Period: {fmt_month(am)}"
     )
-    rows = _sub_to_rows(username, sub, include_user=False)
+    rows, _ = collect_rows([{**sub, "user": username}], include_user=False)
+    rows.sort(key=lambda r: (r.get("_month", ""), r.get("initiative_name", "")))
     _write_sheet(ws, rows, subtitle)
     buf = io.BytesIO()
     wb.save(buf)
@@ -1055,90 +1166,113 @@ def build_excel_individual(username: str, sub: dict) -> bytes:
 
 
 def build_excel_consolidated(
-    all_data: dict,
-    selected_combos: list[tuple[str, str]],
-    submitted_only: bool = False,
-    status_filter: list[str] | None = None,
+    reports: list[dict],
     group_by: str = "entity",   # "entity" → one tab per entity | "user" → one tab per person
+    status_desc: str = "",
+    dedupe: bool = True,
 ) -> bytes:
     """
-    Builds a consolidated Excel workbook.
+    Consolidated workbook from a list of reports. Callers filter the list; this
+    function only lays it out.
 
-    group_by="entity" (default, for user self-exports):
-        One sheet per entity tab named "Entity 107". All periods for that
-        entity appear as rows sorted by period then username.
+    group_by="entity"  one sheet per entity, rows sorted by period then user
+    group_by="user"    one sheet per person, rows sorted by entity then period
 
-    group_by="user" (for admin consolidated reports):
-        One sheet per team member tab named after the person. All their
-        entities/periods appear as rows sorted by entity then period.
+    dedupe=True (deliverable): one row per initiative per month, duplicates from
+    carried-forward copies collapsed. This is what you hand to a reviewer.
 
-    status_filter: if provided, only include submissions whose status is in
-    this list. Takes precedence over submitted_only.
+    dedupe=False (backup): every row from every period file, duplicates included.
+    Each row carries its own Filing Month, so the restore can rebuild the separate
+    period files exactly. Deduplicating a backup would silently discard the
+    intermediate periods, because the newest report's copy would win.
     """
     wb = Workbook()
     wb.remove(wb.active)
-
-    if status_filter is not None:
-        allowed_statuses = set(status_filter)
-        status_desc = ", ".join(STATUS_LABELS.get(s, s).split(" ", 1)[-1] for s in status_filter) or "None selected"
-    elif submitted_only:
-        allowed_statuses = {"submitted", "approved", "archived"}
-        status_desc = "Submitted, Approved & Archived"
-    else:
-        allowed_statuses = None
-        status_desc = "All statuses"
+    status_desc = status_desc or "All statuses"
 
     if group_by == "user":
-        # ── One tab per person ───────────────────────────────────────────────
-        for username in sorted(all_data.keys()):
-            rows = []
-            # Sort by entity then reporting_month so a user's sheet reads chronologically
-            combos_for_user = sorted(
-                [(e, rm) for e, rm in selected_combos],
-                key=lambda x: (x[0], x[1]),
-            )
-            for entity, rm in combos_for_user:
-                sub = all_data[username].get(rm)
-                if not sub or sub.get("entity") != entity:
-                    continue
-                if allowed_statuses is not None and sub.get("status") not in allowed_statuses:
-                    continue
-                rows.extend(_sub_to_rows(username, sub, include_user=False))
-
+        for username in sorted({r.get("user", "") for r in reports if r.get("user")}):
+            mine = [r for r in reports if r.get("user") == username]
+            rows, _ = collect_rows(mine, include_user=False, dedupe=dedupe)
+            rows.sort(key=lambda r: (r.get("_month", ""), r.get("initiative_name", "")))
             if not rows:
                 continue
-            ws = wb.create_sheet(title=username[:31])
-            subtitle = f"Team member: {username}  |  {status_desc}"
-            _write_sheet(ws, rows, subtitle)
+            ws = wb.create_sheet(title=(username or "Unknown")[:31])
+            _write_sheet(ws, rows, f"Team member: {username}  |  {status_desc}")
 
     else:
-        # ── One tab per entity (original behaviour) ──────────────────────────
-        entities = sorted({e for e, _ in selected_combos})
-        for entity in entities:
+        for entity in sorted({r.get("entity", "") for r in reports if r.get("entity")}):
+            theirs = [r for r in reports if r.get("entity") == entity]
+            rows, _ = collect_rows(theirs, include_user=True, dedupe=dedupe)
+            rows.sort(key=lambda r: (r.get("_month", ""), r.get("user", ""), r.get("initiative_name", "")))
+            if not rows:
+                continue
             ws = wb.create_sheet(title=f"Entity {entity}"[:31])
-            subtitle = f"Entity: {entity}  |  {status_desc}"
-            entity_combos = sorted(
-                [(e, rm) for e, rm in selected_combos if e == entity],
-                key=lambda x: x[1],
-            )
-            rows = []
-            for _, rm in entity_combos:
-                for username in sorted(all_data.keys()):
-                    sub = all_data[username].get(rm)
-                    if not sub or sub.get("entity") != entity:
-                        continue
-                    if allowed_statuses is not None and sub.get("status") not in allowed_statuses:
-                        continue
-                    rows.extend(_sub_to_rows(username, sub, include_user=True))
-            _write_sheet(ws, rows, subtitle)
+            _write_sheet(ws, rows, f"Entity: {entity}  |  {status_desc}")
 
     if not wb.sheetnames:
         ws = wb.create_sheet("No Data")
-        ws.cell(1, 1, "No matching submissions found.")
+        ws.cell(1, 1, "No reports match the selected filters.")
 
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
+
+
+def collect_rows(
+    reports: list[dict], include_user: bool, dedupe: bool = True
+) -> tuple[list[dict], int]:
+    """Flatten reports into export rows, dropping duplicates.
+
+    Because rolling forward copies earlier rows into the new period's report, the
+    same (initiative, month) appears in every later report as well as its own.
+    Selecting several periods would otherwise list those rows once per report.
+
+    Rows are keyed on (user, entity, series, month). Where the same row appears
+    more than once, the version from the LATEST report wins, since that is the
+    most recently reviewed copy. Returns the rows plus how many duplicates were
+    dropped, so the UI can say so rather than quietly changing the count.
+    """
+    if not dedupe:
+        out = []
+        for rep in sorted(reports, key=lambda r: r.get("reporting_month", "")):
+            out.extend(_sub_to_rows(rep.get("user", ""), rep, include_user=include_user))
+        return out, 0
+
+    seen: dict[tuple, dict] = {}
+    dropped = 0
+    # Ascending, so later reports overwrite earlier copies of the same row.
+    for rep in sorted(reports, key=lambda r: r.get("reporting_month", "")):
+        username = rep.get("user", "")
+        for row, init in zip(
+            _sub_to_rows(username, rep, include_user=include_user),
+            rep.get("initiatives") or [],
+        ):
+            key = (
+                username,
+                rep.get("entity", ""),
+                series_id_of(init),
+                init.get("month_yr") or rep.get("activities_month") or "",
+            )
+            if key in seen:
+                dropped += 1
+            seen[key] = row
+    return list(seen.values()), dropped
+
+
+def dedupe_stats(reports: list[dict]) -> tuple[int, int]:
+    """(unique rows, duplicates dropped) for the export summary."""
+    rows, dropped = collect_rows(reports, include_user=True)
+    return len(rows), dropped
+
+
+def status_desc_for(status_keys: list[str]) -> str:
+    """Human-readable status list for an export subtitle."""
+    if not status_keys:
+        return "None selected"
+    return ", ".join(
+        STATUS_LABELS.get(s, s).split(" ", 1)[-1] for s in status_keys
+    )
 
 
 # ── CSS ───────────────────────────────────────────────────────────────────────
@@ -1151,7 +1285,8 @@ def inject_css():
     .badge-approved    { background:#f0fdf4; color:#166534; border:1.5px solid #86efac; }
     .badge-submitted   { background:#eff6ff; color:#1e40af; border:1.5px solid #93c5fd; }
     .badge-in-progress { background:#fef9ec; color:#92600a; border:1.5px solid #fcd34d; }
-    .badge-rejected    { background:#fff1f2; color:#9f1239; border:1.5px solid #fda4af; }
+    .badge-rejected    { background:#fff7ed; color:#9a3412; border:1.5px solid #fdba74; }
+    .badge-archived    { background:#f8fafc; color:#475569; border:1.5px solid #cbd5e1; }
     .badge-not-started { background:#f8fafc; color:#64748b; border:1.5px solid #cbd5e1; }
     .rd-badge { display:inline-block; padding:3px 12px; border-radius:20px; font-size:12px; font-weight:700; }
     .progress-bar-outer { background:#e2e8f0; border-radius:4px; height:8px; overflow:hidden; margin-bottom:6px; }
@@ -1170,7 +1305,7 @@ def badge_html(status: str) -> str:
         "approved":    "badge-approved",
         "submitted":   "badge-submitted",
         "in-progress": "badge-in-progress",
-        "rejected":    "badge-rejected",
+        "rejected": "badge-rejected",
     }
     cls   = cls_map.get(status, "badge-not-started")
     label = STATUS_LABELS.get(status, status)
@@ -1178,42 +1313,30 @@ def badge_html(status: str) -> str:
 
 def best_draft_for_user(username: str) -> dict:
     """
-    Picks the most relevant draft to load on login:
-    1. The earliest in-progress period that has real initiatives
-       (likely a rollover waiting to be reviewed and submitted).
-    2. The current calendar month's filing if it exists.
-    3. A fresh empty draft for the current month.
-
-    This ensures the user lands on something actionable — e.g. if
-    they've already submitted June and July, and a rollover created
-    an August in-progress draft, they open directly on August.
+    Picks the report to open on sign-in, in priority order:
+      1. The earliest in-progress report with real content — usually a rollover
+         waiting to be reviewed and submitted.
+      2. The current filing month, if it already exists.
+      3. The most recent report with any content.
+      4. A fresh empty draft for the current month.
     """
-    months_index = load_user_months(username)
+    reports = user_reports(username)
 
-    # Priority 1: any in-progress period with real initiatives
-    # (sort ascending so earliest un-submitted period wins)
-    in_progress = sorted([
-        m for m in months_index
-        if (sub := load_submission(username, m))
-        and sub.get("initiatives")
-        and sub.get("status") == "in-progress"
-    ])
+    in_progress = sorted(
+        [r for r in reports if r.get("status") == "in-progress"],
+        key=lambda r: r.get("reporting_month", ""),
+    )
     if in_progress:
-        return load_submission(username, in_progress[0])
+        return in_progress[0]
 
-    # Priority 2: current calendar month if it already has a submission
     cur = cur_month()
-    cur_sub = load_submission(username, cur)
-    if cur_sub and cur_sub.get("initiatives"):
-        return cur_sub
+    for r in reports:
+        if r.get("reporting_month") == cur:
+            return r
 
-    # Priority 3: most recent period with any real content
-    for month in sorted(months_index, reverse=True):
-        sub = load_submission(username, month)
-        if sub and sub.get("initiatives"):
-            return sub
+    if reports:
+        return max(reports, key=lambda r: r.get("reporting_month", ""))
 
-    # Fallback: empty draft for current month
     draft = empty_draft()
     draft["reporting_month"]  = cur
     draft["activities_month"] = prev_month_of(cur)
@@ -1251,7 +1374,7 @@ def screen_login():
         """, unsafe_allow_html=True)
         options = ["— Select your name —", "⚙ Admin (Oversight Lead)"] + EMPLOYEES
         sel = st.selectbox("Sign in as", options, label_visibility="collapsed")
-        if st.button("Sign In →", use_container_width=True, type="primary"):
+        if st.button("Sign In →", width='stretch', type="primary"):
             if sel.startswith("— "):
                 st.warning("Please select your name.")
             else:
@@ -1290,99 +1413,73 @@ def screen_login():
 # Streamlit has no background scheduler — these checks run only when someone
 # opens the app, and simply surface a visible nudge based on today's date.
 
-def _all_rejection_comments(sub: dict) -> list[str]:
-    """Collect every rejection comment on a submission — report-level and per-initiative."""
-    comments = []
-    rc = sub.get("rejection_comment", "")
-    if rc:
-        comments.append(rc)
-    for init in sub.get("initiatives") or []:
-        irc = init.get("rejection_comment", "")
-        if irc and init.get("initiative_status") == "returned":
-            comments.append(f"{init.get('initiative_name','Initiative')}: {irc}")
-    return comments
+def outstanding_review_notes(report: dict) -> list[str]:
+    """Reviewer notes on initiatives still awaiting revision, one per line."""
+    notes = []
+    for init in outstanding_returns(report):
+        comment = (init.get("review_comment") or "").strip()
+        name = init.get("initiative_name", "Initiative")
+        notes.append(f"{name}: {comment}" if comment else name)
+    return notes
 
 
 def render_user_reminder(user: str, current_filing_month: str = ""):
     """
-    Three types of alerts, in priority order:
-    1. Rejected periods — shown prominently regardless of what period is currently viewed.
-    2. Unsubmitted in-progress periods from other filing months.
-    3. Monthly filing reminder (past the 5th).
+    Alerts in priority order:
+      1. Reports with initiatives sent back for revision.
+      2. Unsubmitted reports from other filing periods.
+      3. Monthly filing nudge after the 5th.
     """
-    months_index = load_user_months(user)
+    reports = user_reports(user)
 
-    # ── Priority 1: Rejected periods — always show, takes precedence ─────────
-    for month in sorted(months_index, reverse=True):
-        sub = load_submission(user, month)
-        if not sub or not sub.get("initiatives"):
+    # ── Reports needing revision ─────────────────────────────────────────────
+    for rep in reports:
+        if computed_status(rep) != "rejected":
             continue
-        if sub.get("status") != "rejected":
-            continue
-        ack_key = f"ack_rejection_{month}"
-        already_acked = st.session_state.get(ack_key, False)
-        comments = _all_rejection_comments(sub)
-        comment_str = ""
-        if comments:
-            comment_str = "  " + "  |  ".join(f'"{c}"' for c in comments)
-
+        month = rep.get("reporting_month", "")
         if month == current_filing_month:
-            # Current period rejection is shown inline in the status strip — skip here
-            continue
-
-        # Show rejection banner for OTHER periods regardless of what's currently loaded
-        st.error(
-            f"🔴 Your **{fmt_month(month)}** report was Rejected by the Oversight Lead."
-            + (f"  Comment: {comment_str}" if comment_str else "")
+            continue   # shown inline in the status strip instead
+        n = len(outstanding_returns(rep))
+        st.warning(
+            f"🔴 **{fmt_month(month)}** (Entity {rep.get('entity','—')}) — "
+            f"{n} initiative{'s' if n != 1 else ''} need{'' if n != 1 else 's'} revision. "
+            f"Switch to that period in Report Setup to update {'them' if n != 1 else 'it'}."
         )
-        if not already_acked:
-            st.warning(
-                f"Switch to **Filing: {fmt_month(month)}** in Report Setup above, "
-                "then click **Acknowledge & Prepare Resubmission** to begin updating."
-            )
 
-    # ── Priority 2: Unsubmitted in-progress drafts from other periods ────────
-    pending_periods = []
-    for month in months_index:
-        if month == current_filing_month:
-            continue
-        sub = load_submission(user, month)
-        if sub and sub.get("initiatives") and sub.get("status") == "in-progress":
-            pending_periods.append((month, bool(sub.get("rolled_over_from"))))
-
-    if pending_periods:
-        parts = []
-        for month, was_rolled in pending_periods:
-            label = f"**{fmt_month(month)}**" + (" *(rolled over by admin)*" if was_rolled else "")
-            parts.append(label)
+    # ── Unsubmitted drafts elsewhere ─────────────────────────────────────────
+    pending = [
+        rep for rep in reports
+        if computed_status(rep) == "in-progress"
+        and rep.get("reporting_month") != current_filing_month
+    ]
+    if pending:
+        parts = [
+            f"**{fmt_month(r.get('reporting_month',''))}**"
+            + (" *(rolled forward by the Oversight Lead)*" if r.get("rolled_over_from") else "")
+            for r in pending
+        ]
         st.warning(
             f"⚠ You have an unsubmitted report for {', '.join(parts)}. "
-            "Open **Report Setup** above, select that Filing Month, "
-            "review your initiatives, and click **Submit for Review**."
+            "Open Report Setup, select that filing month, review your initiatives, "
+            "then submit for review."
         )
 
-    # ── Priority 3: Monthly filing reminder (past the 5th) ───────────────────
-    today = date.today()
-    if today.day >= 5:
+    # ── Monthly nudge ────────────────────────────────────────────────────────
+    if date.today().day >= 5:
         cur = cur_month()
-        existing = load_submission(user, cur)
-        if not existing or not existing.get("initiatives"):
+        if not any(r.get("reporting_month") == cur for r in reports):
             st.info(
-                f"📅 It's past the 5th and you haven't started your "
-                f"**{fmt_month(cur)}** filing yet. "
-                "Set up your report below to get started."
+                f"📅 It's past the 5th and your **{fmt_month(cur)}** filing "
+                "hasn't been started. Set up your report below to begin."
             )
 
 
-def render_admin_reminder(all_data: dict):
-    """
-    Surfaces a count of reports still pending review when the admin logs in.
-    """
-    pending = []
-    for username, months in all_data.items():
-        for month, sub in months.items():
-            if sub.get("status") == "submitted" and sub.get("initiatives"):
-                pending.append((username, month))
+def render_admin_reminder():
+    """Surfaces a count of reports still waiting on review."""
+    pending = [
+        (r.get("user", ""), r.get("reporting_month", ""))
+        for r in all_reports(statuses=["submitted"])
+    ]
     if pending:
         names = ", ".join(f"{u} ({fmt_month(m)})" for u, m in pending[:5])
         extra = f" +{len(pending)-5} more" if len(pending) > 5 else ""
@@ -1392,15 +1489,15 @@ def render_admin_reminder(all_data: dict):
 def screen_dashboard():
     user      = st.session_state.user
     draft     = st.session_state.draft
-    # "rejected" is treated the same as "in-progress" for editing/submitting
-    # — user needs to be able to fix and resubmit after a rejection.
-    # Locked states: submitted, approved, archived.
-    # Rejected reports are also locked UNTIL the user acknowledges the rejection
-    # (matching PA Flow 3 — user must explicitly confirm they've seen the feedback
-    # before the edit/resubmit cycle opens up).
-    ack_key  = f"ack_rejection_{draft.get('reporting_month')}"
-    rejected_unacked = draft["status"] == "rejected" and not st.session_state.get(ack_key)
-    submitted = draft["status"] in ("submitted", "approved", "archived") or rejected_unacked
+    # Status is derived from the initiatives, not stored independently.
+    # "rejected" is deliberately NOT locked — the user has to be able to
+    # fix what was flagged. There is no acknowledgement step: it used to live in
+    # st.session_state, which meant signing out or an app restart forced the user
+    # to acknowledge the same feedback again.
+    status      = computed_status(draft)
+    locked      = status in LOCKED_STATUSES
+    is_archived = status == "archived"
+    submitted   = locked   # retained name, used widely below
 
     # Header
     c1, c2 = st.columns([5, 1])
@@ -1437,11 +1534,19 @@ def screen_dashboard():
     # and hasn't been submitted yet — so the user knows exactly what happened.
     rolled_from = draft.get("rolled_over_from")
     if rolled_from and draft.get("status") == "in-progress":
+        n_new  = len(current_rows(draft))
+        n_past = len(historical_rows(draft))
         st.info(
-            f"📋 **The Oversight Lead has rolled your {fmt_month(rolled_from)} report "
-            f"forward to {fmt_month(draft.get('reporting_month',''))}.**  \n"
-            "Your initiatives have been carried over and are ready for you to review. "
-            "Update your activities for this month, then click **Submit for Review** when ready.",
+            f"📋 **Your {fmt_month(rolled_from)} report has been rolled forward to "
+            f"{fmt_month(draft.get('reporting_month',''))}.**  \n"
+            f"{n_new} ongoing initiative{'s' if n_new != 1 else ''} "
+            f"{'have' if n_new != 1 else 'has'} a fresh row for this month with the "
+            "activities field blank — describe what you did this month, then submit. "
+            + (
+                f"The {n_past} row{'s' if n_past != 1 else ''} from earlier months "
+                "are kept in the report as a record and can't be edited."
+                if n_past else ""
+            ),
             icon="📋",
         )
 
@@ -1533,16 +1638,37 @@ def screen_dashboard():
         act_changed    = chosen_act    != draft.get("activities_month")
 
         if entity_changed or filing_changed or act_changed:
-            if filing_changed:
-                existing = load_submission(user, chosen_filing)
-                draft    = existing if existing else empty_draft()
-            draft["entity"]           = chosen_entity
-            draft["reporting_month"]  = chosen_filing
-            draft["activities_month"] = chosen_act
-            save_draft(user, draft)
-            st.session_state.draft = draft
-            st.session_state.show_entry_picker = False   # close picker when period changes
-            st.rerun()
+            # Changing entity or filing month is NAVIGATION, not an edit: load the
+            # report that actually lives at the new (entity, period) address.
+            # Previously only the filing month triggered a reload, so switching
+            # entity relabelled the current report's initiatives instead —
+            # silently retagging Entity 107 work as Entity 108.
+            if entity_changed or filing_changed:
+                existing = load_submission(user, chosen_entity, chosen_filing)
+                if existing:
+                    draft = existing
+                else:
+                    draft = empty_draft()
+                    draft["activities_month"] = prev_month_of(chosen_filing)
+                draft["entity"]          = chosen_entity
+                draft["reporting_month"] = chosen_filing
+                st.session_state.draft = draft
+                st.session_state.show_entry_picker = False
+                st.rerun()
+
+            # Reporting-period change is a real edit, so refuse it on a locked
+            # report rather than mutating a submitted or archived record.
+            elif act_changed:
+                if is_locked(draft):
+                    st.warning(
+                        f"This report is {STATUS_LABELS.get(computed_status(draft), '')} "
+                        "and can't be changed. Ask the Oversight Lead to reopen it."
+                    )
+                else:
+                    draft["activities_month"] = chosen_act
+                    save_draft(user, draft)
+                    st.session_state.draft = draft
+                    st.rerun()
 
         if setup_complete:
             fname = export_filename(draft["entity"], draft["reporting_month"])
@@ -1564,8 +1690,10 @@ def screen_dashboard():
     past_inits = get_past_ongoing_initiatives(user, draft["reporting_month"])
 
     # Filter out initiatives already in the current draft (by name)
-    current_names = {i.get("initiative_name","").strip().lower() for i in draft["initiatives"]}
-    past_inits    = [i for i in past_inits if i.get("initiative_name","").strip().lower() not in current_names]
+    # Compare on series, not name — the same initiative may already be present as
+    # a carried-forward row under a slightly different label.
+    present_series = {series_id_of(i) for i in draft["initiatives"]}
+    past_inits     = [i for i in past_inits if series_id_of(i) not in present_series]
 
     if not submitted and past_inits:
         st.markdown(f"""
@@ -1590,36 +1718,50 @@ def screen_dashboard():
     # ── Status strip ─────────────────────────────────────────────────────────
     c1, c2, c3 = st.columns([4, 1, 1])
     with c1:
-        st.markdown(f"**Report Status:** {badge_html(draft['status'])}", unsafe_allow_html=True)
+        st.markdown(f"**Report Status:** {badge_html(status)}", unsafe_allow_html=True)
         if draft.get("submitted_at"):
-            ts = ts_to_est(draft["submitted_at"], "%b %d, %Y %I:%M %p")
-            st.caption(f"Submitted {ts}")
-        if draft["status"] == "rejected":
-            comments = _all_rejection_comments(draft)
-            msg = "Your report was Rejected by the Oversight Lead."
-            if comments:
-                msg += " " + "  |  ".join(f'"{c}"' for c in comments)
-            st.error(msg)
-            # Show acknowledgement button matching PA Flow 3 — user must confirm
-            # they've seen the rejection before the resubmit cycle can restart.
-            if not st.session_state.get(f"ack_rejection_{draft.get('reporting_month')}"):
-                st.warning(
-                    "Please review the feedback above, update your initiatives if needed, "
-                    "then click **Acknowledge & Prepare Resubmission** to confirm you've seen "
-                    "the rejection and are ready to update."
+            st.caption(f"Submitted {ts_to_et(draft['submitted_at'])}")
+
+        if status == "rejected":
+            flagged = outstanding_returns(draft)
+            total   = len(draft.get("initiatives") or [])
+            st.warning(
+                f"🔴 {len(flagged)} of {total} initiative"
+                f"{'s' if total != 1 else ''} need"
+                f"{'' if len(flagged) != 1 else 's'} revision. "
+                "Everything else has been accepted — update the flagged "
+                f"initiative{'s' if len(flagged) != 1 else ''} below and resubmit."
+            )
+            for note in outstanding_review_notes(draft):
+                st.markdown(f"&nbsp;&nbsp;• {note}", unsafe_allow_html=True)
+        elif status == "archived":
+            arc_str = f" on {ts_to_et(draft['archived_at'], '%b %d, %Y')}" if draft.get("archived_at") else ""
+            st.info(
+                f"📦 Archived{arc_str}. This report is read-only. "
+                "Ask the Oversight Lead to reopen it if it needs changing."
+            )
+        elif status == "submitted":
+            if review_started(draft):
+                st.info(
+                    "🔵 The Oversight Lead has started reviewing this report, so it "
+                    "can't be withdrawn. Anything they send back will show up here."
                 )
-                if st.button("✓ Acknowledge & Prepare Resubmission", key="ack_rejection_btn"):
-                    st.session_state[f"ack_rejection_{draft.get('reporting_month')}"] = True
-                    st.rerun()
             else:
-                st.info("✓ Rejection acknowledged. Update your initiatives below, then resubmit.")
-        elif draft["status"] == "archived":
-            arc_ts = draft.get("archived_at")
-            arc_str = f" on {ts_to_est(arc_ts, '%b %d, %Y')}" if arc_ts else ""
-            st.info(f"📦 This period was archived{arc_str} and is now locked. Contact the Oversight Lead to reopen it.")
+                st.info("🔵 With the Oversight Lead for review — not looked at yet.")
+                if st.button("✏ Make changes", key="unsubmit_btn",
+                             help="Withdraws the submission so you can keep editing"):
+                    unsubmit(draft)
+                    save_draft(user, draft)
+                    st.session_state.draft = draft
+                    st.success("Withdrawn. Edit what you need, then submit again.")
+                    st.rerun()
     with c2:
-        st.metric("Initiatives", len(draft["initiatives"]))
+        st.metric("Initiatives", len(current_rows(draft)))
     with c3:
+        if st.button("📦 Archive →", key="nav_archive",
+                     help="Archived reports for the whole team, read-only"):
+            st.session_state.screen = "archive"
+            st.rerun()
         if st.session_state.is_admin and st.button("Admin View →"):
             st.session_state.screen = "admin"
             st.rerun()
@@ -1649,7 +1791,7 @@ def screen_dashboard():
                     parts.append(f"⚠ {n_returned} need{'s' if n_returned==1 else ''} revision")
                 st.caption(" · ".join(parts) + " — adding more will include them in the same submission.")
 
-            if st.button("＋ Add Initiative", type="primary", use_container_width=True):
+            if st.button("＋ Add Initiative", type="primary", width='stretch'):
                 st.session_state.screen = "entry_picker"
                 st.rerun()
 
@@ -1660,8 +1802,14 @@ def screen_dashboard():
         # Lets you see everything at a glance before opening any single card —
         # this is what matters once there are more than a couple initiatives.
         status_icon_map = {"approved": "✅", "returned": "🔴", "active": "🔵"}
+        # Only this period's rows are actionable. Rows carried in from earlier
+        # months are a fixed record of what was reported then, and appear in the
+        # read-only history block below.
+        editable_inits = current_rows(draft)
+        past_rows      = historical_rows(draft)
+
         table_rows = []
-        for init in draft["initiatives"]:
+        for init in editable_inits:
             istatus = init.get("initiative_status", "active")
             table_rows.append({
                 " ":                  status_icon_map.get(istatus, "🔵"),
@@ -1673,15 +1821,38 @@ def screen_dashboard():
             })
         st.dataframe(
             table_rows,
-            use_container_width=True,
+            width='stretch',
             hide_index=True,
             column_config={" ": st.column_config.TextColumn(width="small")},
         )
-        st.caption("✅ Approved by admin   ·   🔴 Rejected — needs revision   ·   🔵 Active / pending review")
+        st.caption("✅ Accepted   ·   🔴 Rejected — needs revision   ·   🔵 Pending review")
+
+        if past_rows:
+            months = sorted({i.get("month_yr", "") for i in past_rows if i.get("month_yr")}, reverse=True)
+            with st.expander(
+                f"📖 Earlier months in this report ({len(past_rows)} row"
+                f"{'s' if len(past_rows) != 1 else ''}) — read-only"
+            ):
+                st.caption(
+                    "Carried forward when this period was rolled over. These are the "
+                    "records of what was reported in "
+                    + ", ".join(fmt_month(m) for m in months)
+                    + ". They stay in the report and in the export, and can't be edited."
+                )
+                st.dataframe(
+                    [{
+                        "Month": fmt_month(i.get("month_yr", "")),
+                        "Initiative": i.get("initiative_name", "Unnamed"),
+                        "Activities": (i.get("activities", "") or "")[:120],
+                        "Team": ", ".join(i.get("team_members") or []),
+                    } for i in sorted(past_rows, key=lambda x: x.get("month_yr", ""), reverse=True)],
+                    width='stretch',
+                    hide_index=True,
+                )
 
         st.write("")
 
-        for init in draft["initiatives"]:
+        for init in editable_inits:
             iid = init["id"]
             istatus = init.get("initiative_status", "active")
             status_icon = status_icon_map.get(istatus, "🔵")
@@ -1708,45 +1879,48 @@ def screen_dashboard():
                 if init.get("notes"):
                     st.markdown(f"*Notes: {init['notes']}*")
 
-                # Per-initiative status banner (set by admin)
+                # Reviewer feedback on this specific initiative
                 if istatus == "returned":
-                    ret_ts = init.get("returned_at")
-                    ret_str = f" on {ts_to_est(ret_ts, '%b %d %I:%M %p')}" if ret_ts else ""
-                    rc = init.get("rejection_comment", "")
-                    rc_str = f' Comment: "{rc}".' if rc else ""
-                    st.warning(f"⚠ This initiative was Rejected{ret_str}.{rc_str} Edit and resubmit.")
+                    ret_str = f" on {ts_to_et(init['returned_at'], '%b %d %I:%M %p')}" if init.get("returned_at") else ""
+                    rc = (init.get("review_comment") or "").strip()
+                    st.warning(
+                        f"🔴 Revision requested{ret_str}."
+                        + (f'  Reviewer note: "{rc}"' if rc else "")
+                        + "  Edit this initiative, then resubmit the report."
+                    )
                 elif istatus == "approved":
-                    appr_ts = init.get("approved_at")
-                    appr_str = f" on {ts_to_est(appr_ts, '%b %d %I:%M %p')}" if appr_ts else ""
-                    st.success(f"✓ Approved by admin{appr_str}.")
+                    appr_str = f" on {ts_to_et(init['approved_at'], '%b %d %I:%M %p')}" if init.get("approved_at") else ""
+                    st.success(f"✓ Accepted by the Oversight Lead{appr_str}.")
 
-                is_archived = draft["status"] == "archived"
+                # Earlier rounds of feedback, kept for context once addressed.
+                if init.get("review_history"):
+                    with st.expander(f"Previous feedback ({len(init['review_history'])})"):
+                        for h in init["review_history"]:
+                            when = ts_to_et(h.get("at"), "%b %d, %Y") if h.get("at") else ""
+                            st.caption(f"{when} — {h.get('comment','')}")
+
                 st.write("")
-                c1, c2, c3, c4 = st.columns([2.5, 0.8, 0.8, 0.8])
+                # Editing is blocked whenever the report is locked, not only when
+                # archived. Deleting from a submitted or approved report used to
+                # silently revert it to In Progress, un-approving work the
+                # Oversight Lead had already signed off without telling anyone.
+                lock_help = (
+                    f"This report is {STATUS_LABELS.get(status, status)} and can't be edited."
+                    if locked else None
+                )
+                c1, c2, c3 = st.columns([4, 0.8, 0.8])
                 with c2:
-                    if st.button("✏ Edit", key=f"edit_{iid}", disabled=is_archived,
-                                 help="This period is archived and locked." if is_archived else None):
+                    if st.button("✏ Edit", key=f"edit_{iid}", disabled=locked, help=lock_help):
                         st.session_state.wiz_init = dict(init)
                         st.session_state.wiz_step = 0
-                        # Carry-over initiatives go to the pathway selector first
-                        if init.get("carry_over") and not is_archived:
+                        if init.get("carry_over"):
                             st.session_state.screen = "pathway_select"
                         else:
                             st.session_state.wiz_mode = "edit"
                             st.session_state.screen   = "wizard"
                         st.rerun()
                 with c3:
-                    if st.button("📤 Submit for Review", key=f"usub_{iid}", disabled=submitted,
-                                 help="Marks your full report as Ready for Review"):
-                        draft["status"]       = "submitted"
-                        draft["submitted_at"] = int(datetime.now().timestamp()*1000)
-                        save_draft(user, draft)
-                        st.session_state.draft = draft
-                        st.success("Report submitted!")
-                        st.rerun()
-                with c4:
-                    if st.button("🗑 Delete", key=f"del_{iid}", disabled=is_archived,
-                                 help="This period is archived and locked." if is_archived else None):
+                    if st.button("🗑 Delete", key=f"del_{iid}", disabled=locked, help=lock_help):
                         st.session_state.confirm_del = iid
                         st.rerun()
 
@@ -1760,8 +1934,8 @@ def screen_dashboard():
                     with ca:
                         if st.button("Yes, delete it", key=f"conf_yes_{iid}", type="primary"):
                             draft["initiatives"] = [i for i in draft["initiatives"] if i["id"] != iid]
-                            if submitted:
-                                draft["status"] = "in-progress"
+                            if not current_rows(draft):
+                                # An empty report was never really submitted.
                                 draft.pop("submitted_at", None)
                             save_draft(user, draft)
                             st.session_state.draft       = draft
@@ -1778,26 +1952,23 @@ def screen_dashboard():
     st.divider()
     c1, c2 = st.columns([3, 1])
     with c1:
-        if not submitted and draft["initiatives"]:
-            was_rejected = draft["status"] == "rejected"
-            label = "Resubmit — Ready for Review ✓" if was_rejected else "Submit — Ready for Review ✓"
-            caption = (
-                "Resubmitting will send your updated report back to the Oversight Lead for review."
-                if was_rejected else
-                f"Sends your {len(draft['initiatives'])} initiative"
-                f"{'s' if len(draft['initiatives'])!=1 else ''} to the Oversight Lead for review."
+        if not locked and draft["initiatives"]:
+            revising = status == "rejected"
+            n = len(draft["initiatives"])
+            st.markdown("#### Ready to resubmit?" if revising else "#### Ready to submit?")
+            st.caption(
+                "Sends your revised report back to the Oversight Lead for review."
+                if revising else
+                f"Sends {n} initiative{'s' if n != 1 else ''} to the Oversight Lead for review."
             )
-            st.markdown("#### Ready to submit?" if not was_rejected else "#### Ready to resubmit?")
-            st.caption(caption)
-            if st.button(label, type="primary"):
-                draft["status"]       = "submitted"
-                draft["submitted_at"] = int(datetime.now().timestamp()*1000)
-                draft.pop("rejection_comment", None)   # clear old rejection comment
-                # Clear the acknowledgement flag since the cycle is now restarted
-                st.session_state.pop(f"ack_rejection_{draft.get('reporting_month')}", None)
+            if st.button(
+                "Resubmit for review" if revising else "Submit for review",
+                type="primary",
+            ):
+                mark_submitted(draft)
                 save_draft(user, draft)
                 st.session_state.draft = draft
-                st.success("Report resubmitted!" if was_rejected else "Report submitted!")
+                st.success("Resubmitted for review." if revising else "Submitted for review.")
                 st.rerun()
     with c2:
         if draft.get("initiatives"):
@@ -1817,195 +1988,140 @@ def screen_dashboard():
 
     # ── History ──────────────────────────────────────────────────────────────
     st.write("")
-    render_history_section(user, draft.get("reporting_month",""))
+    render_history_section(
+        user, draft.get("reporting_month", ""), draft.get("entity", "")
+    )
 
 
 # ── User Export ───────────────────────────────────────────────────────────────
 
 def render_user_export_section(user: str):
-    """
-    Lets a signed-in user filter and download their own submissions as Excel.
-    Filters: entity, filing month, reporting period, status.
-    """
-    all_months = load_user_months(user)
-    if not all_months:
+    """Filter and download this user's own reports as Excel."""
+    reports = user_reports(user)
+    if not reports:
         return
 
-    # Collect every submission for this user
-    user_subs = []   # (reporting_month, sub)
-    for month in all_months:
-        sub = load_submission(user, month)
-        if sub and sub.get("initiatives"):
-            user_subs.append((month, sub))
-
-    if not user_subs:
-        return
-
-    with st.expander("⬇ Export My Reports", expanded=False):
-        st.caption("Filter your reports and download a custom Excel file.")
+    with st.expander("⬇ Export my reports", expanded=False):
+        st.caption("Filter your reports and download them as one Excel file.")
         st.write("")
 
-        STATUS_LABELS_USER = {
-            "in-progress": "🟡 In Progress",
-            "submitted":   "🔵 Ready for Review",
-            "approved":    "🟢 Approved",
-            "rejected":    "🔴 Rejected",
-            "archived":    "📦 Archived",
-        }
-
-        # ── Filters ──────────────────────────────────────────────────────────
         fc1, fc2, fc3 = st.columns(3)
-
-        # Entity filter
-        entities_present = sorted({s.get("entity","") for _, s in user_subs if s.get("entity")})
         with fc1:
-            f_entity = st.selectbox(
-                "Entity",
-                ["All"] + entities_present,
-                key="ue_entity",
-            )
-
-        # Filing Month filter
-        filing_months = sorted({m for m, _ in user_subs}, reverse=True)
+            entities = sorted({r.get("entity", "") for r in reports if r.get("entity")})
+            f_entity = st.selectbox("Entity", ["All"] + entities, key="ue_entity")
         with fc2:
+            filings = sorted({r.get("reporting_month", "") for r in reports}, reverse=True)
             f_filing = st.selectbox(
-                "Filing Month",
-                ["All"] + [fmt_month(m) for m in filing_months],
+                "Filing month", ["All"] + filings, format_func=lambda m: m if m == "All" else fmt_month(m),
                 key="ue_filing",
             )
-
-        # Reporting Period filter
-        act_months = sorted(
-            {s.get("activities_month","") for _, s in user_subs if s.get("activities_month")},
-            reverse=True,
-        )
         with fc3:
+            periods = sorted(
+                {r.get("activities_month", "") for r in reports if r.get("activities_month")},
+                reverse=True,
+            )
             f_period = st.selectbox(
-                "Reporting Period",
-                ["All"] + [fmt_month(m) for m in act_months],
+                "Reporting period", ["All"] + periods,
+                format_func=lambda m: m if m == "All" else fmt_month(m),
                 key="ue_period",
             )
 
-        # Status checkboxes — flat, fully visible
         st.write("")
         st.caption("**Status**")
-        statuses_present = sorted({s.get("status","") for _, s in user_subs})
-        sel_statuses: list[str] = []
-        status_cols = st.columns(len(statuses_present) if statuses_present else 1)
-        for i, status_key in enumerate(statuses_present):
-            with status_cols[i]:
-                if st.checkbox(
-                    STATUS_LABELS_USER.get(status_key, status_key),
-                    value=True,
-                    key=f"ue_status_{status_key}",
-                ):
-                    sel_statuses.append(status_key)
+        present = sorted({computed_status(r) for r in reports})
+        chosen_statuses = []
+        cols = st.columns(max(len(present), 1))
+        for i, key in enumerate(present):
+            with cols[i]:
+                if st.checkbox(STATUS_LABELS.get(key, key), value=True, key=f"ue_status_{key}"):
+                    chosen_statuses.append(key)
 
-        # ── Apply filters ─────────────────────────────────────────────────────
-        filtered = []
-        for month, sub in user_subs:
-            if f_entity != "All" and sub.get("entity") != f_entity:
-                continue
-            if f_filing != "All" and fmt_month(month) != f_filing:
-                continue
-            if f_period != "All" and fmt_month(sub.get("activities_month","")) != f_period:
-                continue
-            if sub.get("status") not in sel_statuses:
-                continue
-            filtered.append((month, sub))
+        filtered = [
+            r for r in reports
+            if (f_entity == "All" or r.get("entity") == f_entity)
+            and (f_filing == "All" or r.get("reporting_month") == f_filing)
+            and (f_period == "All" or r.get("activities_month") == f_period)
+            and computed_status(r) in chosen_statuses
+        ]
 
         st.write("")
-
-        # ── Preview & Download ────────────────────────────────────────────────
         if not filtered:
-            st.caption("No reports match these filters.")
-        else:
-            # Summary line
-            n_inits = sum(len(s.get("initiatives") or []) for _, s in filtered)
-            st.caption(
-                f"{len(filtered)} report{'s' if len(filtered)!=1 else ''} · "
-                f"{n_inits} initiative{'s' if n_inits!=1 else ''}"
-            )
+            st.caption("No reports match these filters. Widen a filter to see results.")
+            return
 
-            if len(filtered) == 1:
-                # Single report → individual export
-                month, sub = filtered[0]
-                xlsx  = build_excel_individual(user, sub)
-                fname = export_filename(sub.get("entity",""), month)
-                st.caption("ℹ️ Only 1 period matches — downloading that single filing. Select more periods or change filters to get a consolidated export.")
-                st.download_button(
-                    f"↓ Download — {sub.get('entity','')} {fmt_month(month)} (1 period)",
-                    data=xlsx,
-                    file_name=fname,
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    type="primary",
-                    key="ue_dl_single",
-                )
-            else:
-                # Multiple reports → consolidated export (user's data only)
-                user_all_data = {user: {m: s for m, s in filtered}}
-                chosen_combos = list({(s.get("entity",""), m) for m, s in filtered})
-                chosen_status_keys = list(sel_statuses)
-                xlsx = build_excel_consolidated(
-                    user_all_data, chosen_combos,
-                    status_filter=chosen_status_keys,
-                    group_by="entity",
-                )
-                today = datetime.now().strftime("%m%d%y")
-                fname = f"{user.replace(' ','_')}_RD_Report_{today}.xlsx"
-                st.download_button(
-                    f"↓ Download {len(filtered)} Reports",
-                    data=xlsx,
-                    file_name=fname,
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    type="primary",
-                    key="ue_dl_multi",
-                )
+        n_inits = sum(len(r.get("initiatives") or []) for r in filtered)
+        st.caption(
+            f"{len(filtered)} report{'s' if len(filtered) != 1 else ''} · "
+            f"{n_inits} initiative{'s' if n_inits != 1 else ''}"
+        )
+
+        if len(filtered) == 1:
+            rep = filtered[0]
+            st.caption("One period matches, so this downloads that single filing.")
+            st.download_button(
+                f"↓ Download — Entity {rep.get('entity','')} {fmt_month(rep.get('reporting_month',''))}",
+                data=build_excel_individual(user, rep),
+                file_name=export_filename(rep.get("entity", ""), rep.get("reporting_month", "")),
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary",
+                key="ue_dl_single",
+            )
+        else:
+            st.download_button(
+                f"↓ Download {len(filtered)} reports",
+                data=build_excel_consolidated(
+                    filtered, group_by="entity", status_desc=status_desc_for(chosen_statuses)
+                ),
+                file_name=f"{_safe_name(user)}_RD_Report_{datetime.now().strftime('%m%d%y')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary",
+                key="ue_dl_multi",
+            )
 
 
 # ── History (shown below submit on the dashboard) ───────────────────────────
 
-def render_history_section(user: str, current_reporting_month: str):
-    """Renders a collapsible history of all past submissions for this user."""
-    history = get_user_history(user)
-    # Exclude current period from history display
-    history = [(m, s) for m, s in history if m != current_reporting_month]
-
+def render_history_section(user: str, current_reporting_month: str, current_entity: str = ""):
+    """This user's own past reports. The Archive tab shows everyone's."""
+    history = [
+        r for r in get_user_history(user)
+        if not (
+            r.get("reporting_month") == current_reporting_month
+            and r.get("entity") == current_entity
+        )
+    ]
     if not history:
         return
 
-    with st.expander(f"📁 My Submission History ({len(history)} past period{'s' if len(history)!=1 else ''})", expanded=False):
-        for month, sub in history:
-            entity  = sub.get("entity", "—")
-            status  = sub.get("status", "not-started")
-            inits   = sub.get("initiatives") or []
+    with st.expander(
+        f"📁 My submission history ({len(history)} report{'s' if len(history) != 1 else ''})",
+        expanded=False,
+    ):
+        for rep in history:
+            entity = rep.get("entity", "—")
+            month  = rep.get("reporting_month", "")
+            inits  = rep.get("initiatives") or []
             st.markdown(
-                f"**{entity} — {fmt_month(month)}** &nbsp; {badge_html(status)} &nbsp; "
-                f"*{len(inits)} initiative{'s' if len(inits)!=1 else ''}*",
+                f"**Entity {entity} — {fmt_month(month)}** &nbsp; "
+                f"{badge_html(computed_status(rep))} &nbsp; "
+                f"*{len(inits)} initiative{'s' if len(inits) != 1 else ''}*",
                 unsafe_allow_html=True,
             )
+            for i in inits:
+                st.markdown(
+                    f"&nbsp;&nbsp;&nbsp;• **{i.get('initiative_name','Unnamed')}** — "
+                    f"{i.get('business_component','')}  "
+                    f"📅 {i.get('start_date','—')} → {i.get('expected_end_date','—')}  "
+                    f"👥 {', '.join(i.get('team_members') or ['—'])}",
+                    unsafe_allow_html=True,
+                )
             if inits:
-                for i in inits:
-                    st.markdown(
-                        f"&nbsp;&nbsp;&nbsp;• **{i.get('initiative_name','Unnamed')}** — "
-                        f"{i.get('business_component','')}  "
-                        f"📅 {i.get('start_date','—')} → {i.get('expected_end_date','—')}  "
-                        f"👥 {', '.join(i.get('team_members') or ['—'])}",
-                        unsafe_allow_html=True,
-                    )
-                    if i.get("tech_uncertainty"):
-                        st.caption(f"   Uncertainty: {i['tech_uncertainty'][:120]}{'…' if len(i.get('tech_uncertainty',''))>120 else ''}")
-            # Export button for this past period — only if there are initiatives
-            if sub.get("entity") and sub.get("reporting_month") and inits:
-                h_xlsx  = build_excel_individual(user, sub)
-                h_fname = export_filename(sub["entity"], sub["reporting_month"])
                 st.download_button(
-                    f"↓ {entity} — {fmt_month(month)} (this period only)",
-                    data=h_xlsx,
-                    file_name=h_fname,
+                    f"↓ Entity {entity} — {fmt_month(month)}",
+                    data=build_excel_individual(user, rep),
+                    file_name=export_filename(entity, month),
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key=f"hist_dl_{month}",
-                    help="Downloads this single period's report. Use Export My Reports above for a custom multi-period download.",
+                    key=f"hist_dl_{entity}_{month}",
                 )
             st.write("")
 
@@ -2108,7 +2224,10 @@ def screen_wizard():
                 if mode in ("new", "carryover") and not init.get("month_yr"):
                     # Use activities_month (the R&D period) not filing month
                     init["month_yr"] = draft.get("activities_month") or draft.get("reporting_month", "")
+                init.setdefault("historical", False)
+                init["series_id"] = series_id_of(init)
                 if mode == "edit":
+                    clear_return_flag(init)
                     draft["initiatives"] = [i if i["id"] != init["id"] else init for i in draft["initiatives"]]
                 else:
                     draft["initiatives"].append(init)
@@ -2131,6 +2250,162 @@ def screen_wizard():
 
 # ── Admin ─────────────────────────────────────────────────────────────────────
 
+def render_archive_browser(key_prefix: str = "arc"):
+    """Read-only view of every archived report, for everyone.
+
+    Deliberately not filtered by the entity permissions in Settings — those
+    govern which entities a person may FILE for. The archive is a shared record
+    of closed periods that the whole team can read and export.
+
+    No edit controls are rendered here at all, rather than rendered-and-disabled,
+    so there is no path from this screen to a write.
+    """
+    archived = all_reports(statuses=["archived"])
+
+    if not archived:
+        st.info(
+            "Nothing archived yet. Reports appear here once the Oversight Lead "
+            "archives them from the Submissions tab."
+        )
+        return
+
+    st.caption(
+        f"{len(archived)} archived report"
+        f"{'s' if len(archived) != 1 else ''} across the whole team. "
+        "Read-only — archived reports can't be edited by anyone until the "
+        "Oversight Lead reopens them."
+    )
+    st.write("")
+
+    f1, f2, f3 = st.columns(3)
+    with f1:
+        entities = sorted({r.get("entity", "") for r in archived if r.get("entity")})
+        f_entity = st.selectbox("Entity", ["All"] + entities, key=f"{key_prefix}_entity")
+    with f2:
+        periods = sorted({r.get("reporting_month", "") for r in archived}, reverse=True)
+        f_period = st.selectbox(
+            "Filing month", ["All"] + periods,
+            format_func=lambda m: m if m == "All" else fmt_month(m),
+            key=f"{key_prefix}_period",
+        )
+    with f3:
+        people = sorted({r.get("user", "") for r in archived if r.get("user")})
+        f_user = st.selectbox("Team member", ["All"] + people, key=f"{key_prefix}_user")
+
+    shown = [
+        r for r in archived
+        if (f_entity == "All" or r.get("entity") == f_entity)
+        and (f_period == "All" or r.get("reporting_month") == f_period)
+        and (f_user   == "All" or r.get("user") == f_user)
+    ]
+
+    st.write("")
+    if not shown:
+        st.caption("No archived reports match these filters.")
+        return
+
+    unique_rows, dropped = dedupe_stats(shown)
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Reports", len(shown))
+    m2.metric("Rows", unique_rows)
+    m3.metric("Team members", len({r.get("user") for r in shown}))
+    if dropped:
+        st.caption(
+            f"ℹ {dropped} duplicate row{'s' if dropped != 1 else ''} collapsed in the "
+            "download — later periods carry copies of earlier months."
+        )
+
+    st.download_button(
+        f"↓ Download {len(shown)} archived report{'s' if len(shown) != 1 else ''}",
+        data=build_excel_consolidated(shown, group_by="entity", status_desc="Archived"),
+        file_name=f"RD_Archive_{datetime.now().strftime('%m%d%y')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key=f"{key_prefix}_dl_all",
+    )
+
+    st.write("")
+    st.divider()
+
+    for rep in shown:
+        entity = rep.get("entity", "—")
+        month  = rep.get("reporting_month", "")
+        who    = rep.get("user", "Unknown")
+        inits  = rep.get("initiatives") or []
+        arc    = f" · archived {ts_to_et(rep['archived_at'], '%b %d, %Y')}" if rep.get("archived_at") else ""
+
+        with st.expander(
+            f"📦 {who} — Entity {entity} — {fmt_month(month)} "
+            f"({len(inits)} initiative{'s' if len(inits) != 1 else ''})"
+        ):
+            st.caption(
+                f"Reporting period: {fmt_month(rep.get('activities_month','')) or '—'}{arc}"
+            )
+            for i in inits:
+                st.markdown(f"**{i.get('initiative_name','Unnamed')}** — {i.get('business_component','')}")
+                st.caption(
+                    f"📅 {i.get('start_date','—')} → {i.get('expected_end_date','—')}  ·  "
+                    f"👥 {', '.join(i.get('team_members') or ['—'])}"
+                )
+                if i.get("initiative_description"):
+                    st.markdown(i["initiative_description"])
+                if i.get("tech_uncertainty"):
+                    st.markdown("*Technical uncertainty:*")
+                    st.caption(i["tech_uncertainty"])
+                if i.get("activities"):
+                    st.markdown("*Activities:*")
+                    st.caption(i["activities"])
+                if i.get("notes"):
+                    st.caption(f"Notes: {i['notes']}")
+                st.write("")
+
+            st.download_button(
+                f"↓ {who} — Entity {entity} {fmt_month(month)}",
+                data=build_excel_individual(who, rep),
+                file_name=export_filename(entity, month).replace(
+                    ".xlsx", f"_{_safe_name(who)}.xlsx"
+                ),
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"{key_prefix}_dl_{_safe_name(who)}_{entity}_{month}",
+            )
+
+
+def screen_archive():
+    """Standalone archive screen for preparers."""
+    c1, c2 = st.columns([5, 1])
+    with c1:
+        st.markdown("## 📦 Archive")
+        st.caption("Every archived report across the team. Read-only.")
+    with c2:
+        st.write("")
+        if st.button("← Back"):
+            st.session_state.screen = "dashboard"
+            st.rerun()
+    st.divider()
+    render_archive_browser("arcuser")
+
+
+# ── Admin ─────────────────────────────────────────────────────────────────────
+
+def _select_all_controls(scope_key: str, keys: list[str], label: str):
+    """Select-all / clear-all as BUTTONS, not a parent checkbox.
+
+    A parent checkbox forced its children true on every rerun, which meant an
+    individual month could never be unticked while the parent was on. Buttons set
+    state once and then leave the child checkboxes alone.
+    """
+    b1, b2 = st.columns(2)
+    with b1:
+        if st.button(f"Select all {label}", key=f"{scope_key}_all"):
+            for k in keys:
+                st.session_state[k] = True
+            st.rerun()
+    with b2:
+        if st.button(f"Clear all {label}", key=f"{scope_key}_none"):
+            for k in keys:
+                st.session_state[k] = False
+            st.rerun()
+
+
 def screen_admin():
     st.markdown("## ⚙ Admin Dashboard")
 
@@ -2140,708 +2415,623 @@ def screen_admin():
             st.session_state.screen = "login" if st.session_state.user == "Admin" else "dashboard"
             st.rerun()
 
-    # Silently repair any missing index entries before loading data —
-    # ensures files that exist on disk are always included in the view.
-    repaired = repair_months_index()
-    if repaired:
-        st.info(f"🔧 Index repaired: {repaired} missing entr{'ies' if repaired!=1 else 'y'} restored from disk.")
+    reports = all_reports()
+    combos  = get_combos()
 
-    # Load everything, grouped by (entity, reporting_month)
-    all_data = load_all_submissions()
-    combos   = get_combos(all_data)   # [(entity, rm), ...]
+    render_admin_reminder()
 
-    render_admin_reminder(all_data)
+    # ── Summary ───────────────────────────────────────────────────────────────
+    by_status = {}
+    for r in reports:
+        by_status.setdefault(computed_status(r), []).append(r)
 
-    # ── Summary stats (always visible, above the tabs) ───────────────────────
-    all_subs  = [
-        sub for ud in all_data.values() for sub in ud.values()
-        if sub.get("initiatives")
-    ]
-    n_users   = sum(1 for ud in all_data.values() if any(s.get("initiatives") for s in ud.values()))
-    n_sub     = sum(1 for s in all_subs if s.get("status") in ("submitted","approved"))
-    n_appr    = sum(1 for s in all_subs if s.get("status") == "approved")
-    n_arch    = sum(1 for s in all_subs if s.get("status") == "archived")
-    n_inits   = sum(len(s.get("initiatives") or []) for s in all_subs)
-
+    n_inits = sum(len(r.get("initiatives") or []) for r in reports)
     c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.metric("Team Members",     n_users)
-    c2.metric("Periods/Entities", len(combos))
-    c3.metric("Submitted",        n_sub)
-    c4.metric("Approved",         n_appr)
-    c5.metric("Archived",         n_arch)
-    c6.metric("Total Initiatives",n_inits)
+    c1.metric("Team members",   len({r.get("user") for r in reports}))
+    c2.metric("Reports",        len(reports))
+    c3.metric("Awaiting review", len(by_status.get("submitted", [])))
+    c4.metric("Approved",       len(by_status.get("approved", [])))
+    c5.metric("Archived",       len(by_status.get("archived", [])))
+    c6.metric("Initiatives",    n_inits)
 
     st.write("")
 
-    # ── Navigation — radio stores the tab in session state so widget interactions
-    # inside a section don't reset back to Submissions on every rerun. ─────────
-    ADMIN_TABS = ["📁 Submissions", "🔄 Rollover", "⬇ Export", "🗄 Backup & Data", "⚙ Settings"]
-    if "admin_tab" not in st.session_state:
+    ADMIN_TABS = [
+        "📁 Submissions", "🔄 Rollover", "📦 Archive",
+        "⬇ Export", "🗄 Backup & Data", "⚙ Settings",
+    ]
+    if "admin_tab" not in st.session_state or st.session_state.admin_tab not in ADMIN_TABS:
         st.session_state.admin_tab = ADMIN_TABS[0]
     active_tab = st.radio(
-        "##nav",
-        ADMIN_TABS,
+        "##nav", ADMIN_TABS,
         index=ADMIN_TABS.index(st.session_state.admin_tab),
-        horizontal=True,
-        label_visibility="collapsed",
-        key="admin_tab_radio",
+        horizontal=True, label_visibility="collapsed", key="admin_tab_radio",
     )
     st.session_state.admin_tab = active_tab
     st.write("")
 
-    # ── Show only the active section ──────────────────────────────────────────
-    # (Previously used st.tabs which resets on every widget rerun inside a tab)
-
+    # ══ Submissions ═══════════════════════════════════════════════════════════
     if active_tab == "📁 Submissions":
-        if not combos:
-            st.info("No submissions found yet.")
+        if not reports:
+            st.info("No reports yet. They appear here once a team member submits one.")
         else:
             st.caption(
-                "**Filing Month** = the month the report was submitted in (sets the Group # in the filename). "
-                "Each report also has a separate **Reporting Period** — the month the R&D activities took place "
-                "in — shown inside each report below."
+                "**Filing month** is when the report was submitted — it sets the Group "
+                "number in the filename. **Reporting period** is when the R&D work "
+                "happened, shown inside each report."
             )
-            # ── Filters ──────────────────────────────────────────────────────
             fc1, fc2, fc3 = st.columns([1.2, 1.5, 1.5])
-            entities_present = sorted({e for e, _ in combos})
-            periods_present  = sorted({rm for _, rm in combos}, reverse=True)
-
             with fc1:
-                f_entity = st.selectbox(
-                    "Entity", ["All"] + entities_present, key="f_entity"
-                )
+                entities = sorted({e for e, _ in combos})
+                f_entity = st.selectbox("Entity", ["All"] + entities, key="f_entity")
             with fc2:
+                periods = sorted({rm for _, rm in combos}, reverse=True)
                 f_period = st.selectbox(
-                    "Filing Month", ["All"] + [fmt_month(p) for p in periods_present], key="f_period"
+                    "Filing month", ["All"] + periods,
+                    format_func=lambda m: m if m == "All" else fmt_month(m),
+                    key="f_period",
                 )
             with fc3:
-                f_status = st.selectbox(
-                    "Status",
-                    ["All", "Ready for Review", "Approved", "Archived", "Rejected", "In Progress"],
-                    key="f_status",
-                )
+                status_opts = ["All"] + [STATUS_LABELS[k] for k in
+                    ("submitted", "rejected", "approved", "archived", "in-progress")]
+                f_status_label = st.selectbox("Status", status_opts, key="f_status")
 
-            status_map = {
-                "Ready for Review": "submitted", "Approved": "approved",
-                "Archived": "archived", "Rejected": "rejected", "In Progress": "in-progress",
-            }
+            label_to_key = {v: k for k, v in STATUS_LABELS.items()}
+            f_status = label_to_key.get(f_status_label)
 
-            filtered_combos = [
-                (e, rm) for e, rm in combos
-                if (f_entity == "All" or e == f_entity)
-                and (f_period == "All" or fmt_month(rm) == f_period)
+            shown = [
+                r for r in reports
+                if (f_entity == "All" or r.get("entity") == f_entity)
+                and (f_period == "All" or r.get("reporting_month") == f_period)
+                and (f_status is None or computed_status(r) == f_status)
             ]
 
-            if not filtered_combos:
-                st.caption("No periods match the selected filters.")
+            if not shown:
+                st.caption("No reports match these filters.")
 
-            for (entity, rm) in filtered_combos:
-                combo_rows = []
-                for username, months in all_data.items():
-                    sub = months.get(rm)
-                    if not sub or sub.get("entity") != entity:
-                        continue
-                    status = sub.get("status", "not-started")
-                    inits  = sub.get("initiatives") or []
-                    if not inits and status == "in-progress":
-                        continue
-                    if f_status != "All" and status != status_map.get(f_status):
-                        continue
-                    combo_rows.append((username, sub))
+            # Group by (entity, period) for readability
+            groups: dict[tuple[str, str], list[dict]] = {}
+            for r in shown:
+                groups.setdefault((r.get("entity", ""), r.get("reporting_month", "")), []).append(r)
 
-                if not combo_rows:
-                    continue
+            for (entity, rm) in sorted(groups.keys(), key=lambda c: (c[1], c[0]), reverse=True):
+                group = sorted(groups[(entity, rm)], key=lambda r: r.get("user", ""))
+                sample_am = next((r.get("activities_month") for r in group if r.get("activities_month")), None)
+                am_suffix = f"  ·  Reporting period: **{fmt_month(sample_am)}**" if sample_am else ""
+                st.markdown(f"#### Entity {entity} — Filing month: **{fmt_month(rm)}**{am_suffix}")
 
-                # Show both Filing Month and the typical Reporting Period for this group
-                sample_am = next(
-                    (s.get("activities_month") for _, s in combo_rows if s.get("activities_month")),
-                    None,
-                )
-                am_suffix = f"  ·  Reporting Period: **{fmt_month(sample_am)}**" if sample_am else ""
-                st.markdown(f"#### Entity {entity} — Filing Month: **{fmt_month(rm)}**{am_suffix}")
-
-                for username, sub in combo_rows:
-                    status = sub.get("status", "not-started")
-                    inits  = sub.get("initiatives") or []
-                    icon   = {"approved":"✅","submitted":"🔵","in-progress":"🟡",
-                              "rejected":"🔴","archived":"📦","not-started":"⚪"}.get(status,"⚪")
+                for rep in group:
+                    username = rep.get("user", "Unknown")
+                    rstatus  = computed_status(rep)
+                    inits    = rep.get("initiatives") or []
+                    n_cur    = len(current_rows(rep))
+                    n_past   = len(historical_rows(rep))
+                    icon     = {"approved": "✅", "submitted": "🔵", "in-progress": "🟡",
+                                "rejected": "🔴", "archived": "📦"}.get(rstatus, "⚪")
+                    rkey     = f"{entity}_{rm}_{_safe_name(username)}"
 
                     with st.expander(
-                        f"{icon}  {username}   —  {STATUS_LABELS.get(status,'—')}  "
-                        f"({len(inits)} initiative{'s' if len(inits)!=1 else ''})",
-                        expanded=(status == "submitted"),
+                        f"{icon}  {username}   —  {STATUS_LABELS.get(rstatus, '—')}  "
+                        f"({n_cur} this period"
+                        + (f" · {n_past} carried" if n_past else "") + ")",
+                        expanded=(rstatus == "submitted"),
                     ):
-                        # ── Report-level info + export ────────────────────────
                         h1, h2 = st.columns([4, 1])
                         with h1:
-                            rep_period = sub.get("activities_month", "")
                             st.markdown(
-                                f"**Filing Month:** {fmt_month(rm)} &nbsp;|&nbsp; "
-                                f"**Reporting Period:** {fmt_month(rep_period) or '—'}",
+                                f"**Filing month:** {fmt_month(rm)} &nbsp;|&nbsp; "
+                                f"**Reporting period:** {fmt_month(rep.get('activities_month','')) or '—'}",
                                 unsafe_allow_html=True,
                             )
-                            if sub.get("submitted_at"):
-                                ts = ts_to_est(sub["submitted_at"], "%b %d %I:%M %p")
-                                st.caption(f"Submitted: {ts}")
-                            if sub.get("approved_at"):
-                                ts = ts_to_est(sub["approved_at"], "%b %d %I:%M %p")
-                                st.caption(f"Report approved: {ts}")
+                            if rep.get("submitted_at"):
+                                st.caption(f"Submitted: {ts_to_et(rep['submitted_at'], '%b %d %I:%M %p')}")
+                            if rep.get("approved_at"):
+                                st.caption(f"Approved: {ts_to_et(rep['approved_at'], '%b %d %I:%M %p')}")
                         with h2:
                             if inits:
-                                u_xlsx  = build_excel_individual(username, sub)
-                                u_fname = export_filename(entity, rm).replace(".xlsx", f"_{_safe_name(username)}.xlsx")
                                 st.download_button(
                                     "↓ Export",
-                                    data=u_xlsx,
-                                    file_name=u_fname,
+                                    data=build_excel_individual(username, rep),
+                                    file_name=export_filename(entity, rm).replace(
+                                        ".xlsx", f"_{_safe_name(username)}.xlsx"
+                                    ),
                                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                    key=f"dl_{entity}_{rm}_{username}",
+                                    key=f"dl_{rkey}",
                                 )
 
-                        # ── Report-level approve / return ─────────────────────
-                        if status == "submitted":
+                        # ── Archived reports are read-only, full stop ─────────
+                        if rstatus == "archived":
+                            arc = ts_to_et(rep["archived_at"], "%b %d, %Y %I:%M %p") if rep.get("archived_at") else ""
+                            st.info(
+                                f"📦 Archived{f' on {arc}' if arc else ''}. "
+                                "Read-only, and still included in every export."
+                            )
+                            if st.button("↩ Reopen for editing", key=f"reopen_{rkey}"):
+                                # Reopening returns the report to whatever its
+                                # initiatives say it is. There was previously no
+                                # way back out of archived at all, despite the
+                                # user-facing banner telling people to ask.
+                                rep["status"] = "approved"
+                                rep.pop("archived_at", None)
+                                save_draft(username, rep)
+                                st.success(f"Reopened {username}'s {fmt_month(rm)} report.")
+                                st.rerun()
+
+                            st.divider()
+                            for i in sorted(inits, key=lambda x: x.get("month_yr", "")):
+                                st.markdown(
+                                    f"**{fmt_month(i.get('month_yr','')) or '—'}** · "
+                                    f"**{i.get('initiative_name','Unnamed')}** — "
+                                    f"{i.get('business_component','')}  \n"
+                                    f"<small>👥 {', '.join(i.get('team_members') or ['—'])} "
+                                    f"&nbsp;|&nbsp; 📅 {i.get('start_date','—')} → "
+                                    f"{i.get('expected_end_date','—')}</small>",
+                                    unsafe_allow_html=True,
+                                )
+                            continue
+
+                        # ── Report-level actions ──────────────────────────────
+                        if rstatus == "submitted":
                             ra1, ra2, ra3 = st.columns([3, 1, 1])
                             with ra2:
-                                if st.button("✓ Approve All", key=f"appr_rpt_{entity}_{rm}_{username}", type="primary"):
-                                    now = int(datetime.now().timestamp()*1000)
-                                    sub["status"]      = "approved"
-                                    sub["approved_at"] = now
-                                    for i in sub.get("initiatives") or []:
-                                        if i.get("initiative_status","active") == "active":
-                                            i["initiative_status"] = "approved"
-                                            i["approved_at"]       = now
-                                    save_draft(username, sub)
-                                    st.success(f"Report approved!")
+                                if st.button("✓ Accept all", key=f"appr_rpt_{rkey}", type="primary"):
+                                    now = int(time.time() * 1000)
+                                    # Only this period's rows. Earlier months were
+                                    # already accepted in their own period.
+                                    for i in current_rows(rep):
+                                        clear_return_flag(i, reason="accepted")
+                                        i["initiative_status"] = "approved"
+                                        i["approved_at"]       = now
+                                    rep["approved_at"] = now
+                                    save_draft(username, rep)
+                                    st.success(f"Accepted {username}'s report.")
                                     st.rerun()
                             with ra3:
-                                if st.button("✕ Reject All", key=f"rej_rpt_{entity}_{rm}_{username}"):
-                                    st.session_state[f"reject_report_{entity}_{rm}_{username}"] = True
+                                if st.button("✕ Return all", key=f"rej_rpt_{rkey}"):
+                                    st.session_state[f"return_report_{rkey}"] = True
                                     st.rerun()
 
-                        # ── Archive (only available once approved) ────────────
-                        if status == "approved":
-                            arc1, arc2 = st.columns([4, 1])
-                            with arc1:
-                                st.caption("This report is approved and ready to be closed out for the period.")
-                            with arc2:
-                                if st.button("📦 Archive", key=f"archive_{entity}_{rm}_{username}"):
-                                    now = int(datetime.now().timestamp()*1000)
-                                    sub["status"]      = "archived"
-                                    sub["archived_at"] = now
-                                    save_draft(username, sub)
-                                    st.success("Report archived.")
-                                    st.rerun()
-                        elif status == "archived":
-                            arc_ts = sub.get("archived_at")
-                            arc_str = ts_to_est(arc_ts, "%b %d, %Y %I:%M %p") if arc_ts else ""
-                            st.info(f"📦 Archived{f' on {arc_str}' if arc_str else ''}. Remains in all exports.")
-
-                        if st.session_state.get(f"reject_report_{entity}_{rm}_{username}"):
-                            reject_comment = st.text_area(
-                                "Rejection comment (will be shown to the user):",
-                                key=f"rc_rpt_{entity}_{rm}_{username}",
-                                placeholder="Explain what needs to be updated...",
-                                height=80,
+                        if st.session_state.get(f"return_report_{rkey}"):
+                            note = st.text_area(
+                                "What needs to change? This note is shown to the preparer.",
+                                key=f"rc_rpt_{rkey}", height=80,
+                                placeholder="Describe what needs updating...",
                             )
                             rc1, rc2 = st.columns(2)
                             with rc1:
-                                if st.button("Confirm Reject", key=f"rc_confirm_rpt_{entity}_{rm}_{username}", type="primary"):
-                                    now = int(datetime.now().timestamp()*1000)
-                                    sub["status"]            = "rejected"
-                                    sub["rejected_at"]       = now
-                                    sub["rejection_comment"] = reject_comment.strip()
-                                    st.session_state.pop(f"reject_report_{entity}_{rm}_{username}", None)
-                                    save_draft(username, sub)
-                                    st.rerun()
+                                if st.button("Return for revision", key=f"rc_confirm_{rkey}", type="primary"):
+                                    if not note.strip():
+                                        st.error("Add a note so the preparer knows what to change.")
+                                    else:
+                                        now = int(time.time() * 1000)
+                                        for i in current_rows(rep):
+                                            i["initiative_status"] = "returned"
+                                            i["returned_at"]       = now
+                                            i["review_comment"]    = note.strip()
+                                            i.pop("approved_at", None)
+                                        st.session_state.pop(f"return_report_{rkey}", None)
+                                        save_draft(username, rep)
+                                        st.rerun()
                             with rc2:
-                                if st.button("Cancel", key=f"rc_cancel_rpt_{entity}_{rm}_{username}"):
-                                    st.session_state.pop(f"reject_report_{entity}_{rm}_{username}", None)
+                                if st.button("Cancel", key=f"rc_cancel_{rkey}"):
+                                    st.session_state.pop(f"return_report_{rkey}", None)
                                     st.rerun()
+
+                        if rstatus == "approved":
+                            arc1, arc2 = st.columns([4, 1])
+                            with arc1:
+                                st.caption("Approved. Archive it to close the period out.")
+                            with arc2:
+                                if st.button("📦 Archive", key=f"archive_{rkey}"):
+                                    rep["status"]      = "archived"
+                                    rep["archived_at"] = int(time.time() * 1000)
+                                    save_draft(username, rep)
+                                    st.success("Archived.")
+                                    st.rerun()
+
+                        if rstatus == "rejected":
+                            n = len(outstanding_returns(rep))
+                            st.warning(
+                                f"🔴 Waiting on the preparer — {n} initiative"
+                                f"{'s' if n != 1 else ''} returned for revision."
+                            )
 
                         st.divider()
 
                         if not inits:
                             st.caption("No initiatives.")
-                        elif status == "in-progress":
-                            # Don't allow accepting/rejecting until the user has
-                            # reviewed the rollover and submitted for review themselves.
+                        elif rstatus == "in-progress":
                             st.info(
-                                "🟡 This report is **In Progress** — the user hasn't submitted it yet. "
-                                "They need to log in, review their initiatives, and click "
-                                "**Submit for Review** before you can approve or reject."
+                                "🟡 Not submitted yet. The preparer needs to review their "
+                                "initiatives and submit for review before you can accept "
+                                "or return them."
                             )
-                            for init in inits:
-                                iid     = init["id"]
-                                istatus = init.get("initiative_status","active")
-                                iname   = init.get("initiative_name","Unnamed")
-                                ico     = {"approved":"✅","returned":"🔴","active":"🔵"}.get(istatus,"🔵")
-                                ic1, ic4 = st.columns([5, 0.8])
-                                with ic1:
-                                    co   = "↩ " if init.get("carry_over") else ""
-                                    bc   = init.get("business_component","")
-                                    team = ", ".join(init.get("team_members") or ["—"])
-                                    sd   = init.get("start_date","—")
-                                    ed   = init.get("expected_end_date","—")
-                                    st.markdown(
-                                        f"{ico} **{co}{iname}** — {bc}  \n"
-                                        f"<small>👥 {team} &nbsp;|&nbsp; 📅 {sd} → {ed}</small>",
-                                        unsafe_allow_html=True,
-                                    )
-                                with ic4:
-                                    if st.button("🗑 Delete", key=f"del_i_{entity}_{rm}_{username}_{iid}"):
-                                        sub["initiatives"] = [i for i in sub["initiatives"] if i["id"] != iid]
-                                        if not sub["initiatives"]:
-                                            sub["status"] = "in-progress"
-                                        save_draft(username, sub)
-                                        st.success(f"Deleted: {iname}")
-                                        st.rerun()
+                            for i in current_rows(rep):
+                                st.markdown(
+                                    f"🔵 **{'↩ ' if i.get('carry_over') else ''}"
+                                    f"{i.get('initiative_name','Unnamed')}** — "
+                                    f"{i.get('business_component','')}  \n"
+                                    f"<small>👥 {', '.join(i.get('team_members') or ['—'])} "
+                                    f"&nbsp;|&nbsp; 📅 {i.get('start_date','—')} → "
+                                    f"{i.get('expected_end_date','—')}</small>",
+                                    unsafe_allow_html=True,
+                                )
                         else:
-                            for init in inits:
-                                iid     = init["id"]
-                                istatus = init.get("initiative_status","active")
-                                iname   = init.get("initiative_name","Unnamed")
-                                ico     = {"approved":"✅","returned":"🔴","active":"🔵"}.get(istatus,"🔵")
+                            past = historical_rows(rep)
+                            if past:
+                                months = sorted(
+                                    {i.get("month_yr", "") for i in past if i.get("month_yr")},
+                                    reverse=True,
+                                )
+                                with st.expander(
+                                    f"📖 Earlier months carried into this report "
+                                    f"({len(past)} row{'s' if len(past) != 1 else ''}) — read-only"
+                                ):
+                                    st.caption(
+                                        "Already accepted in "
+                                        + ", ".join(fmt_month(m) for m in months)
+                                        + ". Kept for the record; nothing to review here."
+                                    )
+                                    st.dataframe(
+                                        [{
+                                            "Month": fmt_month(i.get("month_yr", "")),
+                                            "Initiative": i.get("initiative_name", "Unnamed"),
+                                            "Activities": (i.get("activities", "") or "")[:120],
+                                        } for i in sorted(past, key=lambda x: x.get("month_yr", ""), reverse=True)],
+                                        width='stretch', hide_index=True,
+                                    )
+                                st.write("")
 
-                                ic1, ic2, ic3, ic4 = st.columns([3, 0.8, 0.8, 0.8])
+                            for init in current_rows(rep):
+                                iid     = init["id"]
+                                istatus = init.get("initiative_status", "active")
+                                iname   = init.get("initiative_name", "Unnamed")
+                                ico     = {"approved": "✅", "returned": "🔴", "active": "🔵"}.get(istatus, "🔵")
+                                ikey    = f"{rkey}_{iid}"
+
+                                ic1, ic2, ic3 = st.columns([4, 0.9, 0.9])
                                 with ic1:
-                                    co   = "↩ " if init.get("carry_over") else ""
-                                    bc   = init.get("business_component","")
-                                    team = ", ".join(init.get("team_members") or ["—"])
-                                    sd   = init.get("start_date","—")
-                                    ed   = init.get("expected_end_date","—")
                                     st.markdown(
-                                        f"{ico} **{co}{iname}** — {bc}  \n"
-                                        f"<small>👥 {team} &nbsp;|&nbsp; 📅 {sd} → {ed}</small>",
+                                        f"{ico} **{'↩ ' if init.get('carry_over') else ''}{iname}** — "
+                                        f"{init.get('business_component','')}  \n"
+                                        f"<small>👥 {', '.join(init.get('team_members') or ['—'])} "
+                                        f"&nbsp;|&nbsp; 📅 {init.get('start_date','—')} → "
+                                        f"{init.get('expected_end_date','—')}</small>",
                                         unsafe_allow_html=True,
                                     )
                                     if init.get("approved_at"):
-                                        ts = ts_to_est(init["approved_at"], "%b %d %I:%M %p")
-                                        st.caption(f"   Approved {ts}")
-                                    if init.get("returned_at"):
-                                        ts = ts_to_est(init["returned_at"], "%b %d %I:%M %p")
-                                        rc = init.get("rejection_comment","")
-                                        rc_str = f' — "{rc}"' if rc else ""
-                                        st.caption(f"   Rejected {ts}{rc_str}")
+                                        st.caption(f"   Accepted {ts_to_et(init['approved_at'], '%b %d %I:%M %p')}")
+                                    if istatus == "returned" and init.get("returned_at"):
+                                        rc = (init.get("review_comment") or "").strip()
+                                        st.caption(
+                                            f"   Returned {ts_to_et(init['returned_at'], '%b %d %I:%M %p')}"
+                                            + (f' — "{rc}"' if rc else "")
+                                        )
+                                    if init.get("review_history"):
+                                        st.caption(
+                                            f"   {len(init['review_history'])} earlier "
+                                            f"note{'s' if len(init['review_history']) != 1 else ''}, "
+                                            "since addressed"
+                                        )
 
                                 with ic2:
                                     if istatus != "approved":
-                                        if st.button("✓ Accept", key=f"appr_i_{entity}_{rm}_{username}_{iid}",
-                                                     type="primary"):
-                                            now = int(datetime.now().timestamp()*1000)
+                                        if st.button("✓ Accept", key=f"appr_i_{ikey}", type="primary"):
+                                            now = int(time.time() * 1000)
+                                            clear_return_flag(init, reason="accepted")
                                             init["initiative_status"] = "approved"
                                             init["approved_at"]       = now
-                                            init.pop("returned_at", None)
-                                            all_approved = all(
-                                                i.get("initiative_status") == "approved"
-                                                for i in sub.get("initiatives",[])
-                                            )
-                                            if all_approved:
-                                                sub["status"]      = "approved"
-                                                sub["approved_at"] = now
-                                            save_draft(username, sub)
+                                            if all(i.get("initiative_status") == "approved"
+                                                   for i in current_rows(rep)):
+                                                rep["approved_at"] = now
+                                            save_draft(username, rep)
                                             st.rerun()
 
                                 with ic3:
                                     if istatus != "returned":
-                                        if st.button("✕ Reject", key=f"ret_i_{entity}_{rm}_{username}_{iid}"):
-                                            st.session_state[f"reject_init_{iid}"] = True
+                                        if st.button("✕ Return", key=f"ret_i_{ikey}"):
+                                            st.session_state[f"return_init_{ikey}"] = True
                                             st.rerun()
-                                if st.session_state.get(f"reject_init_{iid}"):
-                                    reject_comment_i = st.text_area(
-                                        f'Comment for rejecting "{iname}" (will be shown to the user):',
-                                        key=f"rc_init_{iid}",
-                                        placeholder="Explain what needs to be updated...",
-                                        height=80,
+
+                                if st.session_state.get(f"return_init_{ikey}"):
+                                    note_i = st.text_area(
+                                        f'What needs to change on "{iname}"? '
+                                        "This note is shown to the preparer.",
+                                        key=f"rc_init_{ikey}", height=80,
+                                        placeholder="Describe what needs updating...",
                                     )
                                     ri1, ri2 = st.columns(2)
                                     with ri1:
-                                        if st.button("Confirm Reject", key=f"rc_conf_init_{iid}", type="primary"):
-                                            now = int(datetime.now().timestamp()*1000)
-                                            init["initiative_status"] = "returned"
-                                            init["returned_at"]       = now
-                                            init["rejection_comment"] = reject_comment_i.strip()
-                                            init.pop("approved_at", None)
-                                            sub["status"] = "rejected"
-                                            st.session_state.pop(f"reject_init_{iid}", None)
-                                            save_draft(username, sub)
-                                            st.rerun()
+                                        if st.button("Return this initiative", key=f"rc_conf_i_{ikey}", type="primary"):
+                                            if not note_i.strip():
+                                                st.error("Add a note so the preparer knows what to change.")
+                                            else:
+                                                init["initiative_status"] = "returned"
+                                                init["returned_at"]       = int(time.time() * 1000)
+                                                init["review_comment"]    = note_i.strip()
+                                                init.pop("approved_at", None)
+                                                st.session_state.pop(f"return_init_{ikey}", None)
+                                                # Returning ONE initiative no longer rejects the
+                                                # whole report — status is derived, so everything
+                                                # already accepted stays accepted.
+                                                save_draft(username, rep)
+                                                st.rerun()
                                     with ri2:
-                                        if st.button("Cancel", key=f"rc_cancel_init_{iid}"):
-                                            st.session_state.pop(f"reject_init_{iid}", None)
+                                        if st.button("Cancel", key=f"rc_cancel_i_{ikey}"):
+                                            st.session_state.pop(f"return_init_{ikey}", None)
                                             st.rerun()
-
-                                with ic4:
-                                    if st.button("🗑 Delete", key=f"del_i_{entity}_{rm}_{username}_{iid}"):
-                                        sub["initiatives"] = [i for i in sub["initiatives"] if i["id"] != iid]
-                                        if not sub["initiatives"]:
-                                            sub["status"] = "in-progress"
-                                        save_draft(username, sub)
-                                        st.success(f"Deleted: {iname}")
-                                        st.rerun()
 
                                 st.write("")
 
                 st.write("")
 
-
+    # ══ Rollover ══════════════════════════════════════════════════════════════
     if active_tab == "🔄 Rollover":
         st.caption(
-            "Only **Approved** reports can be rolled over. The source period is automatically "
-            "**Archived** after rollover. Anyone already in the target period is skipped."
+            "Only approved reports can be rolled forward. Anyone who already has "
+            "data in the target month is skipped. Rolling forward no longer "
+            "archives the source period — archive it yourself in Submissions when "
+            "you're ready to close it out."
         )
 
-        if not combos:
-            st.info("No submissions to roll over yet.")
+        eligible = sorted(
+            {
+                (r.get("entity", ""), r.get("reporting_month", ""))
+                for r in reports
+                if computed_status(r) in ("approved", "archived")
+            },
+            reverse=True,
+        )
+
+        if not eligible:
+            st.info(
+                "Nothing to roll forward yet. Accept a report in the Submissions "
+                "tab first."
+            )
         else:
-            eligible_combos = [
-                (e, rm) for e, rm in combos
-                if any(
-                    sub.get("status") in ("approved", "archived")
-                    for ud in all_data.values()
-                    if (sub := ud.get(rm)) and sub.get("entity") == e
-                )
-            ]
+            chk_keys = [f"ro_chk_{e}_{m}" for e, m in eligible]
+            _select_all_controls("ro", chk_keys, "periods")
+            st.write("")
 
-            if not eligible_combos:
-                st.info("No approved reports to roll over yet. Approve a report in the Submissions tab first.")
-            else:
-                def _rollable_users_for(entity: str, src_month: str, target: str) -> list[str]:
-                    out = []
-                    for username, ud in all_data.items():
-                        sub = ud.get(src_month)
-                        if not sub or sub.get("entity") != entity:
-                            continue
-                        if sub.get("status") not in ("approved", "archived"):
-                            continue
-                        if not sub.get("initiatives"):
-                            continue
-                        existing = load_submission(username, target)
-                        if existing and existing.get("entity") == entity and existing.get("initiatives"):
-                            continue
-                        out.append(username)
-                    return out
+            selections = []
+            for entity in sorted({e for e, _ in eligible}):
+                st.markdown(f"**Entity {entity}**")
+                for e, rm in [c for c in eligible if c[0] == entity]:
+                    chk_key = f"ro_chk_{e}_{rm}"
+                    tgt_key = f"ro_target_{e}_{rm}"
+                    default_tgt = next_month_of(rm)
 
-                from collections import defaultdict
-                grouped: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
-                for e, rm in sorted(eligible_combos, reverse=True):
-                    grouped[e][rm[:4]].append(rm)
-
-                st.markdown("**Select periods to roll — choose a target month for each:**")
-                st.caption("Check a period to include it in the rollover. Each period can roll to a different target month.")
-                st.write("")
-
-                # Render: entity → year group → individual period rows
-                # Each checked row shows an inline target month picker
-                selections = []   # (entity, src_month, chosen_target, rollable_users)
-
-                for entity in sorted(grouped.keys()):
-                    with st.container():
-                        st.markdown(f"**Entity {entity}**")
-
-                        for year in sorted(grouped[entity].keys(), reverse=True):
-                            months_in_year = grouped[entity][year]
-
-                            # Year-level "select all" toggle
-                            year_all_key = f"ro_all_{entity}_{year}"
-                            # Default: check years that have any rollable period
-                            any_rollable = any(
-                                _rollable_users_for(entity, rm, next_month_of(rm))
-                                for rm in months_in_year
-                            )
-                            year_all = st.checkbox(
-                                f"  {year} — select all",
-                                value=st.session_state.get(year_all_key, any_rollable),
-                                key=year_all_key,
-                            )
-
-                            for rm in months_in_year:
-                                chk_key = f"ro_chk_{entity}_{rm}"
-                                tgt_key = f"ro_target_{entity}_{rm}"
-
-                                # Default target = next month after source
-                                default_tgt = next_month_of(rm)
-
-                                # If year-all toggled on, force this period checked
-                                if year_all:
-                                    st.session_state[chk_key] = True
-
-                                is_checked = st.session_state.get(chk_key, year_all)
-
-                                # Build this period's row: [checkbox | label] [→ target picker if checked]
-                                row_cols = st.columns([0.05, 2.2, 0.15, 1.6])
-
-                                with row_cols[0]:
-                                    checked = st.checkbox(
-                                        "##",
-                                        value=is_checked,
-                                        key=chk_key,
-                                        label_visibility="collapsed",
-                                    )
-
-                                with row_cols[1]:
-                                    rollable_for_default = _rollable_users_for(entity, rm, default_tgt)
-                                    user_label = (
-                                        f"{len(rollable_for_default)} user{'s' if len(rollable_for_default)!=1 else ''} ready"
-                                        if rollable_for_default else "nothing to roll"
-                                    )
-                                    color = "#2D6A2D" if rollable_for_default else "#999"
-                                    st.markdown(
-                                        f'<span style="font-size:15px;">{fmt_month(rm)}</span>'
-                                        f'&nbsp;&nbsp;<span style="font-size:13px;color:{color};">{user_label}</span>',
-                                        unsafe_allow_html=True,
-                                    )
-
-                                if checked:
-                                    with row_cols[2]:
-                                        st.markdown('<span style="font-size:18px;">→</span>', unsafe_allow_html=True)
-
-                                    with row_cols[3]:
-                                        # Target options: all months from source+1 up to 12 months forward
-                                        # (not limited to available_months' normal window)
-                                        import datetime as _dt
-                                        _base = _dt.date.today()
-                                        _ext  = [
-                                            f"{(_base.year + ((_base.month + i - 1) // 12))}"
-                                            f"-{str((_base.month - 1 + i) % 12 + 1).zfill(2)}"
-                                            for i in range(1, 14)
-                                        ]
-                                        tgt_options = sorted(
-                                            set(m for m in (_ext + available_months()) if m > rm)
-                                            | {default_tgt}
-                                        )
-                                        cur_tgt = st.session_state.get(tgt_key, default_tgt)
-                                        if cur_tgt not in tgt_options:
-                                            cur_tgt = default_tgt
-                                        chosen_tgt = st.selectbox(
-                                            "##",
-                                            tgt_options,
-                                            index=tgt_options.index(cur_tgt),
-                                            format_func=fmt_month,
-                                            key=tgt_key,
-                                            label_visibility="collapsed",
-                                        )
-                                        # Compute actual rollable users for the chosen target
-                                        rollable = _rollable_users_for(entity, rm, chosen_tgt)
-                                        if rollable:
-                                            selections.append((entity, rm, chosen_tgt, rollable))
-                                        elif rollable_for_default:
-                                            st.caption("⚠ Already have data for this target")
-
-                        st.write("")
-
-                st.divider()
-
-                if not selections:
-                    st.caption("No periods selected with rollable users — tick checkboxes above to begin.")
-                else:
-                    total_users = sum(len(r) for _, _, _, r in selections)
-                    st.markdown(
-                        f"**Preview** — {len(selections)} rollover{'s' if len(selections)!=1 else ''}, "
-                        f"{total_users} submission{'s' if total_users!=1 else ''} total"
-                    )
-                    for entity, src_month, tgt, rollable in selections:
+                    row = st.columns([0.06, 2.2, 0.15, 1.6])
+                    with row[0]:
+                        checked = st.checkbox(
+                            "##", value=st.session_state.get(chk_key, False),
+                            key=chk_key, label_visibility="collapsed",
+                        )
+                    with row[1]:
+                        ready = rollable_users(e, rm, default_tgt)
+                        msg = (
+                            f"{len(ready)} ready" if ready else "nothing to roll"
+                        )
+                        color = "#2D6A2D" if ready else "#999"
                         st.markdown(
-                            f"&nbsp;&nbsp;**Entity {entity}:** {fmt_month(src_month)} → **{fmt_month(tgt)}**",
+                            f'<span style="font-size:15px;">{fmt_month(rm)}</span>'
+                            f'&nbsp;&nbsp;<span style="font-size:13px;color:{color};">{msg}</span>',
                             unsafe_allow_html=True,
                         )
-                        for u in rollable:
-                            inits = [
-                                i.get("initiative_name", "Unnamed")
-                                for i in (all_data.get(u, {}).get(src_month, {}).get("initiatives") or [])
-                            ]
-                            st.markdown(
-                                f"&nbsp;&nbsp;&nbsp;&nbsp;• **{u}** — " + ", ".join(f"*{n}*" for n in inits),
-                                unsafe_allow_html=True,
+                    if checked:
+                        with row[2]:
+                            st.markdown('<span style="font-size:18px;">→</span>', unsafe_allow_html=True)
+                        with row[3]:
+                            base = date.today()
+                            opts = sorted({
+                                f"{base.year + ((base.month + i - 1) // 12)}-"
+                                f"{str((base.month - 1 + i) % 12 + 1).zfill(2)}"
+                                for i in range(1, 14)
+                            } | {default_tgt})
+                            opts = [m for m in opts if m > rm]
+                            cur = st.session_state.get(tgt_key, default_tgt)
+                            if cur not in opts:
+                                cur = default_tgt
+                            tgt = st.selectbox(
+                                "##", opts, index=opts.index(cur),
+                                format_func=fmt_month, key=tgt_key,
+                                label_visibility="collapsed",
                             )
+                            actually = rollable_users(e, rm, tgt)
+                            if actually:
+                                selections.append((e, rm, tgt, actually))
+                            else:
+                                st.caption("⚠ Everyone already has data in that month")
+                st.write("")
 
-                    st.write("")
-                    if st.button(
-                        f"🔄 Roll Forward {total_users} submission{'s' if total_users!=1 else ''}",
-                        type="primary",
-                        key="do_rollover_dynamic",
-                    ):
-                        all_rolled = []
-                        for entity, src_month, tgt, rollable in selections:
-                            subset = {u: all_data[u] for u in rollable if u in all_data}
-                            rolled = rollover_entity(subset, entity, src_month, tgt)
-                            all_rolled.extend(rolled)
-                        if all_rolled:
-                            targets = sorted({tgt for _, _, tgt, _ in selections})
-                            st.success(
-                                f"✓ Rolled over for: {', '.join(all_rolled)}. "
-                                f"Source periods have been archived."
-                            )
-                            st.rerun()
-
-
-    if active_tab == "⬇ Export":
-        if not combos:
-            st.info("No submissions found yet.")
-        else:
-            from collections import defaultdict as _dd
-            status_options = ["In Progress", "Ready for Review", "Approved", "Archived", "Rejected"]
-            status_key_map = {
-                "In Progress":     "in-progress",
-                "Ready for Review":"submitted",
-                "Approved":        "approved",
-                "Archived":        "archived",
-                "Rejected":        "rejected",
-            }
-            if "export_status_sel" not in st.session_state:
-                st.session_state.export_status_sel = ["Ready for Review", "Approved", "Archived"]
-
-            ex_left, ex_right = st.columns([1, 1])
-
-            # ── LEFT: Periods & Entities (checkboxes grouped by entity → year) ──
-            with ex_left:
-                st.markdown("**1. Periods & Entities**")
-
-                # Group combos: entity → year → [months]
-                ex_grouped = _dd(lambda: _dd(list))
-                for e, rm in sorted(combos, reverse=True):
-                    ex_grouped[e][rm[:4]].append(rm)
-
-                chosen_combos = []
-                for entity in sorted(ex_grouped.keys()):
-                    st.markdown(f"**Entity {entity}**")
-                    for year in sorted(ex_grouped[entity].keys(), reverse=True):
-                        months_in_year = ex_grouped[entity][year]
-                        year_all_key = f"ex_all_{entity}_{year}"
-
-                        # "Select year" master checkbox — default on
-                        year_all = st.checkbox(
-                            f"  {year} — select all",
-                            value=st.session_state.get(year_all_key, True),
-                            key=year_all_key,
+            st.divider()
+            if not selections:
+                st.caption("Tick a period above to plan a rollover.")
+            else:
+                total = sum(len(u) for _, _, _, u in selections)
+                st.markdown(
+                    f"**Preview** — {len(selections)} move"
+                    f"{'s' if len(selections) != 1 else ''}, "
+                    f"{total} report{'s' if total != 1 else ''}"
+                )
+                for e, rm, tgt, users in selections:
+                    st.markdown(
+                        f"&nbsp;&nbsp;**Entity {e}:** {fmt_month(rm)} → **{fmt_month(tgt)}**",
+                        unsafe_allow_html=True,
+                    )
+                    for u in users:
+                        rep = load_submission(u, e, rm) or {}
+                        names = [
+                            i.get("initiative_name", "Unnamed")
+                            for i in (rep.get("initiatives") or [])
+                        ]
+                        st.markdown(
+                            f"&nbsp;&nbsp;&nbsp;&nbsp;• **{u}** — "
+                            + ", ".join(f"*{n}*" for n in names),
+                            unsafe_allow_html=True,
                         )
-                        for rm in months_in_year:
-                            chk_key = f"ex_chk_{entity}_{rm}"
-                            if year_all:
-                                st.session_state[chk_key] = True
-                            chk = st.checkbox(
-                                f"  {fmt_month(rm)}",
-                                value=st.session_state.get(chk_key, True),
-                                key=chk_key,
-                            )
-                            if chk:
-                                chosen_combos.append((entity, rm))
-                    st.write("")
-
-            # ── RIGHT: Status (flat checkboxes, fully visible) ───────────────
-            with ex_right:
-                st.markdown("**2. Status**")
 
                 st.write("")
-                # Flat visible checkboxes — no popover, no hidden state
-                new_sel = list(st.session_state.export_status_sel)
-                for opt in status_options:
-                    chk = st.checkbox(opt, value=opt in new_sel, key=f"st_chk_{opt}")
-                    if chk and opt not in new_sel:
-                        new_sel.append(opt)
-                    elif not chk and opt in new_sel:
-                        new_sel.remove(opt)
-                if new_sel != st.session_state.export_status_sel:
-                    st.session_state.export_status_sel = new_sel
-                    st.rerun()
-                chosen_statuses_display = st.session_state.export_status_sel
-                chosen_status_keys = [status_key_map[s] for s in chosen_statuses_display]
+                if st.button(f"🔄 Roll forward {total} report{'s' if total != 1 else ''}",
+                             type="primary", key="do_rollover"):
+                    rolled = []
+                    for e, rm, tgt, users in selections:
+                        rolled.extend(rollover_entity(e, rm, tgt, only_users=users))
+                    if rolled:
+                        st.success(f"Rolled forward for: {', '.join(sorted(set(rolled)))}.")
+                        st.rerun()
+                    else:
+                        st.warning("Nothing was rolled forward — targets already had data.")
+
+    # ══ Archive ═══════════════════════════════════════════════════════════════
+    if active_tab == "📦 Archive":
+        render_archive_browser("arcadmin")
+
+    # ══ Export ════════════════════════════════════════════════════════════════
+    if active_tab == "⬇ Export":
+        if not reports:
+            st.info("No reports to export yet.")
+        else:
+            status_keys = ["in-progress", "submitted", "rejected", "approved", "archived"]
+
+            ex_left, ex_right = st.columns([1, 1])
+            with ex_left:
+                st.markdown("**1. Periods and entities**")
+                chk_keys = [f"ex_chk_{e}_{m}" for e, m in combos]
+                _select_all_controls("ex", chk_keys, "periods")
+                st.write("")
+                chosen_combos = []
+                for entity in sorted({e for e, _ in combos}):
+                    st.markdown(f"**Entity {entity}**")
+                    for e, rm in sorted([c for c in combos if c[0] == entity], reverse=True):
+                        key = f"ex_chk_{e}_{rm}"
+                        if st.checkbox(
+                            f"  {fmt_month(rm)}",
+                            value=st.session_state.get(key, True),
+                            key=key,
+                        ):
+                            chosen_combos.append((e, rm))
+                    st.write("")
+
+            with ex_right:
+                st.markdown("**2. Status**")
+                st.write("")
+                chosen_statuses = []
+                for key in status_keys:
+                    default = key in ("submitted", "approved", "archived")
+                    if st.checkbox(
+                        STATUS_LABELS.get(key, key),
+                        value=st.session_state.get(f"ex_st_{key}", default),
+                        key=f"ex_st_{key}",
+                    ):
+                        chosen_statuses.append(key)
+
+                st.write("")
+                group_by = st.radio(
+                    "Tab layout",
+                    ["One tab per entity", "One tab per team member"],
+                    key="ex_group_by",
+                )
 
             st.divider()
 
-            # ── Summary ───────────────────────────────────────────────────────
-            matched_rows = matched_inits = 0
-            matched_users: set = set()
-            for entity, rm in chosen_combos:
-                for username, months in all_data.items():
-                    sub = months.get(rm)
-                    if not sub or sub.get("entity") != entity: continue
-                    if sub.get("status") not in chosen_status_keys: continue
-                    inits = sub.get("initiatives") or []
-                    if not inits: continue
-                    matched_rows += 1; matched_users.add(username); matched_inits += len(inits)
+            combo_set = set(chosen_combos)
+            matched = [
+                r for r in reports
+                if (r.get("entity", ""), r.get("reporting_month", "")) in combo_set
+                and computed_status(r) in chosen_statuses
+            ]
 
-            if not chosen_combos or not chosen_status_keys:
-                st.warning("Select at least one period and one status to export.")
+            if not chosen_combos or not chosen_statuses:
+                st.warning("Select at least one period and one status.")
             else:
-                unique_entities = sorted({e for e,_ in chosen_combos})
+                unique_rows, dropped = dedupe_stats(matched)
                 sc1, sc2, sc3, sc4 = st.columns(4)
-                sc1.metric("Entities",    len(unique_entities))
-                sc2.metric("Reports",     matched_rows)
-                sc3.metric("Users",       len(matched_users))
-                sc4.metric("Initiatives", matched_inits)
-                st.caption("Excel tabs: " + ", ".join(f'"Entity {e}"' for e in unique_entities))
+                sc1.metric("Entities",    len({r.get("entity") for r in matched}))
+                sc2.metric("Reports",     len(matched))
+                sc3.metric("Team members", len({r.get("user") for r in matched}))
+                sc4.metric("Rows",        unique_rows)
 
-            st.write("")
+                if dropped:
+                    # Rolling forward copies earlier rows into later reports, so
+                    # selecting overlapping periods sees the same row more than
+                    # once. Say so rather than quietly changing the count.
+                    st.caption(
+                        f"ℹ {dropped} duplicate row{'s' if dropped != 1 else ''} "
+                        "collapsed — later periods carry copies of earlier months, "
+                        "and the most recently reviewed version is kept."
+                    )
 
-            # ── Download ──────────────────────────────────────────────────────
-            today = datetime.now().strftime("%m%d%y")
-            status_tag = (
-                "_".join(s.replace(" ","") for s in chosen_statuses_display)
-                if len(chosen_statuses_display) < len(status_options) else "AllStatuses"
-            )
-            fname = f"Consolidated_Report_{status_tag}_{today}.xlsx"
+                if not matched:
+                    st.caption("No reports match this combination.")
+                else:
+                    gb = "user" if group_by.endswith("member") else "entity"
+                    tag = ("_".join(
+                        STATUS_LABELS[s].split(" ", 1)[-1].replace(" ", "")
+                        for s in chosen_statuses
+                    ) if len(chosen_statuses) < len(status_keys) else "AllStatuses")
+                    st.download_button(
+                        f"↓ Download consolidated report ({len(matched)} report"
+                        f"{'s' if len(matched) != 1 else ''})",
+                        data=build_excel_consolidated(
+                            matched, group_by=gb,
+                            status_desc=status_desc_for(chosen_statuses),
+                        ),
+                        file_name=f"Consolidated_Report_{tag}_{datetime.now().strftime('%m%d%y')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        type="primary",
+                    )
 
-            if chosen_combos and chosen_status_keys and matched_rows > 0:
-                xlsx = build_excel_consolidated(all_data, chosen_combos, status_filter=chosen_status_keys, group_by="entity")
-                st.download_button(
-                    f"↓ Download Consolidated Report ({matched_rows} report{'s' if matched_rows!=1 else ''})",
-                    data=xlsx, file_name=fname,
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    type="primary",
-                )
-            elif chosen_combos and chosen_status_keys:
-                st.caption("No reports match this combination — nothing to download yet.")
-
-
+    # ══ Backup & Data ═════════════════════════════════════════════════════════
     if active_tab == "🗄 Backup & Data":
-        backup_date = datetime.now().strftime("%m%d%y")
-
         st.markdown("**Backup**")
         st.caption(
-            "Downloads all historical data as an Excel file — one tab per entity, "
-            "all periods, all users, all statuses. Only current initiatives are included; "
-            "anything previously deleted is already gone. "
-            "Save this somewhere safe (Google Drive, OneDrive) after each approval cycle."
+            "Every report, every period, every status, as one Excel file. "
+            "This app's storage is wiped whenever the server restarts, so "
+            "download this after each approval cycle and keep it somewhere durable."
         )
-        backup_bytes = create_backup_excel(all_data)
-        n_subs = sum(
-            1 for f in DATA_DIR.glob("*.json")
-            if not f.stem.endswith("_months") and f.stem != "registry"
-            and bool(json.loads(f.read_text()).get("initiatives"))
-        )
+        backup_bytes = create_backup_excel()
         col1, col2 = st.columns([2, 3])
         with col1:
             st.download_button(
-                "↓ Download Full Data Backup (.xlsx)",
+                "↓ Download full data backup (.xlsx)",
                 data=backup_bytes,
-                file_name=f"RD_Data_Backup_{backup_date}.xlsx",
+                file_name=f"RD_Data_Backup_{datetime.now().strftime('%m%d%y')}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
         with col2:
-            st.caption(f"{n_subs} submission{'s' if n_subs != 1 else ''} with data · {len(backup_bytes)//1024} KB")
+            # This count used to glob every JSON in data/ and call .get() on each,
+            # which crashed with an AttributeError as soon as anyone added a custom
+            # entity, because that config file holds a list rather than a dict.
+            st.caption(
+                f"{store.count_reports()} report"
+                f"{'s' if store.count_reports() != 1 else ''} with data · "
+                f"{len(backup_bytes) // 1024} KB"
+            )
 
         st.divider()
 
-        st.markdown("**⚠ Delete All History**")
+        st.markdown("**⚠ Delete all reports**")
         st.caption(
-            "Permanently deletes all submission data from the server. "
-            "Download the backup above first. This cannot be undone."
+            "Permanently deletes every report. Your entity list and permissions "
+            "are stored separately and are kept. Download the backup first — "
+            "this can't be undone."
         )
         if not st.session_state.get("confirm_delete_all"):
-            if st.button("🗑 Delete All History", key="del_all_btn"):
+            if st.button("🗑 Delete all reports", key="del_all_btn"):
                 st.session_state.confirm_delete_all = True
                 st.rerun()
         else:
             st.error(
-                "This will permanently delete ALL submissions for ALL users across ALL periods. "
-                "Are you sure?"
+                f"This deletes all {store.count_reports()} reports for every team "
+                "member across every period. Entity list and permissions are kept."
             )
             da1, da2 = st.columns(2)
             with da1:
-                if st.button("Yes, delete everything", key="del_all_confirm", type="primary"):
-                    delete_all_history()
+                if st.button("Yes, delete all reports", key="del_all_confirm", type="primary"):
+                    n = delete_all_history()
                     st.session_state.confirm_delete_all = False
-                    st.success("All history deleted. The app will reload.")
+                    st.success(f"Deleted {n} reports.")
                     st.rerun()
             with da2:
                 if st.button("Cancel", key="del_all_cancel"):
@@ -2850,13 +3040,11 @@ def screen_admin():
 
         st.divider()
 
-        # ── Restore from Backup ──────────────────────────────────────────────
-        st.markdown("**📤 Restore from Backup**")
+        st.markdown("**📤 Restore from backup**")
         st.caption(
-            "If the server restarted and lost its data, upload a previously downloaded "
-            "backup or export (.xlsx) here to rebuild submissions from it. "
-            "Works with the full data backup, a consolidated report, or an individual user's export. "
-            "All statuses are restored exactly as they were — Approved, Archived, In Progress, etc."
+            "If the server restarted and lost its data, upload a backup or export "
+            "here to rebuild the reports from it. Works with the full backup, a "
+            "consolidated report, or a single person's export."
         )
 
         uploaded = st.file_uploader(
@@ -2864,33 +3052,27 @@ def screen_admin():
         )
 
         if uploaded is not None:
-            file_bytes = uploaded.getvalue()
-            parsed, parse_warnings = parse_import_workbook(file_bytes)
+            parsed, parse_warnings = parse_import_workbook(uploaded.getvalue())
 
             if not parsed:
-                st.error("Couldn't find any usable data in this file.")
-                if parse_warnings:
-                    for w in parse_warnings:
-                        st.caption(f"⚠ {w}")
+                st.error("No usable report data found in this file.")
+                for w in parse_warnings:
+                    st.caption(f"⚠ {w}")
             else:
-                # Preview — split into "will import" vs "already has data"
                 will_import, will_skip = [], []
                 for (username, entity, rm), data in parsed.items():
-                    existing = load_submission(username, rm)
-                    already_has_data = bool(existing and existing.get("initiatives"))
+                    existing = load_submission(username, entity, rm)
                     row = {
-                        "User": username,
-                        "Entity": entity,
-                        "Period": fmt_month(rm),
+                        "User": username, "Entity": entity, "Period": fmt_month(rm),
                         "Status": STATUS_LABELS.get(data["status"], data["status"]),
                         "Initiatives": len(data["initiatives"]),
                     }
-                    (will_skip if already_has_data else will_import).append(row)
+                    (will_skip if (existing and existing.get("initiatives")) else will_import).append(row)
 
                 pc1, pc2, pc3 = st.columns(3)
-                pc1.metric("Periods found", len(parsed))
+                pc1.metric("Found", len(parsed))
                 pc2.metric("Will import", len(will_import))
-                pc3.metric("Already have data", len(will_skip))
+                pc3.metric("Already present", len(will_skip))
 
                 if will_import:
                     st.markdown("**Will be imported:**")
@@ -2898,12 +3080,13 @@ def screen_admin():
                         st.markdown(
                             f"&nbsp;&nbsp;• **{row['User']}** — Entity {row['Entity']} — "
                             f"{row['Period']} — {row['Status']} "
-                            f"({row['Initiatives']} initiative{'s' if row['Initiatives']!=1 else ''})",
+                            f"({row['Initiatives']} initiative"
+                            f"{'s' if row['Initiatives'] != 1 else ''})",
                             unsafe_allow_html=True,
                         )
 
                 if will_skip:
-                    with st.expander(f"⚠ {len(will_skip)} period(s) already have data — won't be touched unless you choose to overwrite"):
+                    with st.expander(f"⚠ {len(will_skip)} already have data — skipped unless you overwrite"):
                         for row in will_skip:
                             st.markdown(
                                 f"&nbsp;&nbsp;• **{row['User']}** — Entity {row['Entity']} — "
@@ -2919,33 +3102,29 @@ def screen_admin():
                 overwrite = False
                 if will_skip:
                     overwrite = st.checkbox(
-                        "Overwrite periods that already have data (replaces their current initiatives)",
-                        value=False,
-                        key="restore_overwrite",
+                        "Overwrite periods that already have data",
+                        value=False, key="restore_overwrite",
                     )
 
-                n_to_apply = len(parsed) if overwrite else len(will_import)
-                if n_to_apply == 0:
+                n_apply = len(parsed) if overwrite else len(will_import)
+                if n_apply == 0:
                     st.info("Nothing to import — every period in this file already has data.")
-                else:
-                    if st.button(
-                        f"📤 Restore {n_to_apply} period{'s' if n_to_apply!=1 else ''}",
-                        type="primary",
-                        key="confirm_restore",
-                    ):
-                        result = apply_import(parsed, overwrite=overwrite)
-                        st.success(
-                            f"✓ Restored {len(result['imported'])} period(s). "
-                            + (f"Skipped {len(result['skipped'])} (already had data)." if result["skipped"] else "")
-                        )
-                        st.rerun()
+                elif st.button(f"📤 Restore {n_apply} report{'s' if n_apply != 1 else ''}",
+                               type="primary", key="confirm_restore"):
+                    result = apply_import(parsed, overwrite=overwrite)
+                    st.success(
+                        f"Restored {len(result['imported'])} report(s)."
+                        + (f" Skipped {len(result['skipped'])}." if result["skipped"] else "")
+                    )
+                    st.rerun()
 
+    # ══ Settings ══════════════════════════════════════════════════════════════
     if active_tab == "⚙ Settings":
-        st.markdown("**Entity Permissions**")
+        st.markdown("**Entity filing permissions**")
         st.caption(
-            "By default, team members can see all entities. Set restrictions here "
-            "to limit which entities each user can file reports for. "
-            "Admins always see everything regardless of permissions."
+            "Controls which entities each person can FILE reports for. This is not "
+            "a confidentiality setting — the Archive tab shows archived reports for "
+            "every entity to everyone, by design."
         )
 
         all_ents = all_entities()
@@ -2955,7 +3134,6 @@ def screen_admin():
         changed = False
         for emp in employees_list:
             current = perms.get(emp, [])
-            # Seed widget key on first render or after reset
             perm_key = f"perm_{emp}"
             if perm_key not in st.session_state:
                 st.session_state[perm_key] = current if current else all_ents
@@ -2964,13 +3142,10 @@ def screen_admin():
                 st.markdown(f"**{emp}**")
             with col2:
                 sel = st.multiselect(
-                    f"##perm_{emp}",
-                    all_ents,
-                    key=perm_key,
+                    f"##perm_{emp}", all_ents, key=perm_key,
                     label_visibility="collapsed",
                     placeholder="All entities (no restriction)",
                 )
-                # If they selected everything, treat as "no restriction" (empty list)
                 new_perm = [] if set(sel) == set(all_ents) else list(sel)
                 if new_perm != current:
                     perms[emp] = new_perm
@@ -2979,25 +3154,27 @@ def screen_admin():
         st.write("")
         if changed:
             save_permissions(perms)
-            st.success("✓ Permissions saved.")
+            st.success("Permissions saved.")
 
         st.divider()
-        st.markdown("**Current Restrictions** (users with fewer than all entities):")
+        st.markdown("**Current restrictions**")
         restricted = {u: v for u, v in perms.items() if v}
         if not restricted:
-            st.caption("No restrictions set — all users can see all entities.")
+            st.caption("No restrictions — everyone can file for all entities.")
         else:
             for u, ents in restricted.items():
                 st.markdown(f"&nbsp;&nbsp;• **{u}**: {', '.join(ents)}", unsafe_allow_html=True)
 
         st.write("")
-        if st.button("Reset all to default (all entities)", key="reset_perms"):
+        if st.button("Reset all to all entities", key="reset_perms"):
             save_permissions({})
-            # Clear the multiselect widget cache so they re-render
-            # with all entities selected instead of the old restricted values
             for emp in employees_list:
                 st.session_state.pop(f"perm_{emp}", None)
             st.rerun()
+
+        st.divider()
+        st.markdown("**Entities**")
+        st.caption(", ".join(all_ents))
 
 
 # ── Entry Picker Screen ───────────────────────────────────────────────────────
@@ -3030,7 +3207,7 @@ def screen_entry_picker():
             "Best for adding one or two initiatives with full detail."
         )
         st.write("")
-        if st.button("Start Guided Entry →", type="primary", use_container_width=True, key="pick_guided"):
+        if st.button("Start Guided Entry →", type="primary", width='stretch', key="pick_guided"):
             st.session_state.wiz_init = new_initiative()
             st.session_state.wiz_step = 0
             st.session_state.wiz_mode = "new"
@@ -3044,7 +3221,7 @@ def screen_entry_picker():
             "Best for entering several initiatives in one sitting."
         )
         st.write("")
-        if st.button("Start Bulk Entry →", use_container_width=True, key="pick_bulk"):
+        if st.button("Start Bulk Entry →", width='stretch', key="pick_bulk"):
             st.session_state.pop("bulk_df", None)
             st.session_state.screen = "bulk_entry"
             st.rerun()
@@ -3110,7 +3287,7 @@ def screen_bulk_entry():
         edited = st.data_editor(
             st.session_state.bulk_df,
             num_rows="dynamic",
-            use_container_width=True,
+            width='stretch',
             hide_index=False,
             column_config={
                 "Initiative Name *": st.column_config.TextColumn(
@@ -3352,7 +3529,7 @@ def screen_pathway_select():
     with c1:
         st.markdown("### 🔄 Still working on it")
         st.caption("Lightweight monthly update. Update activities and notes; all other details carry over as-is.")
-        if st.button("Select →", key="pw_continuing", use_container_width=True, type="primary"):
+        if st.button("Select →", key="pw_continuing", width='stretch', type="primary"):
             st.session_state.wiz_init["pathway"] = "continuing"
             st.session_state.screen = "continuing"
             st.rerun()
@@ -3360,7 +3537,7 @@ def screen_pathway_select():
     with c2:
         st.markdown("### ✅ Resolved this month")
         st.caption("Capture the resolution and outcome. Sets a completion date; won't appear in future carry-overs.")
-        if st.button("Select →", key="pw_resolved", use_container_width=True):
+        if st.button("Select →", key="pw_resolved", width='stretch'):
             st.session_state.wiz_init["pathway"] = "resolved"
             st.session_state.screen = "resolved"
             st.rerun()
@@ -3368,7 +3545,7 @@ def screen_pathway_select():
     with c3:
         st.markdown("### 🔀 New direction")
         st.caption("The scope or approach has fundamentally changed. Full structured entry — same as adding a new initiative.")
-        if st.button("Select →", key="pw_new_direction", use_container_width=True):
+        if st.button("Select →", key="pw_new_direction", width='stretch'):
             st.session_state.wiz_init["pathway"] = "new_direction"
             st.session_state.wiz_mode = "edit"
             st.session_state.wiz_step = 0
@@ -3386,6 +3563,10 @@ def _save_initiative_update(user: str, init: dict):
     draft = st.session_state.draft
     if not init.get("month_yr"):
         init["month_yr"] = draft.get("activities_month") or draft.get("reporting_month", "")
+    # The user has just revised this initiative, so it is no longer awaiting
+    # revision. The reviewer's note moves into history rather than continuing to
+    # display as an open problem on work that has since been fixed.
+    clear_return_flag(init)
     draft["initiatives"] = [
         i if i["id"] != init["id"] else init
         for i in draft["initiatives"]
@@ -3581,8 +3762,15 @@ def main():
         screen_continuing()
     elif screen == "resolved":
         screen_resolved()
+    elif screen == "archive":
+        screen_archive()
     elif screen == "admin":
         screen_admin()
+    else:
+        # Unknown screen name (e.g. a stale value after a code change) — send the
+        # user somewhere real rather than rendering a blank page.
+        st.session_state.screen = "login"
+        screen_login()
 
 if __name__ == "__main__":
     main()
