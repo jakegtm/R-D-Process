@@ -1,2 +1,7 @@
-streamlit
-openpyxl
+# Pinned so a new Streamlit release can't change app behaviour without a commit.
+# 1.50 is the floor for width='stretch' (use_container_width is removed).
+streamlit>=1.50,<2.0
+openpyxl>=3.1,<4.0
+# Imported directly by the bulk-entry grid. It previously worked only because
+# Streamlit happened to pull it in as a transitive dependency.
+pandas>=2.0,<3.0
