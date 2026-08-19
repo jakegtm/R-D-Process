@@ -16,6 +16,7 @@ import re
 import time
 
 import store
+import directory
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -31,10 +32,23 @@ st.set_page_config(
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 
+# Who can SIGN IN and prepare reports. Deliberately NOT the list of people who
+# can be named on an initiative — that comes from the uploaded employee
+# directory (directory.py), which runs to thousands of names for a real client
+# and would be unusable as a sign-in dropdown.
+#
+# EMPLOYEES is also the fallback for team selection until a directory is
+# uploaded, so a fresh install still works.
 EMPLOYEES = [
     "Bob Smith", "Sara", "Doug", "Trevor", "Doni",
     "Jonathan", "Steven", "Michael", "Joe", "Nicole Browne",
 ]
+
+# What the app calls the grouping that employees are filtered by. It maps to the
+# client's Cost Center column, but "Group" alone would collide with the Group
+# number in export filenames (107_Group_10_2025_...), which means the month.
+# Change this one string to relabel it everywhere, including the export header.
+GROUP_LABEL = "Employee Group"
 
 ENTITIES = ["107", "108", "109", "110"]   # base/default entities — custom ones persist separately
 
@@ -62,6 +76,18 @@ LEGACY_STATUS_ALIASES = {"changes requested": "rejected"}
 # Wizard steps — exactly the 9 columns in the Excel template
 # (Month/Yr is derived from reporting_month, not asked separately)
 WIZARD_STEPS = [
+    {
+        # Asked first, because it determines who can be named on this
+        # initiative. Changing it later clears any team member who isn't in the
+        # new group — see the group branch in screen_wizard().
+        "field": "employee_group",
+        "label": GROUP_LABEL,
+        "type": "group",
+        "question": f"Which {GROUP_LABEL.lower()} is this initiative's work in?",
+        "hint": "Team members you pick later are limited to this group. "
+                "Type to search — the code and the name both match.",
+        "required": True,
+    },
     {
         "field": "business_component",
         "label": "Business Component",
@@ -143,8 +169,9 @@ WIZARD_STEPS = [
 ]
 
 CARRYOVER_FIELDS = {
-    "business_component", "initiative_name", "initiative_description",
-    "tech_uncertainty", "start_date", "expected_end_date", "team_members",
+    "employee_group", "business_component", "initiative_name",
+    "initiative_description", "tech_uncertainty", "start_date",
+    "expected_end_date", "team_members",
 }
 
 
@@ -676,6 +703,9 @@ def parse_import_workbook(file_bytes: bytes) -> tuple[dict, list[str]]:
             status_key = _parse_status_label(str(get("status", "")))
 
             init = new_initiative()
+            # Read by header name, so files exported before this column
+            # existed still import — they just come back with no group.
+            init["employee_group"]         = str(get(GROUP_LABEL.lower(), ""))
             init["business_component"]     = str(get("business component", ""))
             init["initiative_name"]        = str(iname).strip()
             init["initiative_description"] = str(get("initiative description", ""))
@@ -966,6 +996,7 @@ def new_initiative() -> dict:
     import random as _rnd
     return {
         "id": f"{int(datetime.now().timestamp()*1000)}_{_rnd.randint(10000,99999)}",
+        "employee_group":        "",
         "business_component":    "",
         "initiative_name":       "",
         "initiative_description":"",
@@ -1050,7 +1081,10 @@ def _data_font():
 
 # Column definition for a single-combo sheet (User prepended for consolidated)
 _COL_DEF = [
-    # Widths match original template exactly (measured via openpyxl from source file)
+    # Employee Group leads, matching the order the app asks for things. Every
+    # other width matches the original template exactly (measured via openpyxl
+    # from the source file).
+    (GROUP_LABEL,                                              "employee_group",     32.0,   False),
     ("Month/Yr",                                               "_month",             14.15,  False),
     ("Filing Month",                                            "_filing",            13.0,   False),
     ("Business Component",                                     "business_component", 35.0,   False),
@@ -1166,6 +1200,7 @@ def _sub_to_rows(username: str, sub: dict, include_user: bool) -> list[dict]:
                 or ts_to_et(init.get("approved_at"), "%Y-%m-%d")
                 or ts_to_et(sub.get("approved_at"), "%Y-%m-%d")
             ),
+            "employee_group":        init.get("employee_group",        ""),
             "business_component":    init.get("business_component",    ""),
             "initiative_name":       init.get("initiative_name",        ""),
             "initiative_description":init.get("initiative_description", ""),
@@ -1313,6 +1348,157 @@ def status_desc_for(status_keys: list[str]) -> str:
 
 
 # ── CSS ───────────────────────────────────────────────────────────────────────
+
+# ── Employee group and team selection ─────────────────────────────────────────
+# Every employee in the uploaded directory belongs to exactly one group (the
+# client's Cost Center column), so there is no multi-assignment ambiguity. For
+# the current client that is 152 groups across 2,132 people, median 7 each —
+# the difference between a usable dropdown and a useless one.
+#
+# The group is chosen FIRST, stored on the initiative, and the team list is then
+# strictly that group's people. There is no way to reach across groups: work
+# spanning two groups is two initiatives. Write-ins are the one exception, since
+# a contractor belongs to no group by definition.
+#
+# With no directory uploaded, group selection falls back to free text and team
+# selection to the built-in EMPLOYEES list, so a fresh install still works.
+
+def group_select(state_key: str, current: str = "", label: str | None = None) -> str:
+    """Choose an employee group. Returns the chosen group, "" if none."""
+    label = label or GROUP_LABEL
+    if not directory.is_loaded():
+        st.caption(
+            "No employee directory loaded, so this is free text and team "
+            "selection falls back to the built-in list. An admin can upload the "
+            "client's directory in **Admin → Settings**."
+        )
+        return st.text_input(label, value=current or "", key=f"{state_key}__free")
+
+    opts = directory.groups()
+    n_emp, n_grp = directory.counts()
+    placeholder = f"— Choose a {label.lower()} —"
+    choices = [placeholder] + opts
+    if current and current not in opts:
+        # A group that has since been renamed or dropped from the directory.
+        # Keep it selectable rather than silently reassigning the initiative.
+        choices = [placeholder, current] + opts
+    idx = choices.index(current) if current in choices else 0
+
+    picked = st.selectbox(
+        label, choices, index=idx, key=f"{state_key}__grp",
+        help=f"{n_emp:,} employees across {n_grp} groups. Type to search — the "
+             "code and the name both match.",
+    )
+    return "" if picked == placeholder else picked
+
+
+def _prune_to_group(members, group: str):
+    """Drop anyone who isn't in `group`. Write-ins are kept — a contractor
+    isn't in the directory at all, so they belong to whichever initiative
+    someone added them to."""
+    return [m for m in (members or [])
+            if not directory.known(m) or directory.group_of(m) == group]
+
+
+def render_team_picker(state_key: str, group: str, current=None, label: str = "Team Members"):
+    """Select team members from within one group.
+
+    Writes the result to st.session_state[state_key] and returns it, so callers
+    can read it whichever way suits them.
+    """
+    if state_key not in st.session_state:
+        st.session_state[state_key] = list(current or [])
+    selected = list(st.session_state[state_key])
+
+    # ── No directory — built-in list ─────────────────────────────────────────
+    if not directory.is_loaded():
+        ms_key = f"{state_key}__builtin"
+        if ms_key not in st.session_state:
+            st.session_state[ms_key] = [m for m in selected if m in EMPLOYEES]
+        picked = st.multiselect(
+            label, EMPLOYEES, key=ms_key, placeholder="Select team members...",
+        )
+        # Write-ins and directory names aren't in EMPLOYEES; keep them rather
+        # than silently dropping them.
+        extras = [m for m in selected if m not in EMPLOYEES]
+        result = list(picked) + extras
+        st.session_state[state_key] = result
+        return result
+
+    if not group:
+        st.info(f"Choose a {GROUP_LABEL.lower()} first — team members come from it.")
+        return selected
+
+    people = directory.names_in(group)
+    ms_key = f"{state_key}__ms"
+    if ms_key not in st.session_state:
+        st.session_state[ms_key] = [p for p in selected if p in people]
+    picked = st.multiselect(
+        f"{label} — {len(people)} in {group}",
+        people,
+        key=ms_key,
+        placeholder="Select team members...",
+    )
+
+    write_ins = [m for m in selected if not directory.known(m)]
+
+    # ── Write-ins: contractors and anyone missing from the file ─────────────
+    with st.expander(f"Someone not in the directory ({len(write_ins)} added)"
+                     if write_ins else "Someone not in the directory (contractor, new hire)"):
+        st.caption(
+            "The directory is employees only, so contractors have to be added "
+            "here. Give the company too and it is stored as *Name (Company)*, "
+            "which keeps the entries consistent across preparers."
+        )
+        wc1, wc2 = st.columns(2)
+        with wc1:
+            wi_name = st.text_input("Name", key=f"{state_key}__wi_name")
+        with wc2:
+            wi_co = st.text_input(
+                "Company (contractors only)", key=f"{state_key}__wi_co",
+                placeholder="Leave blank for an employee",
+            )
+        if st.button("Add to team", key=f"{state_key}__wi_add"):
+            nm, co = (wi_name or "").strip(), (wi_co or "").strip()
+            if not nm:
+                st.warning("Enter a name first.")
+            else:
+                entry = f"{nm} ({co})" if co else nm
+                if entry in selected:
+                    st.info(f"{entry} is already on this initiative.")
+                else:
+                    st.session_state[state_key] = list(picked) + write_ins + [entry]
+                    st.session_state.pop(f"{state_key}__wi_name", None)
+                    st.session_state.pop(f"{state_key}__wi_co", None)
+                    st.rerun()
+
+        for person in write_ins:
+            wc3, wc4 = st.columns([8, 1])
+            with wc3:
+                st.markdown(
+                    f"{person}  \n<small style='color:#64748b;'>"
+                    "not in the directory — added manually</small>",
+                    unsafe_allow_html=True,
+                )
+            with wc4:
+                if st.button("✕", key=f"{state_key}__rm_{abs(hash(person)) % 10**8}",
+                             help=f"Remove {person}"):
+                    st.session_state[state_key] = [
+                        p for p in (list(picked) + write_ins) if p != person
+                    ]
+                    st.rerun()
+
+    result = list(picked) + write_ins
+    st.session_state[state_key] = result
+    return result
+
+
+def clear_team_picker_state(state_key: str):
+    """Drop a picker's internal widget state so the next initiative doesn't
+    inherit the last one's selection."""
+    for k in [k for k in list(st.session_state) if k.startswith(f"{state_key}__")]:
+        st.session_state.pop(k, None)
+
 
 def inject_css():
     st.markdown("""
@@ -1850,6 +2036,7 @@ def screen_dashboard():
             istatus = init.get("initiative_status", "active")
             table_rows.append({
                 " ":                  status_icon_map.get(istatus, "🔵"),
+                GROUP_LABEL:          init.get("employee_group", ""),
                 "Initiative":         init.get("initiative_name", "Unnamed"),
                 "Business Component": init.get("business_component", ""),
                 "Team":               ", ".join(init.get("team_members") or []),
@@ -2226,22 +2413,44 @@ def screen_wizard():
                 pass
         picked  = st.date_input(s["label"], value=parsed)
         new_val = picked.strftime("%Y-%m-%d") if picked else None
+    elif s["type"] == "group":
+        new_val = group_select(f"wiz_grp_{init.get('id','new')}", val or "")
+        # Team members belong to a group, so changing it invalidates them.
+        # Say so and drop them rather than exporting a team that contradicts
+        # the group on the same row.
+        if new_val and val and new_val != val:
+            kept = _prune_to_group(init.get("team_members"), new_val)
+            dropped = [m for m in (init.get("team_members") or []) if m not in kept]
+            if dropped:
+                st.warning(
+                    f"{len(dropped)} team member"
+                    f"{'s are' if len(dropped) != 1 else ' is'} not in "
+                    f"{new_val} and will be removed: {', '.join(dropped)}."
+                )
+                init["team_members"] = kept
+                clear_team_picker_state(f"wiz_team_{init.get('id','new')}")
     elif s["type"] == "multiselect":
-        # Use a stable key so Streamlit preserves the selection across reruns.
-        # On first render for this initiative (key not yet in session_state),
-        # seed it from the saved value so edits pre-fill correctly.
-        ms_key = f"wiz_team_{init.get('id','new')}_{step}"
-        if ms_key not in st.session_state:
-            st.session_state[ms_key] = val or []
-        new_val = st.multiselect(
-            s["label"], EMPLOYEES,
-            key=ms_key,
+        # Scoped to the group chosen in step 1. Keyed on the initiative so each
+        # keeps its own selection across reruns, and seeded from the saved value
+        # so edits pre-fill.
+        new_val = render_team_picker(
+            f"wiz_team_{init.get('id','new')}",
+            init.get("employee_group", ""),
+            val or [],
+            label=s["label"],
         )
 
     init[field] = new_val
 
     if s["required"]:
-        is_valid = bool(new_val) if s["type"] == "multiselect" else bool(str(new_val or "").strip())
+        if s["type"] == "multiselect":
+            is_valid = bool(new_val)
+        elif s["type"] == "group":
+            # Without a directory there is nothing to choose from, so don't
+            # block the preparer on a field the admin hasn't set up yet.
+            is_valid = bool(str(new_val or "").strip()) or not directory.is_loaded()
+        else:
+            is_valid = bool(str(new_val or "").strip())
     else:
         is_valid = True
 
@@ -3234,6 +3443,187 @@ def screen_admin():
         st.markdown("**Entities**")
         st.caption(", ".join(all_ents))
 
+        st.divider()
+        render_directory_settings()
+
+
+# ── Employee directory admin ──────────────────────────────────────────────────
+
+def render_directory_settings():
+    """Upload / replace the client's employee list.
+
+    Deliberately tolerant about file shape: HR exports arrive with title rows,
+    notes, and merged cells above the real header — the current client's has
+    five — and asking the client to clean that up is a worse ask than detecting
+    it here. The admin confirms the sheet and the two columns that matter;
+    everything else in the file is ignored.
+    """
+    st.markdown("**Employee directory**")
+
+    if directory.is_loaded():
+        m = directory.meta()
+        n_emp, n_grp = directory.counts()
+        when = ts_to_et(m.get("saved_at"), "%b %d, %Y %I:%M %p") if m.get("saved_at") else ""
+        st.success(
+            f"✓ **{n_emp:,} employees** across **{n_grp} {GROUP_LABEL.lower()}s** — "
+            f"from *{m.get('filename','uploaded file')}*"
+            + (f", sheet *{m.get('sheet','')}*" if m.get("sheet") else "")
+            + (f", loaded {when}" if when else "")
+        )
+        st.caption(
+            f"Preparers pick a {GROUP_LABEL.lower()} first, then choose team "
+            "members from within it. Uploading again replaces this; initiatives "
+            "already saved keep the names they were given either way."
+        )
+        if st.session_state.get("dir_confirm_clear"):
+            st.warning(
+                f"Remove the directory? {GROUP_LABEL} becomes free text and team "
+                "selection falls back to the built-in list. Saved initiatives "
+                "are not affected."
+            )
+            dc1, dc2 = st.columns(2)
+            with dc1:
+                if st.button("Yes, remove it", key="dir_clear_yes", type="primary"):
+                    directory.clear()
+                    st.session_state.dir_confirm_clear = False
+                    st.rerun()
+            with dc2:
+                if st.button("Cancel", key="dir_clear_no"):
+                    st.session_state.dir_confirm_clear = False
+                    st.rerun()
+        else:
+            if st.button("Remove directory", key="dir_clear"):
+                st.session_state.dir_confirm_clear = True
+                st.rerun()
+    else:
+        st.info(
+            f"No directory loaded, so {GROUP_LABEL} is free text and team "
+            f"selection uses the built-in list of {len(EMPLOYEES)} names."
+        )
+
+    st.caption(
+        "⚠ This app's storage is wiped when the server restarts, so the "
+        "directory has to be re-uploaded afterwards along with the reports."
+    )
+
+    st.write("")
+    up = st.file_uploader(
+        "Upload an employee list (.xlsx)", type=["xlsx"], key="dir_uploader"
+    )
+    if up is None:
+        return
+
+    try:
+        raw = up.getvalue()
+        sheets = directory.sheet_names(raw)
+    except Exception as e:
+        st.error(f"Couldn't open that file as an Excel workbook: {e}")
+        return
+    if not sheets:
+        st.error("That workbook has no sheets.")
+        return
+
+    sheet = st.selectbox("Sheet", sheets, key="dir_sheet")
+    try:
+        info = directory.inspect(raw, sheet)
+    except Exception as e:
+        st.error(f"Couldn't read that sheet: {e}")
+        return
+    if not info["columns"]:
+        st.error("No column headers found on that sheet — try another one.")
+        return
+
+    st.caption(
+        f"Header detected on row **{info['header_row']}** · "
+        f"**{info['n_rows']:,}** data rows · **{len(info['columns'])}** columns"
+    )
+
+    cols, sug = info["columns"], info["suggested"]
+
+    def _idx(val, fallback=0):
+        return cols.index(val) if val in cols else fallback
+
+    mc1, mc2, mc3 = st.columns(3)
+    with mc1:
+        name_col = st.selectbox(
+            "Name column", cols, index=_idx(sug.get("name")), key="dir_name_col"
+        )
+    with mc2:
+        group_col = st.selectbox(
+            f"{GROUP_LABEL} column", cols, index=_idx(sug.get("group")),
+            key="dir_group_col",
+            help="Usually Cost Center. Whatever you pick here is what preparers "
+                 "filter employees by.",
+        )
+    with mc3:
+        id_opts = ["(none)"] + cols
+        id_col = st.selectbox(
+            "Employee ID (optional)", id_opts,
+            index=(id_opts.index(sug["id"]) if sug.get("id") in id_opts else 0),
+            key="dir_id_col",
+            help="Only used to tell apart two people with the same name.",
+        )
+
+    if name_col == group_col:
+        st.error(f"Name and {GROUP_LABEL.lower()} must be different columns.")
+        return
+
+    try:
+        records, warnings = directory.parse(
+            raw, sheet, name_col, group_col, "" if id_col == "(none)" else id_col
+        )
+    except Exception as e:
+        st.error(f"Couldn't read that sheet: {e}")
+        return
+    if not records:
+        for w in warnings:
+            st.error(w)
+        return
+
+    sizes_by_group = {}
+    for r in records:
+        sizes_by_group[r["group"]] = sizes_by_group.get(r["group"], 0) + 1
+    sizes = sorted(sizes_by_group.values(), reverse=True)
+
+    pc1, pc2, pc3 = st.columns(3)
+    pc1.metric("Employees", f"{len(records):,}")
+    pc2.metric(f"{GROUP_LABEL}s", len(sizes_by_group))
+    pc3.metric("Largest group", sizes[0] if sizes else 0)
+
+    for w in warnings:
+        st.caption(f"ℹ {w}")
+
+    if sizes and sizes[0] > 40:
+        n_big = sum(1 for s in sizes if s > 40)
+        st.caption(
+            f"ℹ {n_big} group{'s' if n_big != 1 else ''} "
+            f"{'have' if n_big != 1 else 'has'} more than 40 people. Those lists "
+            "are long — the picker's search box handles them, but it's worth "
+            "knowing before the client sees it."
+        )
+
+    with st.expander("Preview the first 10 rows"):
+        st.dataframe(
+            [{"Name": r["display"], GROUP_LABEL: r["group"]} for r in records[:10]],
+            width='stretch', hide_index=True,
+        )
+
+    st.write("")
+    if st.button(
+        f"Load {len(records):,} employees"
+        + (" (replaces the current directory)" if directory.is_loaded() else ""),
+        type="primary", key="dir_save",
+    ):
+        directory.save(records, {
+            "filename": up.name, "sheet": sheet,
+            "name_col": name_col, "group_col": group_col,
+        })
+        st.success(
+            f"Loaded {len(records):,} employees across "
+            f"{len(sizes_by_group)} {GROUP_LABEL.lower()}s."
+        )
+        st.rerun()
+
 
 # ── Entry Picker Screen ───────────────────────────────────────────────────────
 
@@ -3322,6 +3712,7 @@ def screen_bulk_entry():
         n = 5
         import pandas as _pd
         st.session_state.bulk_df = pd.DataFrame({
+            f"{GROUP_LABEL} *":    [""] * n,
             "Initiative Name *":   [""] * n,
             "Business Component *":[""] * n,
             "Description *":       [""] * n,
@@ -3348,6 +3739,20 @@ def screen_bulk_entry():
             width='stretch',
             hide_index=False,
             column_config={
+                # Rows can each have a different group — the team-member step
+                # that follows scopes each row's people to its own group.
+                f"{GROUP_LABEL} *": (
+                    st.column_config.SelectboxColumn(
+                        f"{GROUP_LABEL} *", width="medium",
+                        options=directory.groups(),
+                        help="Team members for this row are limited to this group.",
+                    )
+                    if directory.is_loaded() else
+                    st.column_config.TextColumn(
+                        f"{GROUP_LABEL} *", width="medium",
+                        help="No employee directory loaded — free text for now.",
+                    )
+                ),
                 "Initiative Name *": st.column_config.TextColumn(
                     "Initiative Name *", width="medium",
                     help="Short, unique name for this initiative",
@@ -3404,6 +3809,7 @@ def screen_bulk_entry():
         for idx, row in edited.iterrows():
             row_num = idx if isinstance(idx, int) else int(idx)
 
+            grp   = str(row.get(f"{GROUP_LABEL} *",   "") or "").strip()
             name  = str(row.get("Initiative Name *",  "") or "").strip()
             bc    = str(row.get("Business Component *","") or "").strip()
             desc  = str(row.get("Description *",      "") or "").strip()
@@ -3429,10 +3835,12 @@ def screen_bulk_entry():
             sd = _to_str(sd_raw)
             ed = _to_str(ed_raw)
 
-            if not any([name, bc, desc, unc, acts]) and not sd and not ed:
+            if not any([grp, name, bc, desc, unc, acts]) and not sd and not ed:
                 continue
 
             row_errors = []
+            if not grp and directory.is_loaded():
+                row_errors.append(GROUP_LABEL)
             if not name:   row_errors.append("Initiative Name")
             if not bc:     row_errors.append("Business Component")
             if not desc:   row_errors.append("Description")
@@ -3455,6 +3863,7 @@ def screen_bulk_entry():
                 continue
 
             init = new_initiative()
+            init["employee_group"]         = grp
             init["initiative_name"]        = name
             init["business_component"]     = bc
             init["initiative_description"] = desc
@@ -3510,21 +3919,15 @@ def screen_bulk_team():
         sd    = init.get("start_date", "—")
         ed    = init.get("expected_end_date", "—")
 
+        grp = init.get("employee_group", "")
         st.markdown(f"**{iname}** — *{bc}*")
-        st.caption(f"📅 {sd} → {ed}  ·  Reporting Period: {fmt_month(am)}")
-
-        key = f"bulk_team_{i}"
-        if key not in st.session_state:
-            st.session_state[key] = init.get("team_members", [])
-
-        st.multiselect(
-            "Team Members",
-            EMPLOYEES,
-            key=key,
-            label_visibility="collapsed",
-            placeholder="Select team members...",
+        st.caption(
+            f"📅 {sd} → {ed}  ·  Reporting Period: {fmt_month(am)}"
+            + (f"  ·  {GROUP_LABEL}: **{grp}**" if grp else "")
         )
-        st.write("")
+
+        render_team_picker(f"bulk_team_{i}", grp, init.get("team_members", []))
+        st.divider()
 
     st.divider()
 
@@ -3548,6 +3951,7 @@ def screen_bulk_team():
             st.session_state.pop("bulk_pending", None)
             st.session_state.pop("bulk_df", None)
             for i in range(len(inits)):
+                clear_team_picker_state(f"bulk_team_{i}")
                 st.session_state.pop(f"bulk_team_{i}", None)
 
             n = len(inits)
@@ -3640,11 +4044,9 @@ def screen_continuing():
     user  = st.session_state.user
     init  = dict(st.session_state.wiz_init)
 
-    # Seed the team multiselect key on first render so it pre-fills correctly
-    if "cont_team" not in st.session_state:
-        st.session_state["cont_team"] = [
-            m for m in (init.get("team_members") or []) if m in EMPLOYEES
-        ]
+    # The picker seeds itself from the initiative. This used to seed with
+    # `if m in EMPLOYEES`, which silently dropped every team member who wasn't
+    # in the built-in ten — all directory names, and all write-ins.
 
     st.markdown(f"## 🔄 Monthly Update")
     st.markdown(f"**{init.get('initiative_name', 'Unnamed')}** — *{init.get('business_component', '')}*")
@@ -3689,9 +4091,21 @@ def screen_continuing():
         name = st.text_input("Initiative Name",    value=init.get("initiative_name", ""),    key="cont_name")
         desc = st.text_area("Initiative Description", value=init.get("initiative_description", ""), height=100, key="cont_desc")
         unc  = st.text_area("Technical Uncertainty",  value=init.get("tech_uncertainty", ""),        height=100, key="cont_unc")
-        team = st.multiselect(
-            "Team Members", EMPLOYEES,
-            key="cont_team",
+        new_grp = group_select("cont_grp", init.get("employee_group", ""))
+        if new_grp and new_grp != init.get("employee_group", ""):
+            init["employee_group"] = new_grp
+            kept = _prune_to_group(init.get("team_members"), new_grp)
+            if len(kept) != len(init.get("team_members") or []):
+                st.warning(
+                    f"Team members outside {new_grp} were removed. "
+                    "Reselect below."
+                )
+                init["team_members"] = kept
+                clear_team_picker_state("cont_team")
+                st.session_state.pop("cont_team", None)
+        team = render_team_picker(
+            "cont_team", init.get("employee_group", ""),
+            init.get("team_members") or [],
         )
 
     st.write("")
@@ -3714,6 +4128,9 @@ def screen_continuing():
                 init["initiative_description"] = st.session_state.get("cont_desc", init["initiative_description"])
                 init["tech_uncertainty"]       = st.session_state.get("cont_unc", init["tech_uncertainty"])
                 init["team_members"]           = st.session_state.get("cont_team", init.get("team_members", []))
+                init["employee_group"]         = st.session_state.get(
+                    "cont_grp__grp", init.get("employee_group", "")
+                ) if directory.is_loaded() else init.get("employee_group", "")
                 _save_initiative_update(user, init)
 
 
