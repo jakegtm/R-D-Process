@@ -169,7 +169,7 @@ WIZARD_STEPS = [
 ]
 
 CARRYOVER_FIELDS = {
-    "employee_group", "business_component", "initiative_name",
+    "employee_group", "contractors", "business_component", "initiative_name",
     "initiative_description", "tech_uncertainty", "start_date",
     "expected_end_date", "team_members",
 }
@@ -450,6 +450,60 @@ def add_custom_entity(new_entity: str) -> bool:
     return True
 
 
+# ── Business component closure ────────────────────────────────────────────────
+# Closing a business component is separate from resolving a technical
+# uncertainty. An uncertainty is a question that gets answered; a component is a
+# body of work that finishes. One component can carry several uncertainties, so
+# resolving one does not close the component, and closing the component does not
+# retroactively resolve anything.
+#
+# Closure is stored per (entity, business component) rather than on any single
+# initiative, because a component spans initiatives and months.
+
+def _closed_bcs() -> dict:
+    return store.get_config("closed_business_components", {}) or {}
+
+
+def bc_is_closed(entity: str, bc: str) -> dict | None:
+    """The closure record for this component, or None if it is still open."""
+    key = (bc or "").strip().lower()
+    if not key:
+        return None
+    return _closed_bcs().get(entity or "", {}).get(key)
+
+
+def close_business_component(entity: str, bc: str, who: str, note: str = "") -> bool:
+    """Mark a component closed. False if it was already closed."""
+    key = (bc or "").strip().lower()
+    if not key or bc_is_closed(entity, bc):
+        return False
+    data = _closed_bcs()
+    data.setdefault(entity or "", {})[key] = {
+        "label":     (bc or "").strip(),
+        "closed_by": who,
+        "closed_at": int(time.time() * 1000),
+        "note":      (note or "").strip(),
+    }
+    store.set_config("closed_business_components", data)
+    return True
+
+
+def reopen_business_component(entity: str, bc: str) -> bool:
+    key = (bc or "").strip().lower()
+    data = _closed_bcs()
+    if key in data.get(entity or "", {}):
+        data[entity or ""].pop(key, None)
+        store.set_config("closed_business_components", data)
+        return True
+    return False
+
+
+def closed_bc_list(entity: str) -> list[dict]:
+    """Closed components for one entity, most recently closed first."""
+    recs = list(_closed_bcs().get(entity or "", {}).values())
+    return sorted(recs, key=lambda r: r.get("closed_at") or 0, reverse=True)
+
+
 # ── Permissions ───────────────────────────────────────────────────────────────
 
 def load_permissions() -> dict:
@@ -715,6 +769,8 @@ def parse_import_workbook(file_bytes: bytes) -> tuple[dict, list[str]]:
             init["activities"]              = str(get("activities to eliminate technical uncertainty", ""))
             team_raw                        = str(get("team members", ""))
             init["team_members"]            = [t.strip() for t in team_raw.split(",") if t.strip()]
+            con_raw                         = str(get("contractors", ""))
+            init["contractors"]             = [c.strip() for c in con_raw.split(",") if c.strip()]
             init["notes"]                   = str(get("notes", ""))
             init["month_yr"]                = activities_month
             init["carry_over"]              = False
@@ -1005,6 +1061,11 @@ def new_initiative() -> dict:
         "expected_end_date":     None,
         "activities":            "",
         "team_members":          [],
+        # contractors: people who are NOT in the employee directory — outside
+        # firms, and anyone missing from the HR export. Kept in their own field
+        # rather than mixed into team_members so the two stay distinguishable in
+        # the export no matter what happens to the directory afterwards.
+        "contractors":           [],
         "notes":                 "",
         "carry_over":            False,
         # Per-initiative status (set by admin actions)
@@ -1026,13 +1087,54 @@ def new_initiative() -> dict:
         # pathway: which flow the user chose this month for this carry-over initiative.
         # "continuing" | "resolved" | "new_direction" | "" (not yet chosen)
         "pathway":               "",
-        # resolved: True once user marks initiative as complete via the Resolved pathway.
-        # Resolved initiatives are excluded from future carry-over suggestions.
+        # resolved: the TECHNICAL UNCERTAINTY has been resolved. Set via the
+        # Resolved pathway. Resolved initiatives get no new row in later periods
+        # and drop out of carry-over suggestions.
+        #
+        # Distinct from closing the BUSINESS COMPONENT, which is tracked per
+        # (entity, business component) in config — see close_business_component().
+        # An uncertainty can resolve while the component keeps running.
         "resolved":              False,
         # completion_date: user-set date when resolved (YYYY-MM-DD).
         # Populates the Completion Date column in the export.
         "completion_date":       None,
     }
+
+def split_legacy_members(init: dict) -> dict:
+    """Backfill `contractors` on initiatives saved before the split existed.
+
+    Older rows kept contractors inside team_members. Splitting on the directory
+    is only safe to do ONCE, at which point the result is stored: if it were
+    recomputed on every read, replacing or removing the directory would silently
+    reclassify saved employees as contractors and change historical exports.
+    """
+    if "contractors" in init:
+        return init
+    members = init.get("team_members") or []
+    if directory.is_loaded():
+        init["team_members"] = [m for m in members if directory.known(m)]
+        init["contractors"]  = [m for m in members if not directory.known(m)]
+    else:
+        # No directory to judge against — leave everything as team members
+        # rather than guess.
+        init["contractors"] = []
+    return init
+
+
+def employees_of(init: dict) -> list[str]:
+    split_legacy_members(init)
+    return list(init.get("team_members") or [])
+
+
+def contractors_of(init: dict) -> list[str]:
+    split_legacy_members(init)
+    return list(init.get("contractors") or [])
+
+
+def all_people_on(init: dict) -> list[str]:
+    """Everyone on an initiative, for display where the distinction doesn't matter."""
+    return employees_of(init) + contractors_of(init)
+
 
 def carryover_initiative(src: dict) -> dict:
     """Manual carry-over from the dashboard. Continues the same series, so the
@@ -1088,6 +1190,7 @@ _COL_DEF = [
     ("Month/Yr",                                               "_month",             14.15,  False),
     ("Filing Month",                                            "_filing",            13.0,   False),
     ("Business Component",                                     "business_component", 35.0,   False),
+    ("Component Status",                                       "_bc_status",         24.0,   False),
     ("Initiative Name",                                        "initiative_name",    19.26,  False),
     ("Initiative Description",                                 "initiative_description", 38.15, False),
     ("Tech Uncertainty",                                       "tech_uncertainty",   64.41,  False),
@@ -1095,6 +1198,7 @@ _COL_DEF = [
     ("Expected End Date",                                      "expected_end_date",  15.68,  False),
     ("Activities to Eliminate Technical Uncertainty",          "activities",         60.26,  False),
     ("Team Members",                                           "team_members",       49.0,   True),
+    ("Contractors",                                            "contractors",        30.0,   True),
     ("Notes",                                                  "notes",              52.57,  False),
     ("Completion Date",                                        "_completion",        22.0,   False),
     ("Status",                                                 "_status",            22.0,   False),
@@ -1180,9 +1284,28 @@ def _write_sheet(ws, rows_data: list[dict], subtitle: str):
     ws.freeze_panes = "A6"
 
 
+def _bc_status_cell(entity: str, bc: str) -> str:
+    """Whether this row's business component is open or closed.
+
+    The closure DATE is written out rather than a bare "Closed", because
+    closure is current state while each row belongs to a past month. A March row
+    under a component closed in June is not a March closure, and a bare "Closed"
+    would read as one. With the date present, it can be compared against the
+    row's own Month/Yr two columns to the left.
+    """
+    rec = bc_is_closed(entity, bc)
+    if not (bc or "").strip():
+        return ""
+    if not rec:
+        return "Open"
+    when = ts_to_et(rec.get("closed_at"), "%Y-%m-%d")
+    return f"Closed {when}" if when else "Closed"
+
+
 def _sub_to_rows(username: str, sub: dict, include_user: bool) -> list[dict]:
     """Convert a submission dict into a list of row dicts for _write_sheet."""
     rm     = sub.get("reporting_month", "")
+    entity = sub.get("entity", "")
     status = STATUS_LABELS.get(computed_status(sub), sub.get("status", ""))
     rows   = []
     for init in sub.get("initiatives") or []:
@@ -1195,20 +1318,23 @@ def _sub_to_rows(username: str, sub: dict, include_user: bool) -> list[dict]:
             # initiative, otherwise when it was accepted. Both formatted in
             # Eastern time via the same helper, rather than one going through a
             # fixed -5 offset and the other through the server's local timezone.
-            "_completion": (
-                init.get("completion_date")
-                or ts_to_et(init.get("approved_at"), "%Y-%m-%d")
-                or ts_to_et(sub.get("approved_at"), "%Y-%m-%d")
-            ),
+            # Completion Date means the technical uncertainty was RESOLVED.
+            # It used to fall back to the approval date, which stamped a
+            # completion date on every accepted initiative including ones still
+            # in progress — an examiner reading the file literally would have
+            # seen ongoing work reported as finished.
+            "_completion": (init.get("completion_date") or "") if init.get("resolved") else "",
             "employee_group":        init.get("employee_group",        ""),
             "business_component":    init.get("business_component",    ""),
+            "_bc_status":            _bc_status_cell(entity, init.get("business_component", "")),
             "initiative_name":       init.get("initiative_name",        ""),
             "initiative_description":init.get("initiative_description", ""),
             "tech_uncertainty":      init.get("tech_uncertainty",       ""),
             "start_date":            str(init.get("start_date")        or ""),
             "expected_end_date":     str(init.get("expected_end_date") or ""),
             "activities":            init.get("activities",             ""),
-            "team_members":          ", ".join(init.get("team_members") or []),
+            "team_members":          ", ".join(employees_of(init)),
+            "contractors":           ", ".join(contractors_of(init)),
             "notes":                 init.get("notes",                  ""),
         }
         if include_user:
@@ -1400,15 +1526,25 @@ def _prune_to_group(members, group: str):
             if not directory.known(m) or directory.group_of(m) == group]
 
 
-def render_team_picker(state_key: str, group: str, current=None, label: str = "Team Members"):
-    """Select team members from within one group.
+def render_team_picker(state_key: str, group: str, current=None,
+                       label: str = "Team Members", current_contractors=None):
+    """Select team members from within one group, plus any contractors.
 
-    Writes the result to st.session_state[state_key] and returns it, so callers
-    can read it whichever way suits them.
+    Returns (employees, contractors) and also writes them to
+    st.session_state[state_key] and st.session_state[state_key + "__con"], so
+    callers can read them whichever way suits them.
+
+    The two are kept apart from the moment of entry rather than separated later
+    on the way to the export. Deriving the split at export time would make it
+    depend on whichever directory happened to be loaded that day.
     """
+    con_key = f"{state_key}__con"
     if state_key not in st.session_state:
         st.session_state[state_key] = list(current or [])
-    selected = list(st.session_state[state_key])
+    if con_key not in st.session_state:
+        st.session_state[con_key] = list(current_contractors or [])
+    selected  = list(st.session_state[state_key])
+    write_ins = list(st.session_state[con_key])
 
     # ── No directory — built-in list ─────────────────────────────────────────
     if not directory.is_loaded():
@@ -1423,11 +1559,11 @@ def render_team_picker(state_key: str, group: str, current=None, label: str = "T
         extras = [m for m in selected if m not in EMPLOYEES]
         result = list(picked) + extras
         st.session_state[state_key] = result
-        return result
+        return result, write_ins
 
     if not group:
         st.info(f"Choose a {GROUP_LABEL.lower()} first — team members come from it.")
-        return selected
+        return selected, write_ins
 
     people = directory.names_in(group)
     ms_key = f"{state_key}__ms"
@@ -1440,9 +1576,7 @@ def render_team_picker(state_key: str, group: str, current=None, label: str = "T
         placeholder="Select team members...",
     )
 
-    write_ins = [m for m in selected if not directory.known(m)]
-
-    # ── Write-ins: contractors and anyone missing from the file ─────────────
+    # ── Contractors and anyone missing from the file ───────────────────────
     with st.expander(f"Someone not in the directory ({len(write_ins)} added)"
                      if write_ins else "Someone not in the directory (contractor, new hire)"):
         st.caption(
@@ -1464,10 +1598,10 @@ def render_team_picker(state_key: str, group: str, current=None, label: str = "T
                 st.warning("Enter a name first.")
             else:
                 entry = f"{nm} ({co})" if co else nm
-                if entry in selected:
+                if entry in write_ins:
                     st.info(f"{entry} is already on this initiative.")
                 else:
-                    st.session_state[state_key] = list(picked) + write_ins + [entry]
+                    st.session_state[con_key] = write_ins + [entry]
                     st.session_state.pop(f"{state_key}__wi_name", None)
                     st.session_state.pop(f"{state_key}__wi_co", None)
                     st.rerun()
@@ -1477,20 +1611,18 @@ def render_team_picker(state_key: str, group: str, current=None, label: str = "T
             with wc3:
                 st.markdown(
                     f"{person}  \n<small style='color:#64748b;'>"
-                    "not in the directory — added manually</small>",
+                    "recorded in the Contractors column</small>",
                     unsafe_allow_html=True,
                 )
             with wc4:
                 if st.button("✕", key=f"{state_key}__rm_{abs(hash(person)) % 10**8}",
                              help=f"Remove {person}"):
-                    st.session_state[state_key] = [
-                        p for p in (list(picked) + write_ins) if p != person
-                    ]
+                    st.session_state[con_key] = [p for p in write_ins if p != person]
                     st.rerun()
 
-    result = list(picked) + write_ins
-    st.session_state[state_key] = result
-    return result
+    st.session_state[state_key] = list(picked)
+    st.session_state[con_key]   = write_ins
+    return list(picked), write_ins
 
 
 def clear_team_picker_state(state_key: str):
@@ -1498,6 +1630,7 @@ def clear_team_picker_state(state_key: str):
     inherit the last one's selection."""
     for k in [k for k in list(st.session_state) if k.startswith(f"{state_key}__")]:
         st.session_state.pop(k, None)
+    st.session_state.pop(f"{state_key}__con", None)
 
 
 def inject_css():
@@ -1709,6 +1842,29 @@ def render_admin_reminder():
         st.warning(f"🔔 {len(pending)} report(s) pending your review: {names}{extra}")
 
 
+def pathways_pending(report: dict) -> list[dict]:
+    """Carried-forward initiatives in this period with no pathway chosen yet.
+
+    A rollover stamps carry_over=True and blanks the pathway on each new row, so
+    "needs an answer this period" is exactly those two conditions. Once the
+    preparer picks a pathway and saves, the row drops out of this list and stays
+    out until the next period blanks it again.
+    """
+    return [
+        i for i in current_rows(report)
+        if i.get("carry_over") and not (i.get("pathway") or "").strip()
+    ]
+
+
+def next_pathway_prompt(report: dict) -> dict | None:
+    """The next initiative to ask about, skipping any deferred this session."""
+    skipped = st.session_state.get("pathway_skipped") or set()
+    for init in pathways_pending(report):
+        if init.get("id") not in skipped:
+            return init
+    return None
+
+
 def screen_dashboard():
     user      = st.session_state.user
     draft     = st.session_state.draft
@@ -1905,6 +2061,33 @@ def screen_dashboard():
         st.info("Complete the Report Setup above before adding initiatives.")
         return
 
+    # ── Ask about carried-forward work before anything else ──────────────────
+    # Each initiative rolled into this period needs one of the three pathways
+    # before the report means anything. This used to sit behind ✏ Edit inside a
+    # collapsed expander, so in practice it was never found and carried-forward
+    # rows were resubmitted with last month's activities still in them.
+    #
+    # Deferring is allowed — being unable to reach the rest of the dashboard
+    # would be worse than an unanswered prompt — but the deferral lasts only
+    # for this session, and a banner keeps the outstanding count visible.
+    if not locked:
+        nxt = next_pathway_prompt(draft)
+        if nxt is not None:
+            st.session_state.wiz_init = dict(nxt)
+            st.session_state.wiz_step = 0
+            st.session_state.screen   = "pathway_select"
+            st.rerun()
+
+        deferred = pathways_pending(draft)
+        if deferred:
+            st.warning(
+                f"⏳ {len(deferred)} carried-forward initiative"
+                f"{'s' if len(deferred) != 1 else ''} still need"
+                f"{'' if len(deferred) != 1 else 's'} a monthly update: "
+                + ", ".join(f"**{i.get('initiative_name','Unnamed')}**" for i in deferred)
+                + ". Open one below and choose what happened with it."
+            )
+
     st.divider()
 
     # ── Carry-over from any past period ─────────────────────────────────────
@@ -2039,7 +2222,7 @@ def screen_dashboard():
                 GROUP_LABEL:          init.get("employee_group", ""),
                 "Initiative":         init.get("initiative_name", "Unnamed"),
                 "Business Component": init.get("business_component", ""),
-                "Team":               ", ".join(init.get("team_members") or []),
+                "Team":               ", ".join(all_people_on(init)),
                 "Start":              init.get("start_date", "—"),
                 "End":                init.get("expected_end_date", "—"),
             })
@@ -2088,7 +2271,7 @@ def screen_dashboard():
                 st.markdown(f"**{init.get('initiative_description','—')}**")
                 st.caption(
                     f"📅 {init.get('start_date','—')} → {init.get('expected_end_date','—')}  "
-                    f"  👥 {', '.join(init.get('team_members') or ['—'])}"
+                    f"  👥 {', '.join(all_people_on(init) or ['—'])}"
                 )
                 if init.get("tech_uncertainty"):
                     st.markdown("**Technical Uncertainty:**")
@@ -2336,7 +2519,7 @@ def render_history_section(user: str, current_reporting_month: str, current_enti
                     f"&nbsp;&nbsp;&nbsp;• **{i.get('initiative_name','Unnamed')}** — "
                     f"{i.get('business_component','')}  "
                     f"📅 {i.get('start_date','—')} → {i.get('expected_end_date','—')}  "
-                    f"👥 {', '.join(i.get('team_members') or ['—'])}",
+                    f"👥 {', '.join(all_people_on(i) or ['—'])}",
                     unsafe_allow_html=True,
                 )
             if inits:
@@ -2433,18 +2616,40 @@ def screen_wizard():
         # Scoped to the group chosen in step 1. Keyed on the initiative so each
         # keeps its own selection across reruns, and seeded from the saved value
         # so edits pre-fill.
-        new_val = render_team_picker(
+        split_legacy_members(init)
+        new_val, cons = render_team_picker(
             f"wiz_team_{init.get('id','new')}",
             init.get("employee_group", ""),
             val or [],
             label=s["label"],
+            current_contractors=init.get("contractors") or [],
         )
+        init["contractors"] = cons
 
     init[field] = new_val
 
+    # A closed business component must not be reused — that is the whole point
+    # of closing it. Checked here rather than only on save so the preparer finds
+    # out at the field, not after answering nine more questions.
+    bc_block = ""
+    if field == "business_component" and str(new_val or "").strip():
+        rec = bc_is_closed(st.session_state.draft.get("entity", ""), str(new_val))
+        if rec:
+            when = ts_to_et(rec.get("closed_at"), "%b %d, %Y") if rec.get("closed_at") else ""
+            bc_block = (
+                f"**{rec.get('label', new_val)}** was closed"
+                + (f" by {rec.get('closed_by')}" if rec.get("closed_by") else "")
+                + (f" on {when}" if when else "")
+                + ". Use a different business component, or ask the Oversight "
+                  "Lead to reopen it in Admin → Settings."
+            )
+            st.error(bc_block)
+
     if s["required"]:
         if s["type"] == "multiselect":
-            is_valid = bool(new_val)
+            # A one-person contractor team is a real answer, so don't insist on
+            # a directory employee being named.
+            is_valid = bool(new_val) or bool(init.get("contractors"))
         elif s["type"] == "group":
             # Without a directory there is nothing to choose from, so don't
             # block the preparer on a field the admin hasn't set up yet.
@@ -2453,6 +2658,9 @@ def screen_wizard():
             is_valid = bool(str(new_val or "").strip())
     else:
         is_valid = True
+
+    if bc_block:
+        is_valid = False
 
     c1, c2, c3 = st.columns([1, 4, 1])
     with c1:
@@ -2590,7 +2798,7 @@ def render_archive_browser(key_prefix: str = "arc"):
                 st.markdown(f"**{i.get('initiative_name','Unnamed')}** — {i.get('business_component','')}")
                 st.caption(
                     f"📅 {i.get('start_date','—')} → {i.get('expected_end_date','—')}  ·  "
-                    f"👥 {', '.join(i.get('team_members') or ['—'])}"
+                    f"👥 {', '.join(all_people_on(i) or ['—'])}"
                 )
                 if i.get("initiative_description"):
                     st.markdown(i["initiative_description"])
@@ -2809,7 +3017,7 @@ def screen_admin():
                                     f"**{fmt_month(i.get('month_yr','')) or '—'}** · "
                                     f"**{i.get('initiative_name','Unnamed')}** — "
                                     f"{i.get('business_component','')}  \n"
-                                    f"<small>👥 {', '.join(i.get('team_members') or ['—'])} "
+                                    f"<small>👥 {', '.join(all_people_on(i) or ['—'])} "
                                     f"&nbsp;|&nbsp; 📅 {i.get('start_date','—')} → "
                                     f"{i.get('expected_end_date','—')}</small>",
                                     unsafe_allow_html=True,
@@ -2905,7 +3113,7 @@ def screen_admin():
                                     f"🔵 **{'↩ ' if i.get('carry_over') else ''}"
                                     f"{i.get('initiative_name','Unnamed')}** — "
                                     f"{i.get('business_component','')}  \n"
-                                    f"<small>👥 {', '.join(i.get('team_members') or ['—'])} "
+                                    f"<small>👥 {', '.join(all_people_on(i) or ['—'])} "
                                     f"&nbsp;|&nbsp; 📅 {i.get('start_date','—')} → "
                                     f"{i.get('expected_end_date','—')}</small>",
                                     unsafe_allow_html=True,
@@ -2948,7 +3156,7 @@ def screen_admin():
                                     st.markdown(
                                         f"{ico} **{'↩ ' if init.get('carry_over') else ''}{iname}** — "
                                         f"{init.get('business_component','')}  \n"
-                                        f"<small>👥 {', '.join(init.get('team_members') or ['—'])} "
+                                        f"<small>👥 {', '.join(all_people_on(init) or ['—'])} "
                                         f"&nbsp;|&nbsp; 📅 {init.get('start_date','—')} → "
                                         f"{init.get('expected_end_date','—')}</small>",
                                         unsafe_allow_html=True,
@@ -3444,7 +3652,62 @@ def screen_admin():
         st.caption(", ".join(all_ents))
 
         st.divider()
+        render_closed_bc_settings()
+
+        st.divider()
         render_directory_settings()
+
+
+# ── Closed business components admin ──────────────────────────────────────────
+
+def render_closed_bc_settings():
+    """Review and reopen closed business components.
+
+    Closure is deliberately one-way from the preparer's side: they can close a
+    component when its work finishes, but only the Oversight Lead can reopen
+    one, since reopening means work the client already reported as finished has
+    started again.
+    """
+    st.markdown("**Closed business components**")
+    st.caption(
+        "Closed when a preparer finishes the last of the work under a component. "
+        "A closed component can't be used on new initiatives — reopen it here if "
+        "work restarts. This is separate from resolving a technical uncertainty, "
+        "which closes a question rather than the component."
+    )
+
+    ents = all_entities()
+    any_closed = False
+    for entity in ents:
+        recs = closed_bc_list(entity)
+        if not recs:
+            continue
+        any_closed = True
+        st.markdown(f"*Entity {entity}*")
+        for rec in recs:
+            label = rec.get("label", "—")
+            when  = ts_to_et(rec.get("closed_at"), "%b %d, %Y") if rec.get("closed_at") else ""
+            cc1, cc2 = st.columns([5, 1])
+            with cc1:
+                st.markdown(
+                    f"&nbsp;&nbsp;• **{label}**  \n"
+                    f"<small style='color:#64748b;'>"
+                    f"closed by {rec.get('closed_by','—')}"
+                    + (f" · {when}" if when else "")
+                    + (f" · {rec.get('note')}" if rec.get("note") else "")
+                    + "</small>",
+                    unsafe_allow_html=True,
+                )
+            with cc2:
+                key = f"reopen_bc_{entity}_{_safe_name(label)}"
+                if st.button("↩ Reopen", key=key):
+                    reopen_business_component(entity, label)
+                    st.success(f"Reopened {label} for Entity {entity}.")
+                    st.rerun()
+        st.write("")
+
+    if not any_closed:
+        st.caption("Nothing closed yet.")
 
 
 # ── Employee directory admin ──────────────────────────────────────────────────
@@ -3839,6 +4102,13 @@ def screen_bulk_entry():
                 continue
 
             row_errors = []
+            if bc and bc_is_closed(draft.get("entity", ""), bc):
+                errors.append(
+                    f'Row {row_num} — business component "{bc}" is closed and '
+                    "can't be reused. Pick another, or ask the Oversight Lead to "
+                    "reopen it."
+                )
+                continue
             if not grp and directory.is_loaded():
                 row_errors.append(GROUP_LABEL)
             if not name:   row_errors.append("Initiative Name")
@@ -3926,7 +4196,11 @@ def screen_bulk_team():
             + (f"  ·  {GROUP_LABEL}: **{grp}**" if grp else "")
         )
 
-        render_team_picker(f"bulk_team_{i}", grp, init.get("team_members", []))
+        split_legacy_members(init)
+        render_team_picker(
+            f"bulk_team_{i}", grp, init.get("team_members", []),
+            current_contractors=init.get("contractors") or [],
+        )
         st.divider()
 
     st.divider()
@@ -3941,6 +4215,7 @@ def screen_bulk_team():
             # Assign team members from each multiselect into the initiatives
             for i, init in enumerate(inits):
                 init["team_members"] = st.session_state.get(f"bulk_team_{i}", [])
+                init["contractors"]  = st.session_state.get(f"bulk_team_{i}__con", [])
 
             # Append all to the draft and save
             draft["initiatives"] = draft.get("initiatives", []) + inits
@@ -4015,7 +4290,17 @@ def screen_pathway_select():
             st.rerun()
 
     st.write("")
-    if st.button("← Back to dashboard", key="pw_back"):
+    st.caption(
+        "Every initiative carried into this period needs one of these three "
+        "before the report is submitted."
+    )
+    if st.button("⏳ Skip for now", key="pw_back",
+                 help="Come back to it later in this session"):
+        # Recorded so the dashboard doesn't immediately send us straight back
+        # here — without this the auto-prompt and the back button loop.
+        skipped = set(st.session_state.get("pathway_skipped") or set())
+        skipped.add(init.get("id"))
+        st.session_state.pathway_skipped = skipped
         st.session_state.screen = "dashboard"
         st.rerun()
 
@@ -4103,9 +4388,11 @@ def screen_continuing():
                 init["team_members"] = kept
                 clear_team_picker_state("cont_team")
                 st.session_state.pop("cont_team", None)
-        team = render_team_picker(
+        split_legacy_members(init)
+        team, cont_cons = render_team_picker(
             "cont_team", init.get("employee_group", ""),
             init.get("team_members") or [],
+            current_contractors=init.get("contractors") or [],
         )
 
     st.write("")
@@ -4128,6 +4415,7 @@ def screen_continuing():
                 init["initiative_description"] = st.session_state.get("cont_desc", init["initiative_description"])
                 init["tech_uncertainty"]       = st.session_state.get("cont_unc", init["tech_uncertainty"])
                 init["team_members"]           = st.session_state.get("cont_team", init.get("team_members", []))
+                init["contractors"]            = st.session_state.get("cont_team__con", init.get("contractors", []))
                 init["employee_group"]         = st.session_state.get(
                     "cont_grp__grp", init.get("employee_group", "")
                 ) if directory.is_loaded() else init.get("employee_group", "")
@@ -4139,9 +4427,15 @@ def screen_resolved():
     user  = st.session_state.user
     init  = dict(st.session_state.wiz_init)
 
+    bc     = (init.get("business_component") or "").strip()
+    entity = st.session_state.draft.get("entity", "")
+
     st.markdown(f"## ✅ Resolution — {init.get('initiative_name', 'Unnamed')}")
-    st.markdown(f"*{init.get('business_component', '')}*")
-    st.caption("Capture what you did to reach resolution and the outcome. This initiative won't appear in next month's carry-over suggestions.")
+    st.markdown(f"*{bc}*")
+    st.caption(
+        "Capture what you did to reach resolution and the outcome. This "
+        "initiative won't appear in next month's carry-over suggestions."
+    )
     st.divider()
 
     activities = st.text_area(
@@ -4180,6 +4474,37 @@ def screen_resolved():
         key="res_outcome",
     )
 
+    # ── Closing the business component is a separate decision ───────────────
+    # Resolving an uncertainty answers one question. A business component can
+    # carry several, so it keeps running until someone says otherwise — and it
+    # is asked here rather than inferred, because inferring it would silently
+    # close components that still have live work under them.
+    st.write("")
+    st.markdown("**Does this also close the business component?**")
+    already = bc_is_closed(entity, bc) if bc else None
+    if not bc:
+        st.caption("No business component on this initiative, so there's nothing to close.")
+        close_bc_now = False
+    elif already:
+        when = ts_to_et(already.get("closed_at"), "%b %d, %Y") if already.get("closed_at") else ""
+        st.info(
+            f"**{already.get('label', bc)}** is already closed"
+            + (f" (by {already.get('closed_by')}{', ' + when if when else ''})" if already.get("closed_by") else "")
+            + "."
+        )
+        close_bc_now = False
+    else:
+        close_bc_now = st.checkbox(
+            f"Yes — close **{bc}**. All work under it is finished.",
+            value=False, key="res_close_bc",
+        )
+        st.caption(
+            "Leave unticked if more R&D is expected under this component — "
+            "resolving this uncertainty doesn't require closing it. Once closed, "
+            "the component can't be used on new initiatives until an admin "
+            "reopens it."
+        )
+
     st.write("")
     b1, b2 = st.columns([1, 1])
     with b1:
@@ -4209,7 +4534,13 @@ def screen_resolved():
                 init["start_date"]      = st.session_state.get("res_sd") or None
                 init["expected_end_date"] = st.session_state.get("res_ed") or None
                 init["completion_date"] = completion_date.strip()
-                init["resolved"]        = True
+                init["resolved"]        = True   # the technical uncertainty
+                if close_bc_now and bc:
+                    close_business_component(
+                        entity, bc, user,
+                        note=f"Closed with initiative '{init.get('initiative_name','')}'",
+                    )
+                    st.success(f"Business component **{bc}** closed.")
                 _save_initiative_update(user, init)
 
 
