@@ -1592,6 +1592,10 @@ def render_team_picker(state_key: str, group: str, current=None,
                 "Company (contractors only)", key=f"{state_key}__wi_co",
                 placeholder="Leave blank for an employee",
             )
+        if (wi_name or "").strip() and (wi_name or "").strip() not in " ".join(write_ins):
+            st.caption(
+                f"↳ **{(wi_name or '').strip()}** will be added when you continue."
+            )
         if st.button("Add to team", key=f"{state_key}__wi_add"):
             nm, co = (wi_name or "").strip(), (wi_co or "").strip()
             if not nm:
@@ -1623,6 +1627,31 @@ def render_team_picker(state_key: str, group: str, current=None,
     st.session_state[state_key] = list(picked)
     st.session_state[con_key]   = write_ins
     return list(picked), write_ins
+
+
+def flush_pending_contractor(state_key: str) -> str:
+    """Commit contractor text that was typed but never submitted with the button.
+
+    Requiring a button click to commit a name meant that filling both boxes and
+    moving on silently discarded the entry — the text stayed in the widget and
+    the initiative saved without it, with nothing on screen to say so. Every path
+    that leaves the picker calls this first, so typing the name is enough.
+
+    Idempotent: safe to call more than once, and it does not clear the widgets,
+    since Streamlit will not let a widget-backed key be rewritten after the
+    widget has been drawn in the same run.
+    """
+    nm = (st.session_state.get(f"{state_key}__wi_name") or "").strip()
+    if not nm:
+        return ""
+    co = (st.session_state.get(f"{state_key}__wi_co") or "").strip()
+    entry = f"{nm} ({co})" if co else nm
+    con_key = f"{state_key}__con"
+    current = list(st.session_state.get(con_key) or [])
+    if entry not in current:
+        current.append(entry)
+        st.session_state[con_key] = current
+    return entry
 
 
 def clear_team_picker_state(state_key: str):
@@ -2670,6 +2699,11 @@ def screen_wizard():
     with c3:
         is_last = step == total - 1
         if st.button("Save Initiative ✓" if is_last else "Next →", disabled=not is_valid, type="primary"):
+            # Anything typed into the contractor boxes counts, clicked or not.
+            if s["type"] == "multiselect":
+                tkey = f"wiz_team_{init.get('id','new')}"
+                if flush_pending_contractor(tkey):
+                    init["contractors"] = list(st.session_state.get(f"{tkey}__con") or [])
             if is_last:
                 draft = st.session_state.draft
                 # Stamp month_yr on new/carryover initiatives so the export
@@ -4212,8 +4246,9 @@ def screen_bulk_team():
             st.rerun()
     with b3:
         if st.button("Save All Initiatives ✓", type="primary", key="bt_save"):
-            # Assign team members from each multiselect into the initiatives
+            # Assign team members from each picker into the initiatives
             for i, init in enumerate(inits):
+                flush_pending_contractor(f"bulk_team_{i}")
                 init["team_members"] = st.session_state.get(f"bulk_team_{i}", [])
                 init["contractors"]  = st.session_state.get(f"bulk_team_{i}__con", [])
 
@@ -4414,6 +4449,7 @@ def screen_continuing():
                 init["initiative_name"]        = st.session_state.get("cont_name", init["initiative_name"])
                 init["initiative_description"] = st.session_state.get("cont_desc", init["initiative_description"])
                 init["tech_uncertainty"]       = st.session_state.get("cont_unc", init["tech_uncertainty"])
+                flush_pending_contractor("cont_team")
                 init["team_members"]           = st.session_state.get("cont_team", init.get("team_members", []))
                 init["contractors"]            = st.session_state.get("cont_team__con", init.get("contractors", []))
                 init["employee_group"]         = st.session_state.get(
