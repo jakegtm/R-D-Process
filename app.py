@@ -40,9 +40,22 @@ DATA_DIR.mkdir(exist_ok=True)
 # EMPLOYEES is also the fallback for team selection until a directory is
 # uploaded, so a fresh install still works.
 EMPLOYEES = [
-    "Bob Smith", "Sara", "Doug", "Trevor", "Doni",
-    "Jonathan", "Steven", "Michael", "Joe", "Nicole Browne",
+    "Bob Smith", "Sara", "Doug", "Doni", "Michael", "Nicole Browne",
+    # Added for the working session. Full names, because the sign-in list is
+    # also what lands in the "User" column of the consolidated export, and
+    # "Joe" is not something a reviewer can act on months later.
+    "Trevor Rosenthal", "Joe Lally", "Jonathan Forman", "Steven Burgwald",
 ]
+
+# Sign-in names that were shortened before. Reports and entity permissions are
+# stored under the name as it was at the time, so a straight rename would orphan
+# anything already filed. These keep the old key readable — see migrate_user_names().
+USER_RENAMES = {
+    "Trevor":   "Trevor Rosenthal",
+    "Joe":      "Joe Lally",
+    "Jonathan": "Jonathan Forman",
+    "Steven":   "Steven Burgwald",
+}
 
 # What the app calls the grouping that employees are filtered by. It maps to the
 # client's Cost Center column, but "Group" alone would collide with the Group
@@ -72,6 +85,19 @@ LOCKED_STATUSES = ("submitted", "approved", "archived")
 
 # Kept for the import parser, which may meet labels from older exports.
 LEGACY_STATUS_ALIASES = {"changes requested": "rejected"}
+
+# Outcome tags for a single approach. Worked / Partially worked / Failed are
+# the three from the spec. "Still testing" is a fourth, added because the
+# monthly flow asks about work that is by definition still underway — forcing
+# one of the other three onto an unfinished experiment would put a false
+# conclusion into an audit file. Delete the last entry to drop it.
+APPROACH_OUTCOMES = [
+    ("worked",  "✅ Worked"),
+    ("partial", "🟡 Partially worked"),
+    ("failed",  "🔴 Failed"),
+    ("testing", "🔬 Still testing"),
+]
+OUTCOME_LABEL = dict(APPROACH_OUTCOMES)
 
 # Wizard steps — exactly the 9 columns in the Excel template
 # (Month/Yr is derived from reporting_month, not asked separately)
@@ -141,12 +167,13 @@ WIZARD_STEPS = [
         "required": True,
     },
     {
-        "field": "activities",
-        "label": "Activities to Eliminate Technical Uncertainty",
-        "type": "textarea",
-        "placeholder": "Prototyping new approach, running performance tests, analyzing results...",
-        "question": "What activities are being conducted to eliminate the technical uncertainty?",
-        "hint": "Describe the specific tasks, experiments, or development work happening this month.",
+        "field": "approaches",
+        "label": "Approaches Tried",
+        "type": "approaches",
+        "question": "What have you tried to eliminate the technical uncertainty?",
+        "hint": "One or two sentences per approach, each tagged with how it turned "
+                "out. Log the ones that failed too — a failed attempt is some of "
+                "the strongest evidence that real technical uncertainty existed.",
         "required": True,
     },
     {
@@ -507,8 +534,16 @@ def closed_bc_list(entity: str) -> list[dict]:
 # ── Permissions ───────────────────────────────────────────────────────────────
 
 def load_permissions() -> dict:
-    """{username: [entity, ...]}. An empty list means no restriction."""
-    return store.get_config("permissions", {}) or {}
+    """{username: [entity, ...]}. An empty list means no restriction.
+
+    Permissions set under an old short name are read under the new full name, so
+    renaming someone doesn't silently hand them access to every entity.
+    """
+    perms = store.get_config("permissions", {}) or {}
+    for old_name, new_name in USER_RENAMES.items():
+        if old_name in perms and new_name not in perms:
+            perms[new_name] = perms[old_name]
+    return perms
 
 def save_permissions(perms: dict):
     store.set_config("permissions", perms)
@@ -767,6 +802,9 @@ def parse_import_workbook(file_bytes: bytes) -> tuple[dict, list[str]]:
             init["start_date"]              = _cell_to_date_str(get("start date", None)) or None
             init["expected_end_date"]       = _cell_to_date_str(get("expected end date", None)) or None
             init["activities"]              = str(get("activities to eliminate technical uncertainty", ""))
+            # Rebuild the structured rows from the text this app wrote, so a
+            # restore comes back editable rather than as one frozen blob.
+            init["approaches"]              = parse_approaches_text(init["activities"])
             team_raw                        = str(get("team members", ""))
             init["team_members"]            = [t.strip() for t in team_raw.split(",") if t.strip()]
             con_raw                         = str(get("contractors", ""))
@@ -965,6 +1003,7 @@ def advance_report(report: dict, target_month: str | None = None) -> tuple[bool,
         fresh["historical"]        = False
         fresh["carry_over"]        = True
         fresh["activities"]        = ""
+        fresh["approaches"]        = []
         fresh["notes"]             = ""
         fresh["pathway"]           = ""
         fresh["initiative_status"] = "active"
@@ -1059,7 +1098,14 @@ def new_initiative() -> dict:
         "tech_uncertainty":      "",
         "start_date":            None,
         "expected_end_date":     None,
+        # activities: the flattened, human-readable rendering of `approaches`.
+        # Kept in sync on every save so the Excel column, the importer, and every
+        # display site keep working on plain text while the structure lives in
+        # `approaches`.
         "activities":            "",
+        # approaches: [{"id", "text", "outcome"}] — the structured experimentation
+        # record. Each row is one thing tried, tagged with how it turned out.
+        "approaches":            [],
         "team_members":          [],
         # contractors: people who are NOT in the employee directory — outside
         # firms, and anyone missing from the HR export. Kept in their own field
@@ -1099,6 +1145,90 @@ def new_initiative() -> dict:
         # Populates the Completion Date column in the export.
         "completion_date":       None,
     }
+
+def parse_approaches_text(text: str) -> list:
+    """Inverse of approaches_text(), for restoring from an export.
+
+    Only recognises the shape this app writes ("1. did a thing — Failed"). Text
+    it does not recognise comes back as a single untagged approach rather than
+    being dropped or guessed at.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return []
+    label_to_key = {lbl.split(" ", 1)[-1].lower(): k for k, lbl in APPROACH_OUTCOMES}
+    rows, matched = [], 0
+    for i, line in enumerate(l.strip() for l in raw.splitlines()):
+        if not line:
+            continue
+        body = re.sub(r"^\d+\.\s*", "", line)
+        outcome = ""
+        m = re.search(r"\s+—\s+([A-Za-z ]+)$", body)
+        if m and m.group(1).strip().lower() in label_to_key:
+            outcome = label_to_key[m.group(1).strip().lower()]
+            body = body[: m.start()].strip()
+            matched += 1
+        rows.append({"id": f"imp{i}", "text": body, "outcome": outcome})
+    if not rows:
+        return []
+    if matched == 0 and len(rows) == 1:
+        # Free text from before approaches existed — one untagged row.
+        return [{"id": "imp0", "text": raw, "outcome": ""}]
+    return rows
+
+
+def approaches_text(approaches) -> str:
+    """Flatten approach rows into the text that goes in the Excel column.
+
+    Numbered, one per line, with the outcome spelled out — the export has to
+    stand on its own in front of someone who has never seen the app.
+    """
+    lines = []
+    for i, a in enumerate(approaches or [], 1):
+        text = (a.get("text") or "").strip()
+        if not text:
+            continue
+        label = OUTCOME_LABEL.get(a.get("outcome") or "", "")
+        # Strip the emoji — it carries no meaning in a spreadsheet cell.
+        label = label.split(" ", 1)[-1] if label else ""
+        lines.append(f"{i}. {text}" + (f" — {label}" if label else ""))
+    return "\n".join(lines)
+
+
+def sync_activities(init: dict) -> dict:
+    """Regenerate the flat `activities` text from the structured approaches."""
+    if init.get("approaches"):
+        init["activities"] = approaches_text(init["approaches"])
+    return init
+
+
+def migrate_approaches(init: dict) -> dict:
+    """Give pre-structure initiatives one approach row holding their old text.
+
+    Runs once and stores the result, so an initiative written before approaches
+    existed opens with its activities intact rather than an empty form. The
+    outcome is left blank rather than guessed — nobody said whether that work
+    succeeded, and inventing an answer is exactly what this feature exists to
+    prevent.
+    """
+    if init.get("approaches"):
+        return init
+    old = (init.get("activities") or "").strip()
+    init["approaches"] = (
+        [{"id": "legacy", "text": old, "outcome": ""}] if old else []
+    )
+    return init
+
+
+def outcome_counts(init: dict) -> dict:
+    """{outcome_key: n} for one initiative — feeds the admin summaries."""
+    out = {}
+    for a in init.get("approaches") or []:
+        if (a.get("text") or "").strip():
+            k = a.get("outcome") or ""
+            out[k] = out.get(k, 0) + 1
+    return out
+
 
 def split_legacy_members(init: dict) -> dict:
     """Backfill `contractors` on initiatives saved before the split existed.
@@ -1627,6 +1757,99 @@ def render_team_picker(state_key: str, group: str, current=None,
     st.session_state[state_key] = list(picked)
     st.session_state[con_key]   = write_ins
     return list(picked), write_ins
+
+
+# ── Approach rows ─────────────────────────────────────────────────────────────
+# Free text hid what mattered. "Ran tests on the buffer system" doesn't say
+# whether it worked, and a reviewer three months later can't tell iteration from
+# a single afternoon. One row per thing tried, each tagged, makes the
+# uncertainty → experimentation → resolution arc legible without anyone writing
+# a narrative.
+#
+# Rows are keyed on their own id rather than list position: Streamlit caches
+# widget values by key, so deleting row 2 of four with index-based keys would
+# leave rows 3 and 4 displaying the text that used to sit above them.
+
+def _new_approach() -> dict:
+    import random as _rnd
+    return {"id": f"ap{int(time.time()*1000)}_{_rnd.randint(1000,9999)}",
+            "text": "", "outcome": ""}
+
+
+def render_approaches(state_key: str, current=None, min_rows: int = 1) -> list:
+    """Edit the list of approaches. Returns rows with text filled in."""
+    if state_key not in st.session_state:
+        rows = [dict(r) for r in (current or []) if isinstance(r, dict)]
+        for r in rows:
+            r.setdefault("id", _new_approach()["id"])
+            r.setdefault("text", "")
+            r.setdefault("outcome", "")
+        while len(rows) < min_rows:
+            rows.append(_new_approach())
+        st.session_state[state_key] = rows
+    rows = st.session_state[state_key]
+
+    keys   = [k for k, _ in APPROACH_OUTCOMES]
+    labels = [lbl for _, lbl in APPROACH_OUTCOMES]
+    UNSET  = "— How did it turn out? —"
+
+    for idx, row in enumerate(rows):
+        rid = row["id"]
+        c1, c2, c3 = st.columns([6, 2.6, 0.7])
+        with c1:
+            row["text"] = st.text_area(
+                f"Approach {idx + 1}",
+                value=row.get("text", ""),
+                key=f"{state_key}__t_{rid}",
+                height=80,
+                placeholder="One or two sentences on what you tried.",
+            )
+        with c2:
+            opts = [UNSET] + labels
+            cur  = OUTCOME_LABEL.get(row.get("outcome") or "", UNSET)
+            picked = st.selectbox(
+                "Outcome", opts,
+                index=opts.index(cur) if cur in opts else 0,
+                key=f"{state_key}__o_{rid}",
+            )
+            row["outcome"] = "" if picked == UNSET else keys[labels.index(picked)]
+        with c3:
+            st.write("")
+            st.write("")
+            if len(rows) > 1 and st.button("✕", key=f"{state_key}__x_{rid}",
+                                           help="Remove this approach"):
+                st.session_state[state_key] = [r for r in rows if r["id"] != rid]
+                for suffix in ("t", "o"):
+                    st.session_state.pop(f"{state_key}__{suffix}_{rid}", None)
+                st.rerun()
+
+    if st.button("＋ Add another approach", key=f"{state_key}__add"):
+        st.session_state[state_key] = rows + [_new_approach()]
+        st.rerun()
+
+    filled = [r for r in rows if (r.get("text") or "").strip()]
+    untagged = [r for r in filled if not r.get("outcome")]
+    if untagged:
+        st.caption(
+            f"⚠ {len(untagged)} approach{'es' if len(untagged) != 1 else ''} "
+            "still need an outcome."
+        )
+    return rows
+
+
+def approaches_valid(rows) -> bool:
+    """At least one approach, and everything written down is tagged."""
+    filled = [r for r in (rows or []) if (r.get("text") or "").strip()]
+    return bool(filled) and all(r.get("outcome") for r in filled)
+
+
+def clean_approaches(rows) -> list:
+    """Drop empty rows before saving."""
+    return [
+        {"id": r.get("id", ""), "text": (r.get("text") or "").strip(),
+         "outcome": r.get("outcome") or ""}
+        for r in (rows or []) if (r.get("text") or "").strip()
+    ]
 
 
 def flush_pending_contractor(state_key: str) -> str:
@@ -2625,6 +2848,11 @@ def screen_wizard():
                 pass
         picked  = st.date_input(s["label"], value=parsed)
         new_val = picked.strftime("%Y-%m-%d") if picked else None
+    elif s["type"] == "approaches":
+        migrate_approaches(init)
+        new_val = render_approaches(
+            f"wiz_appr_{init.get('id','new')}", init.get("approaches") or []
+        )
     elif s["type"] == "group":
         new_val = group_select(f"wiz_grp_{init.get('id','new')}", val or "")
         # Team members belong to a group, so changing it invalidates them.
@@ -2675,7 +2903,9 @@ def screen_wizard():
             st.error(bc_block)
 
     if s["required"]:
-        if s["type"] == "multiselect":
+        if s["type"] == "approaches":
+            is_valid = approaches_valid(new_val)
+        elif s["type"] == "multiselect":
             # A one-person contractor team is a real answer, so don't insist on
             # a directory employee being named.
             is_valid = bool(new_val) or bool(init.get("contractors"))
@@ -2704,6 +2934,9 @@ def screen_wizard():
                 tkey = f"wiz_team_{init.get('id','new')}"
                 if flush_pending_contractor(tkey):
                     init["contractors"] = list(st.session_state.get(f"{tkey}__con") or [])
+            if s["type"] == "approaches":
+                init["approaches"] = clean_approaches(new_val)
+                sync_activities(init)
             if is_last:
                 draft = st.session_state.draft
                 # Stamp month_yr on new/carryover initiatives so the export
@@ -4017,6 +4250,7 @@ def screen_bulk_entry():
             "Start Date *":        [_pd.NaT] * n,
             "End Date *":          [_pd.NaT] * n,
             "Activities *":        [""] * n,
+            "Outcome *":           [""] * n,
             "Notes":               [""] * n,
         }, index=range(1, n + 1))
 
@@ -4075,8 +4309,15 @@ def screen_bulk_entry():
                     help="Expected completion date",
                 ),
                 "Activities *": st.column_config.TextColumn(
-                    "Activities *", width="large",
-                    help="Activities this month to eliminate the technical uncertainty",
+                    "Approach Tried *", width="large",
+                    help="One or two sentences on what you tried. More approaches "
+                         "can be added after saving, via Edit.",
+                ),
+                "Outcome *": st.column_config.SelectboxColumn(
+                    "Outcome *", width="medium",
+                    options=[lbl for _, lbl in APPROACH_OUTCOMES],
+                    help="How this approach turned out. Failed attempts are "
+                         "evidence, not a problem.",
                 ),
 
                 "Notes": st.column_config.TextColumn(
@@ -4112,6 +4353,7 @@ def screen_bulk_entry():
             desc  = str(row.get("Description *",      "") or "").strip()
             unc   = str(row.get("Tech Uncertainty *", "") or "").strip()
             acts  = str(row.get("Activities *",       "") or "").strip()
+            outc  = str(row.get("Outcome *",           "") or "").strip()
             notes = str(row.get("Notes",              "") or "").strip()
             import pandas as _pd
             sd_raw = row.get("Start Date *")
@@ -4132,7 +4374,7 @@ def screen_bulk_entry():
             sd = _to_str(sd_raw)
             ed = _to_str(ed_raw)
 
-            if not any([grp, name, bc, desc, unc, acts]) and not sd and not ed:
+            if not any([grp, name, bc, desc, unc, acts, outc]) and not sd and not ed:
                 continue
 
             row_errors = []
@@ -4149,7 +4391,8 @@ def screen_bulk_entry():
             if not bc:     row_errors.append("Business Component")
             if not desc:   row_errors.append("Description")
             if not unc:    row_errors.append("Tech Uncertainty")
-            if not acts:   row_errors.append("Activities")
+            if not acts:   row_errors.append("Approach Tried")
+            if acts and not outc: row_errors.append("Outcome")
             if not sd:     row_errors.append("Start Date")
             if not ed:     row_errors.append("End Date")
 
@@ -4174,7 +4417,14 @@ def screen_bulk_entry():
             init["tech_uncertainty"]       = unc
             init["start_date"]             = sd_str
             init["expected_end_date"]      = ed_str
-            init["activities"]             = acts
+            # One approach per grid row; more can be added later via Edit.
+            outcome_key = next(
+                (k for k, lbl in APPROACH_OUTCOMES if lbl == outc), ""
+            )
+            init["approaches"] = [
+                {"id": f"bulk{row_num}", "text": acts, "outcome": outcome_key}
+            ]
+            init["activities"]             = approaches_text(init["approaches"])
             init["team_members"]           = []
             init["notes"]                  = notes
             init["month_yr"]               = am
@@ -4373,13 +4623,15 @@ def screen_continuing():
     st.caption("Update what changed this month. All fields are pre-filled from last month.")
     st.divider()
 
-    activities = st.text_area(
-        "What did you work on this month? *",
-        value=init.get("activities", ""),
-        height=160,
-        placeholder="Describe the activities you carried out this month to advance this initiative...",
-        key="cont_activities",
+    st.markdown("**What did you try this month? ***")
+    st.caption(
+        "One or two sentences per approach, each tagged with how it turned out. "
+        "Failed attempts belong here — they are the clearest evidence the "
+        "uncertainty was real."
     )
+    migrate_approaches(init)
+    cont_rows  = render_approaches("cont_appr", init.get("approaches") or [])
+    activities = approaches_text(clean_approaches(cont_rows))
 
     dc1, dc2 = st.columns(2)
     with dc1:
@@ -4438,9 +4690,12 @@ def screen_continuing():
             st.rerun()
     with b2:
         if st.button("Save Update ✓", type="primary", key="cont_save"):
-            if not activities.strip():
-                st.error("Please describe what you worked on this month.")
+            if not approaches_valid(cont_rows):
+                st.error(
+                    "Add at least one approach, and tag each one with how it turned out."
+                )
             else:
+                init["approaches"]             = clean_approaches(cont_rows)
                 init["activities"]             = activities.strip()
                 init["notes"]                  = notes.strip()
                 init["start_date"]             = st.session_state.get("cont_sd") or None
@@ -4474,13 +4729,14 @@ def screen_resolved():
     )
     st.divider()
 
-    activities = st.text_area(
-        "What activities led to resolution this month? *",
-        value=init.get("activities", ""),
-        height=140,
-        placeholder="Describe the final activities that eliminated the technical uncertainty...",
-        key="res_activities",
+    st.markdown("**What led to the resolution? ***")
+    st.caption(
+        "The approaches that closed this out. Keep the failed ones — the path to "
+        "the answer is the evidence."
     )
+    migrate_approaches(init)
+    res_rows   = render_approaches("res_appr", init.get("approaches") or [])
+    activities = approaches_text(clean_approaches(res_rows))
 
     rd1, rd2 = st.columns(2)
     with rd1:
@@ -4531,15 +4787,10 @@ def screen_resolved():
         close_bc_now = False
     else:
         close_bc_now = st.checkbox(
-            f"Yes — close **{bc}**. All work under it is finished.",
+            "Yes: Business Component is complete",
             value=False, key="res_close_bc",
         )
-        st.caption(
-            "Leave unticked if more R&D is expected under this component — "
-            "resolving this uncertainty doesn't require closing it. Once closed, "
-            "the component can't be used on new initiatives until an admin "
-            "reopens it."
-        )
+        st.caption("Closed components can't be used again unless an admin reopens them.")
 
     st.write("")
     b1, b2 = st.columns([1, 1])
@@ -4550,8 +4801,10 @@ def screen_resolved():
     with b2:
         if st.button("Save Resolution ✓", type="primary", key="res_save"):
             errors = []
-            if not activities.strip():
-                errors.append("Please describe the activities that led to resolution.")
+            if not approaches_valid(res_rows):
+                errors.append(
+                    "Add at least one approach, and tag each one with how it turned out."
+                )
             if not completion_date.strip():
                 errors.append("Please enter a completion date.")
             else:
@@ -4565,6 +4818,7 @@ def screen_resolved():
                 for e in errors:
                     st.error(e)
             else:
+                init["approaches"]      = clean_approaches(res_rows)
                 init["activities"]      = activities.strip()
                 init["notes"]           = outcome.strip()
                 init["start_date"]      = st.session_state.get("res_sd") or None
