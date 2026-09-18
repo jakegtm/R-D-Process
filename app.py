@@ -2095,12 +2095,17 @@ def screen_login():
             )
 
         def _label(opt: str) -> str:
-            """Show each account with the entities it may file for and see."""
+            """Show each account with the access it carries.
+
+            Oversight Leads get the same gear as the generic Admin entry they
+            replace, so it is obvious at a glance who the administrator is once
+            the built-in one retires.
+            """
             if opt in (placeholder, admin_opt):
                 return opt
-            ents_for = access.entities_for(opt, all_entities())
             if access.is_admin(opt):
-                return f"{opt}  —  Oversight Lead (all entities)"
+                return f"⚙ {opt}  —  Admin (Oversight Lead, all entities)"
+            ents_for = access.entities_for(opt, all_entities())
             if not ents_for:
                 return f"{opt}  —  no entity access"
             return f"{opt}  —  {', '.join(ents_for)}"
@@ -2114,7 +2119,7 @@ def screen_login():
                 st.warning("Please select your name.")
             else:
                 name     = sel.replace("⚙ ", "").replace(" (Oversight Lead)", "").strip()
-                is_admin = "Admin" in sel or is_oversight_lead(name)
+                is_admin = (sel == admin_opt) or is_oversight_lead(name)
                 st.session_state.user     = name
                 st.session_state.is_admin = is_admin
                 # Auto-load the most actionable period (in-progress rollover first,
