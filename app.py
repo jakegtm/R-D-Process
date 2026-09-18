@@ -17,6 +17,7 @@ import time
 
 import store
 import directory
+import access
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -39,13 +40,14 @@ DATA_DIR.mkdir(exist_ok=True)
 #
 # EMPLOYEES is also the fallback for team selection until a directory is
 # uploaded, so a fresh install still works.
-EMPLOYEES = [
-    "Bob Smith", "Sara", "Doug", "Doni", "Michael", "Nicole Browne",
-    # Added for the working session. Full names, because the sign-in list is
-    # also what lands in the "User" column of the consolidated export, and
-    # "Joe" is not something a reviewer can act on months later.
-    "Trevor Rosenthal", "Joe Lally", "Jonathan Forman", "Steven Burgwald",
-]
+# Empty on purpose. Sign-in comes from the uploaded access roster; until one is
+# uploaded the only way in is the built-in Admin entry, which exists so the
+# roster can be loaded in the first place.
+#
+# There were seeded names here during the pilot. They were removed because a
+# hard-coded list is a second source of truth: once a roster exists, a name that
+# appears in the code and not in the file is an account nobody granted.
+EMPLOYEES: list[str] = []
 
 # Sign-in names that were shortened before. Reports and entity permissions are
 # stored under the name as it was at the time, so a straight rename would orphan
@@ -63,7 +65,11 @@ USER_RENAMES = {
 # Change this one string to relabel it everywhere, including the export header.
 GROUP_LABEL = "Employee Group"
 
-ENTITIES = ["107", "108", "109", "110"]   # base/default entities — custom ones persist separately
+# Also empty on purpose. Entities are the client's own legal entity numbers;
+# shipping 107-110 meant every install started with four that don't exist.
+# They are added by an Oversight Lead in Settings, or created from the access
+# roster on upload.
+ENTITIES: list[str] = []
 
 STATUS_LABELS = {
     "in-progress":       "🟡 In Progress",
@@ -477,6 +483,28 @@ def add_custom_entity(new_entity: str) -> bool:
     return True
 
 
+def remove_custom_entity(entity: str) -> tuple[bool, str]:
+    """Remove an entity. Refused while any report is filed under it.
+
+    Deleting an entity that has reports would orphan them: they are keyed on
+    (user, entity, period), so the reports would still exist on disk but no
+    longer appear anywhere in the app.
+    """
+    entity = str(entity).strip()
+    n_reports = len(all_reports(entity=entity))
+    if n_reports:
+        return False, (
+            f"Entity {entity} has {n_reports} report"
+            f"{'s' if n_reports != 1 else ''} filed under it. Delete or move "
+            "those first."
+        )
+    custom = store.get_config("custom_entities", []) or []
+    if entity not in custom:
+        return False, f"Entity {entity} isn't in the list."
+    store.set_config("custom_entities", [e for e in custom if e != entity])
+    return True, ""
+
+
 # ── Business component closure ────────────────────────────────────────────────
 # Closing a business component is separate from resolving a technical
 # uncertainty. An uncertainty is a question that gets answered; a component is a
@@ -549,15 +577,60 @@ def save_permissions(perms: dict):
     store.set_config("permissions", perms)
 
 def get_user_entities(username: str) -> list[str]:
-    """Entities this user may FILE reports for.
+    """Entities this user may file for AND see.
 
-    Note: this governs filing only. The Archive tab deliberately shows every
-    entity to everyone — it is a shared record, not a per-entity permission.
+    Two regimes, and the difference is the default:
+
+      roster loaded    deny by default. Not on the roster means no entities,
+                       and therefore no filing and nothing visible in the
+                       archive. This is what makes a bulk upload meaningful —
+                       adding a row grants access rather than merely recording
+                       an intention.
+
+      no roster        the original behaviour: the per-person checkboxes in
+                       Settings, where blank means no restriction. Kept so a
+                       fresh install and the current ten-person pilot still
+                       work untouched.
+
+    Oversight Leads are exempt: someone who reviews and accepts reports has to
+    be able to open the ones they are reviewing.
     """
+    if is_oversight_lead(username):
+        return all_entities()
+
+    if access.is_loaded():
+        return access.entities_for(username, all_entities())
+
     perms = load_permissions()
     if username not in perms or not perms[username]:
         return all_entities()
     return [e for e in perms[username] if e in all_entities()]
+
+
+def is_oversight_lead(username: str) -> bool:
+    """True for the built-in Admin and for anyone the roster marks as admin."""
+    if username == "Admin":
+        return True
+    return access.is_loaded() and access.is_admin(username)
+
+
+def can_sign_in(username: str) -> bool:
+    """Whether this name may enter the app at all."""
+    if username == "Admin":
+        return True            # bootstrap — see screen_login()
+    if access.is_loaded():
+        return access.is_known(username)
+    return username in EMPLOYEES
+
+
+def visible_entities(username: str) -> list[str]:
+    """Entities whose reports this person may READ.
+
+    Same set as filing. Viewing used to be unrestricted by design — the archive
+    was a shared team record — which stops being defensible once the roster
+    spans a whole company rather than one R&D group.
+    """
+    return get_user_entities(username)
 
 
 # ── Reports ───────────────────────────────────────────────────────────────────
@@ -1980,20 +2053,59 @@ def screen_login():
             <p style="color:#64748b; margin:0;">Monthly Reporting Portal</p>
         </div>
         """, unsafe_allow_html=True)
-        options = ["— Select your name —", "⚙ Admin (Oversight Lead)"] + EMPLOYEES
-        sel = st.selectbox("Sign in as", options, label_visibility="collapsed")
+        # The roster, once uploaded, IS the sign-in list — anyone not on it has
+        # no access at all. The built-in Admin entry always stays, because a
+        # roster with no admin in it would otherwise lock every person out of
+        # the only screen that can fix the roster.
+        placeholder = "— Select your name —"
+        admin_opt   = "⚙ Admin (Oversight Lead)"
+
+        if access.is_loaded():
+            names = access.sign_in_names()
+            n_users, n_admins = access.counts()
+            options = [placeholder, admin_opt] + names
+            hint = (
+                f"{n_users:,} account{'s' if n_users != 1 else ''} on the roster. "
+                "Type to search."
+                + ("  No Oversight Lead is listed — use the Admin entry."
+                   if n_admins == 0 else "")
+            )
+        else:
+            # Nothing is seeded, so Admin is the only way in until a roster is
+            # uploaded. That is the intended first-run state, not an error.
+            options = [placeholder, admin_opt]
+            hint = (
+                "No access roster loaded yet. Sign in as Admin and upload one "
+                "in Settings to add people."
+            )
+
+        def _label(opt: str) -> str:
+            """Show each account with the entities it may file for and see."""
+            if opt in (placeholder, admin_opt):
+                return opt
+            ents_for = access.entities_for(opt, all_entities())
+            if access.is_admin(opt):
+                return f"{opt}  —  Oversight Lead (all entities)"
+            if not ents_for:
+                return f"{opt}  —  no entity access"
+            return f"{opt}  —  {', '.join(ents_for)}"
+
+        sel = st.selectbox("Sign in as", options, label_visibility="collapsed",
+                           format_func=_label)
+        if hint:
+            st.caption(hint)
         if st.button("Sign In →", width='stretch', type="primary"):
             if sel.startswith("— "):
                 st.warning("Please select your name.")
             else:
                 name     = sel.replace("⚙ ", "").replace(" (Oversight Lead)", "").strip()
-                is_admin = "Admin" in sel
+                is_admin = "Admin" in sel or is_oversight_lead(name)
                 st.session_state.user     = name
                 st.session_state.is_admin = is_admin
                 # Auto-load the most actionable period (in-progress rollover first,
                 # then current month, then most recent) so the user lands on the
                 # right report without having to change Report Setup manually.
-                if "Admin" not in sel:
+                if name != "Admin":
                     best = best_draft_for_user(name)
                     st.session_state.draft = best
                     # Clear Report Setup widget keys so Streamlit renders
@@ -2006,7 +2118,10 @@ def screen_login():
                     st.session_state.pop(f"su_act_{rm}", None)
                 else:
                     st.session_state.draft = empty_draft()
-                st.session_state.screen   = "admin" if is_admin else "dashboard"
+                # Land an Oversight Lead who is also a preparer on their own
+                # dashboard; they can reach the admin view from there. Only the
+                # bare built-in Admin goes straight to the review screen.
+                st.session_state.screen = "admin" if name == "Admin" else "dashboard"
                 st.rerun()
         st.markdown(
             '<p style="text-align:center;font-size:12px;color:#94a3b8;margin-top:16px;">'
@@ -2206,7 +2321,18 @@ def screen_dashboard():
             mlist = sorted(set(mlist) | {cur_draft_rm}, reverse=True)
 
         with su1:
-            entity_options = get_user_entities(user) + ["+ Add new entity..."]
+            # Creating entities is an admin act: with deny-by-default access,
+            # a preparer who could add one could file outside the entities the
+            # roster granted them.
+            entity_options = get_user_entities(user)
+            if is_oversight_lead(user):
+                entity_options = entity_options + ["+ Add new entity..."]
+            if not entity_options:
+                st.warning(
+                    "You don't have access to any entities yet. The Oversight "
+                    "Lead grants access in Admin → Settings."
+                )
+                return
             eidx = entity_options.index(draft["entity"]) if draft.get("entity") in entity_options else 0
             entity_pick = st.selectbox("Entity", entity_options, index=eidx, key="su_entity")
 
@@ -2972,16 +3098,38 @@ def screen_wizard():
 # ── Admin ─────────────────────────────────────────────────────────────────────
 
 def render_archive_browser(key_prefix: str = "arc"):
-    """Read-only view of every archived report, for everyone.
+    """Read-only view of archived reports the signed-in person may see.
 
-    Deliberately not filtered by the entity permissions in Settings — those
-    govern which entities a person may FILE for. The archive is a shared record
-    of closed periods that the whole team can read and export.
+    The archive used to show every entity to everyone, on the grounds that it
+    was a shared record of closed periods for one R&D team. That stops being
+    defensible once the roster spans a company, so it is now scoped to the same
+    entities the person may file for. Oversight Leads still see everything,
+    since reviewing requires it.
 
     No edit controls are rendered here at all, rather than rendered-and-disabled,
     so there is no path from this screen to a write.
     """
-    archived = all_reports(statuses=["archived"])
+    viewer  = st.session_state.get("user") or ""
+    allowed = visible_entities(viewer)
+    scoped  = not is_oversight_lead(viewer)
+
+    archived = [
+        r for r in all_reports(statuses=["archived"])
+        if not scoped or r.get("entity") in allowed
+    ]
+
+    if scoped:
+        if not allowed:
+            st.info(
+                "You don't have access to any entities yet, so there is nothing "
+                "to show here. The Oversight Lead grants access in "
+                "Admin → Settings."
+            )
+            return
+        st.caption(
+            f"Showing Entit{'y' if len(allowed) == 1 else 'ies'} "
+            f"**{', '.join(allowed)}** — the ones you have access to."
+        )
 
     if not archived:
         st.info(
@@ -3862,6 +4010,27 @@ def screen_admin():
 
     # ══ Settings ══════════════════════════════════════════════════════════════
     if active_tab == "⚙ Settings":
+        render_roster_settings()
+        st.divider()
+
+        # The click-through list below is unusable past a few dozen people, so
+        # it is hidden once a roster exists — two places to edit the same thing
+        # is how they drift apart.
+        if access.is_loaded():
+            st.markdown("**Entity filing permissions**")
+            st.caption(
+                "Managed by the uploaded roster above. Change access by editing "
+                "and re-uploading that file."
+            )
+            st.divider()
+            st.markdown("**Entities**")
+            st.caption(", ".join(all_entities()))
+            st.divider()
+            render_closed_bc_settings()
+            st.divider()
+            render_directory_settings()
+            return
+
         st.markdown("**Entity filing permissions**")
         st.caption(
             "Controls which entities each person can FILE reports for. This is not "
@@ -3915,14 +4084,267 @@ def screen_admin():
             st.rerun()
 
         st.divider()
-        st.markdown("**Entities**")
-        st.caption(", ".join(all_ents))
+        render_entity_settings()
 
         st.divider()
         render_closed_bc_settings()
 
         st.divider()
         render_directory_settings()
+
+
+# ── Entity admin ──────────────────────────────────────────────────────────────
+
+def render_entity_settings():
+    """Add and remove the client's entity numbers.
+
+    The app ships with none. Every entity here was added deliberately, which
+    makes an empty list a real signal that setup hasn't happened rather than
+    four placeholders that look like configuration.
+    """
+    st.markdown("**Entities**")
+    ents = all_entities()
+
+    if not ents:
+        st.warning(
+            "No entities set up yet. Add the client's entity numbers below — "
+            "nobody can file a report until at least one exists. Uploading an "
+            "access roster can also create them."
+        )
+    else:
+        st.caption(
+            f"{len(ents)} entit{'y' if len(ents) == 1 else 'ies'}. These are the "
+            "numbers that appear in Report Setup and in export filenames."
+        )
+
+    ec1, ec2 = st.columns([3, 1])
+    with ec1:
+        new_e = st.text_input(
+            "Add an entity", key="set_new_entity", placeholder="e.g. 107",
+            label_visibility="collapsed",
+        )
+    with ec2:
+        if st.button("Add entity", key="set_add_entity"):
+            val = (new_e or "").strip()
+            if not val:
+                st.warning("Enter an entity number first.")
+            elif add_custom_entity(val):
+                st.success(f"Entity {val} added.")
+                st.rerun()
+            else:
+                st.info(f"Entity {val} is already in the list.")
+
+    for e in ents:
+        n_rep = len(all_reports(entity=e))
+        rc1, rc2 = st.columns([5, 1])
+        with rc1:
+            st.markdown(
+                f"&nbsp;&nbsp;• **{e}** &nbsp;"
+                f"<small style='color:#64748b;'>{n_rep} report"
+                f"{'s' if n_rep != 1 else ''}</small>",
+                unsafe_allow_html=True,
+            )
+        with rc2:
+            if st.button("Remove", key=f"rm_ent_{_safe_name(e)}", disabled=bool(n_rep),
+                         help=("Has reports filed under it" if n_rep
+                               else f"Remove entity {e}")):
+                ok, why = remove_custom_entity(e)
+                if ok:
+                    st.success(f"Entity {e} removed.")
+                    st.rerun()
+                else:
+                    st.error(why)
+
+
+# ── Access roster admin ───────────────────────────────────────────────────────
+
+def render_roster_settings():
+    """Download, fill in, upload. Bulk access for hundreds or thousands.
+
+    Uploading REPLACES the roster rather than merging, so the file is always the
+    whole truth and there is no way to end up with access nobody can account
+    for. The trade is that a partial file silently removes everyone missing from
+    it, which is why the confirmation step spells out removals by name and the
+    download hands back the current roster rather than a blank sheet.
+    """
+    st.markdown("**User access roster**")
+
+    ents = all_entities()
+
+    if access.is_loaded():
+        m = access.meta()
+        n_users, n_admins = access.counts()
+        when = ts_to_et(m.get("saved_at"), "%b %d, %Y %I:%M %p") if m.get("saved_at") else ""
+        st.success(
+            f"✓ **{n_users:,} people** on the roster "
+            f"({n_admins} Oversight Lead{'s' if n_admins != 1 else ''})"
+            + (f" — from *{m.get('filename','uploaded file')}*" if m.get("filename") else "")
+            + (f", loaded {when}" if when else "")
+        )
+        st.caption(
+            "This is the sign-in list. Anyone not on it can't sign in, file, or "
+            "see anything. Entity access applies to both filing and viewing. "
+            "Each person is identified by name, so renaming someone hides the "
+            "reports they already filed."
+        )
+        if n_admins == 0:
+            st.warning(
+                "⚠ Nobody on the roster is an Oversight Lead. Reviews can still "
+                "be done through the built-in **Admin** sign-in, which is always "
+                "available, but add someone with Role = admin so that isn't the "
+                "only way in."
+            )
+    else:
+        st.info(
+            f"No roster loaded. Sign-in uses the built-in list of "
+            f"{len(EMPLOYEES)} names and the per-person checkboxes below."
+        )
+        st.caption(
+            "Uploading a roster switches the app to deny-by-default: only "
+            "people on the file can sign in."
+        )
+
+    st.caption(
+        "⚠ Sign-in has no password — this controls what a name is allowed to "
+        "do, not that the person is who they picked. It becomes real access "
+        "control when sign-in moves to SSO."
+    )
+
+    st.write("")
+    dl1, dl2 = st.columns(2)
+    with dl1:
+        st.download_button(
+            "↓ Download blank template",
+            data=access.build_template(ents),
+            file_name="RD_Tracker_Access_Template.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="roster_tpl",
+            help="Instructions are on the first tab.",
+        )
+    with dl2:
+        if access.is_loaded():
+            st.download_button(
+                "↓ Export current roster",
+                data=access.build_template(ents, existing=access.users()),
+                file_name=f"RD_Tracker_Access_{datetime.now().strftime('%m%d%y')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="roster_export",
+                type="primary",
+                help="Same layout as the template — edit this and upload it back.",
+            )
+
+    st.write("")
+    up = st.file_uploader("Upload a filled-in roster (.xlsx)", type=["xlsx"],
+                          key="roster_uploader")
+    if up is None:
+        return
+
+    users, warnings, errors = access.parse(up.getvalue(), ents)
+    if errors:
+        for e in errors:
+            st.error(e)
+        return
+
+    diff = access.diff_against_current(users)
+    n_admins_new = sum(1 for u in users if u.get("role") == access.ROLE_ADMIN)
+
+    mc1, mc2, mc3, mc4 = st.columns(4)
+    mc1.metric("People in file", f"{len(users):,}")
+    mc2.metric("Added", len(diff["added"]))
+    mc3.metric("Removed", len(diff["removed"]))
+    mc4.metric("Changed", len(diff["changed"]))
+
+    for w in warnings:
+        st.caption(f"ℹ {w}")
+
+    # With no entities seeded, a first roster refers to entities that don't
+    # exist yet. Offer to create them rather than importing a file that grants
+    # nothing — but list them, because the same situation arises from a typo.
+    referenced = sorted({
+        e for u in users for e in (u.get("entities") or [])
+        if e != access.ALL_ENTITIES
+    })
+    missing = [e for e in referenced if e not in ents]
+    create_missing = False
+    if missing:
+        create_missing = st.checkbox(
+            f"Also create {len(missing)} entit"
+            f"{'y' if len(missing) == 1 else 'ies'} named in this file: "
+            + ", ".join(missing),
+            value=True, key="roster_create_ents",
+        )
+        st.caption(
+            "Untick if any of those look like typos — access to an entity that "
+            "doesn't exist grants nothing."
+        )
+
+    if diff["removed"]:
+        st.warning(
+            f"**{len(diff['removed'])} "
+            f"{'person' if len(diff['removed']) == 1 else 'people'} will lose "
+            "all access** — they aren't in this file: "
+            + ", ".join(diff["removed"][:10])
+            + ("…" if len(diff["removed"]) > 10 else "")
+            + ". Their submitted reports are untouched; they just can't sign in."
+        )
+
+    if n_admins_new == 0:
+        st.warning(
+            "No Oversight Lead in this file. The built-in **Admin** sign-in "
+            "stays available, so you won't be locked out, but nobody else can "
+            "review."
+        )
+
+    with st.expander(f"Preview all {len(users):,} rows"):
+        st.dataframe(
+            [{
+                "Name": u.get("display", ""),
+                "Email": u.get("email", ""),
+                "Entities": ("All" if access.ALL_ENTITIES in (u.get("entities") or [])
+                             else ", ".join(u.get("entities") or []) or "— none —"),
+                "Role": "Oversight Lead" if u.get("role") == access.ROLE_ADMIN else "Preparer",
+            } for u in users],
+            width='stretch', hide_index=True,
+        )
+
+    st.write("")
+    if st.button(f"Replace roster with these {len(users):,} people",
+                 type="primary", key="roster_apply"):
+        made = []
+        if missing and create_missing:
+            for e in missing:
+                if add_custom_entity(e):
+                    made.append(e)
+        access.save(users, {"filename": up.name})
+        st.success(
+            f"Roster updated — {len(users):,} people, "
+            f"{n_admins_new} Oversight Lead{'s' if n_admins_new != 1 else ''}."
+            + (f" Created entit{'y' if len(made) == 1 else 'ies'} {', '.join(made)}."
+               if made else "")
+        )
+        st.rerun()
+
+    if access.is_loaded():
+        st.write("")
+        if st.session_state.get("roster_confirm_clear"):
+            st.warning(
+                "Remove the roster? Sign-in falls back to the built-in list and "
+                "the per-person checkboxes. Nobody's reports are affected."
+            )
+            rc1, rc2 = st.columns(2)
+            with rc1:
+                if st.button("Yes, remove it", key="roster_clear_yes", type="primary"):
+                    access.clear()
+                    st.session_state.roster_confirm_clear = False
+                    st.rerun()
+            with rc2:
+                if st.button("Cancel", key="roster_clear_no"):
+                    st.session_state.roster_confirm_clear = False
+                    st.rerun()
+        else:
+            if st.button("Remove roster", key="roster_clear"):
+                st.session_state.roster_confirm_clear = True
+                st.rerun()
 
 
 # ── Closed business components admin ──────────────────────────────────────────
