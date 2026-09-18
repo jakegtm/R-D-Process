@@ -123,8 +123,19 @@ def users() -> list:
 # ── Lookups ───────────────────────────────────────────────────────────────────
 
 def sign_in_names() -> list:
-    """Display names allowed to sign in, alphabetical."""
-    return sorted((u.get("display") or u.get("name", "")) for u in load()["users"])
+    """Display names allowed to sign in.
+
+    Oversight Leads first, then everyone else, each group alphabetical. They sit
+    at the top because they are who someone scans for when they need a review
+    chased, and because they replace the generic Admin entry that used to hold
+    that position.
+    """
+    def key(u):
+        return (
+            0 if (u.get("role") or "") == ROLE_ADMIN else 1,
+            (u.get("display") or u.get("name", "")).casefold(),
+        )
+    return [(u.get("display") or u.get("name", "")) for u in sorted(load()["users"], key=key)]
 
 
 def get_user(display_name: str) -> dict | None:
