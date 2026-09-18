@@ -614,10 +614,25 @@ def is_oversight_lead(username: str) -> bool:
     return access.is_loaded() and access.is_admin(username)
 
 
+def bootstrap_admin_available() -> bool:
+    """Whether the built-in Admin sign-in should still be offered.
+
+    It exists only to load the first roster. Once that roster names at least one
+    Oversight Lead, the real person takes over and the generic account retires —
+    two admins where one is anonymous and shared is worse than one who is named
+    in the audit trail.
+
+    It comes back automatically if the roster is later replaced by one with no
+    Oversight Lead in it, or removed entirely, so there is no state in which
+    nobody can reach Settings.
+    """
+    return not (access.is_loaded() and access.admin_count() > 0)
+
+
 def can_sign_in(username: str) -> bool:
     """Whether this name may enter the app at all."""
     if username == "Admin":
-        return True            # bootstrap — see screen_login()
+        return bootstrap_admin_available()
     if access.is_loaded():
         return access.is_known(username)
     return username in EMPLOYEES
@@ -2063,13 +2078,13 @@ def screen_login():
         if access.is_loaded():
             names = access.sign_in_names()
             n_users, n_admins = access.counts()
-            options = [placeholder, admin_opt] + names
-            hint = (
-                f"{n_users:,} account{'s' if n_users != 1 else ''} on the roster. "
-                "Type to search."
-                + ("  No Oversight Lead is listed — use the Admin entry."
-                   if n_admins == 0 else "")
-            )
+            # The generic Admin only appears while the roster has no Oversight
+            # Lead of its own.
+            options = [placeholder] + ([admin_opt] if bootstrap_admin_available() else []) + names
+            hint = f"{n_users:,} account{'s' if n_users != 1 else ''} on the roster. Type to search."
+            if n_admins == 0:
+                hint += ("  No Oversight Lead on the roster — the generic Admin "
+                         "sign-in is still available.")
         else:
             # Nothing is seeded, so Admin is the only way in until a roster is
             # uploaded. That is the intended first-run state, not an error.
@@ -4189,10 +4204,18 @@ def render_roster_settings():
         )
         if n_admins == 0:
             st.warning(
-                "⚠ Nobody on the roster is an Oversight Lead. Reviews can still "
-                "be done through the built-in **Admin** sign-in, which is always "
-                "available, but add someone with Role = admin so that isn't the "
-                "only way in."
+                "⚠ Nobody on the roster is an Oversight Lead, so the generic "
+                "**Admin** sign-in is still on the login screen. Give someone "
+                "Role = admin and it disappears — reviews then happen under a "
+                "real name, which is what the audit trail needs."
+            )
+        else:
+            leads = [u.get("display") for u in access.users()
+                     if u.get("role") == access.ROLE_ADMIN]
+            st.caption(
+                f"Oversight Lead{'s' if len(leads) != 1 else ''}: "
+                f"**{', '.join(leads)}**. The generic Admin sign-in is retired "
+                "while at least one is listed."
             )
     else:
         st.info(
@@ -4290,9 +4313,19 @@ def render_roster_settings():
 
     if n_admins_new == 0:
         st.warning(
-            "No Oversight Lead in this file. The built-in **Admin** sign-in "
-            "stays available, so you won't be locked out, but nobody else can "
-            "review."
+            "No Oversight Lead in this file, so the generic **Admin** sign-in "
+            "will stay on the login screen. You won't be locked out, but nobody "
+            "is named as a reviewer."
+        )
+    elif bootstrap_admin_available():
+        new_leads = [u.get("display") for u in users if u.get("role") == access.ROLE_ADMIN]
+        st.info(
+            f"After this upload, **{', '.join(new_leads[:3])}**"
+            + (f" and {len(new_leads) - 3} other{'s' if len(new_leads) - 3 != 1 else ''}"
+               if len(new_leads) > 3 else "")
+            + f" take{'s' if len(new_leads) == 1 else ''} over as Oversight Lead, "
+            "and the generic **Admin** sign-in disappears from the login screen. "
+            "It returns on its own if a later roster has no Oversight Lead."
         )
 
     with st.expander(f"Preview all {len(users):,} rows"):
